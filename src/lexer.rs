@@ -14,6 +14,9 @@ pub enum Token<'a> {
     #[token("-", priority = 3)]
     Minus,
 
+    #[token("=")]
+    Equal,
+
     #[token(";")]
     Semicolon,
     #[token(",")]
@@ -84,6 +87,7 @@ impl Display for Token<'_> {
             Token::Comment => write!(f, "// ..."),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
+            Token::Equal => write!(f, "="),
         }
     }
 }

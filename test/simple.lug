@@ -1,4 +1,11 @@
 // This is super simple
+
+let string = "Hello";
+@print(string);
+
+string = "world!";
+@print(string);
+
 @print("Hello", 2);
 
 @print(2);
