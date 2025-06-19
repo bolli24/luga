@@ -121,12 +121,14 @@ fn main() {
 
     let status = Command::new("gcc")
         .arg("-o")
-        .arg(exe_file)
-        .arg(object_file)
+        .arg(&exe_file)
+        .arg(&object_file)
         .status()
         .unwrap();
 
     if !status.success() {
         eprintln!("Error linking executable.");
     }
+
+    println!("Saved executable to {}", exe_file.display());
 }
