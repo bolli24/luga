@@ -4,23 +4,29 @@ use crate::lexer::Token;
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::input::Stream;
 use chumsky::prelude::*;
+use generator::generate;
 use logos::Logos;
 use parser::luga_parser;
 
-use std::{env, fs};
+use std::{
+    env,
+    fs::{self, File},
+    io::Write,
+    path::PathBuf,
+    process::Command,
+};
 
 pub use chumsky::span::SimpleSpan;
 
+mod generator;
 mod lexer;
 mod parser;
 
 fn main() {
-    let file_path = env::args().nth(1).expect("Expected file argument");
-    let file_name = std::path::PathBuf::from(&file_path)
-        .file_name()
-        .expect("Input must be file")
-        .to_string_lossy()
-        .to_string();
+    let file_path = PathBuf::from(env::args().nth(1).expect("Expected file argument"));
+    let base_name = file_path.file_name().expect("Input must be file");
+    let output_file = PathBuf::from(base_name);
+    let file_name = base_name.to_string_lossy().to_string();
     let src = fs::read_to_string(&file_path).expect("Failed to read file");
     let lexer = Token::lexer(src.as_str());
 
@@ -62,5 +68,43 @@ fn main() {
                 .eprint((&file_name, src.clone()))
                 .unwrap();
         }
+    }
+
+    let Some(program) = result.into_output() else {
+        return;
+    };
+
+    println!();
+
+    let product = generate(program);
+
+    let Ok(product) = product else {
+        eprintln!("Error generating object.");
+        return;
+    };
+
+    let bytes = product.emit().unwrap();
+
+    let object_file = output_file.with_extension("o");
+    let mut f = File::create(&object_file).unwrap();
+    f.write_all(&bytes).unwrap();
+
+    println!("Wrote object to {}", object_file.display());
+
+    #[cfg(target_os = "windows")]
+    let exe_file = output_file.with_extension("exe");
+
+    #[cfg(not(target_os = "windows"))]
+    let exe_file = output_file.with_extension("");
+
+    let status = Command::new("gcc")
+        .arg("-o")
+        .arg(exe_file)
+        .arg(object_file)
+        .status()
+        .unwrap();
+
+    if !status.success() {
+        eprintln!("Error linking executable.");
     }
 }
