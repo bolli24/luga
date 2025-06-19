@@ -75,6 +75,11 @@ pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
         }
     }
 
+    if !returned {
+        let zero = builder.ins().iconst(types::I32, 0);
+        builder.ins().return_(&[zero]);
+    }
+
     builder.finalize();
 
     println!("{}", context.func.display());
