@@ -5,7 +5,7 @@ use cranelift::{
 use cranelift_module::Module;
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 
-use crate::parser::Program;
+use crate::parser::{Expression, Program, Statement};
 
 pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
     #[cfg(target_os = "linux")]
@@ -52,6 +52,8 @@ pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
 
     // let mut vars: IndexMap<String, Variable> = IndexMap::new();
 
+    let mut returned = false;
+
     let mut function_context = FunctionBuilderContext::new();
 
     let mut builder = FunctionBuilder::new(&mut context.func, &mut function_context);
@@ -61,30 +63,17 @@ pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
     builder.switch_to_block(main_block);
     builder.seal_block(main_block);
 
-    /* for statement in &program.statements {
-            match statement {
-                Statement::Expression(_expression) => todo!(),
-                Statement::Binding(name, expression) => {
-                    let var = Variable::new(vars.len());
-                    builder.declare_var(var, F64);
-                    vars.insert(name.clone(), var);
-
-                    let Expression::Number(number) = expression else {
-                        todo!();
-                    };
-
-                    let value = builder.ins().f64const(Ieee64::with_float(*number));
-
-                    builder.def_var(var, value);
-                }
-                Statement::Assignment(_left, _right) => todo!(),
+    for statement in &program.statements {
+        match statement {
+            Statement::Return(Expression::Integer(value)) => {
+                let integer = builder.ins().iconst(types::I64, *value);
+                let cast = builder.ins().ireduce(types::I32, integer);
+                builder.ins().return_(&[cast]);
+                break;
             }
+            _ => todo!("{statement:?}"),
         }
-    */
-
-    let zero = builder.ins().iconst(types::I32, 100);
-
-    builder.ins().return_(&[zero]);
+    }
 
     builder.finalize();
 

@@ -41,8 +41,11 @@ pub enum Token<'a> {
     #[regex(r"\/\/.*[\r\n|\r|\n]", |_| Skip)]
     Comment,
 
-    #[regex(r"[-+]?(?:0|[1-9]\d*)?(?:\.\d+)?(?:[eE][+-]?\d+)?", |lex| lex.slice(), priority = 2)]
-    Number(&'a str),
+    #[regex(r"[-+]?\d+\.\d+", |lex| lex.slice(), priority = 2)]
+    Float(&'a str),
+
+    #[regex(r"[-+]?\d+", |lex| lex.slice(), priority = 2)]
+    Integer(&'a str),
 
     #[regex(r#"[\"']"#, string)]
     Quoted(String),
@@ -82,7 +85,8 @@ impl Display for Token<'_> {
             Token::Comma => write!(f, ","),
             Token::At => write!(f, "@"),
             Token::Id(ident) => write!(f, "{}", ident),
-            Token::Number(num) => write!(f, "{}", num),
+            Token::Float(num) => write!(f, "{}", num),
+            Token::Integer(num) => write!(f, "{}", num),
             Token::Quoted(string) => write!(f, "\"{}\"", string),
             Token::Comment => write!(f, "// ..."),
             Token::Plus => write!(f, "+"),
