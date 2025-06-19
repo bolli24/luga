@@ -69,6 +69,7 @@ pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
                 let integer = builder.ins().iconst(types::I64, *value);
                 let cast = builder.ins().ireduce(types::I32, integer);
                 builder.ins().return_(&[cast]);
+                returned = true;
                 break;
             }
             _ => todo!("{statement:?}"),
