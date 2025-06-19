@@ -4,9 +4,9 @@ use crate::lexer::Token;
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::input::Stream;
 use chumsky::prelude::*;
-use generator::generate;
+use generator::{GeneratorErrors, generate};
 use logos::Logos;
-use parser::luga_parser;
+use parser::{Spanned, luga_parser};
 
 use std::{
     env,
@@ -76,11 +76,33 @@ fn main() {
 
     println!();
 
-    let product = generate(program);
-
-    let Ok(product) = product else {
-        eprintln!("Error generating object.");
-        return;
+    let product = match generate(program) {
+        Ok(product) => product,
+        Err(errors) => match errors {
+            GeneratorErrors::CodeErrors(errors) => {
+                let src = Source::from(src.as_str());
+                for Spanned(error, span) in errors {
+                    Report::build(ReportKind::Error, (&file_name, span.into_range()))
+                        .with_message(error.to_string())
+                        .with_label(
+                            Label::new((&file_name, span.into_range()))
+                                .with_message(error.to_string())
+                                .with_color(Color::Red),
+                        )
+                        .finish()
+                        .eprint((&file_name, src.clone()))
+                        .unwrap();
+                }
+                return;
+            }
+            GeneratorErrors::VerifierErrors(verifier_errors) => {
+                for error in verifier_errors {
+                    // TODO: make this printing nice
+                    eprintln!("{error}");
+                }
+                return;
+            }
+        },
     };
 
     let bytes = product.emit().unwrap();

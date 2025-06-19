@@ -3,15 +3,18 @@ use chumsky::{input::ValueInput, prelude::*};
 
 #[derive(Clone, Debug)]
 pub struct Program {
-    pub statements: Vec<Statement>,
+    pub statements: Vec<Spanned<Statement>>,
 }
+
+#[derive(Debug, Clone)]
+pub struct Spanned<T: std::fmt::Debug + Clone>(pub T, pub SimpleSpan);
 
 #[derive(Clone, Debug)]
 pub enum Statement {
-    Expression(Expression),
-    Binding(String, Expression),
-    Assignment(String, Expression),
-    Return(Expression),
+    Expression(Spanned<Expression>),
+    Binding(String, Spanned<Expression>),
+    Assignment(String, Spanned<Expression>),
+    Return(Spanned<Expression>),
 }
 
 #[derive(Clone, Debug)]
@@ -21,11 +24,20 @@ pub enum Expression {
     Integer(i64),
     String(String),
     Intrinsic(Intrinsic),
+    Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 #[derive(Clone, Debug)]
 pub enum Intrinsic {
-    Print(Vec<Expression>),
+    Print(Vec<Spanned<Expression>>),
 }
 
 const KEY_WORDS: [&str; 2] = ["let", "return"];
@@ -52,7 +64,52 @@ where
 
     let string = select! {Token::Quoted(s) => s.to_owned()};
 
+    let bin_op = select! {
+        Token::Plus => BinOp::Add,
+        Token::Minus => BinOp::Sub,
+        Token::Star => BinOp::Mul,
+        Token::Slash => BinOp::Div,
+    };
+
     let mut expression = Recursive::declare();
+
+    let atom = choice((
+        identifier.map(|name| Expression::Identifier(name.to_owned())),
+        float.map(Expression::Float),
+        integer.map(Expression::Integer),
+        string.map(Expression::String),
+        expression
+            .clone()
+            .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
+            .map(|expr: Spanned<Expression>| expr.0),
+    ))
+    .map_with(|expr: Expression, extra| -> Spanned<Expression> { Spanned(expr, extra.span()) });
+
+    let factor = atom.clone().foldl_with(
+        bin_op
+            .filter(|op| matches!(op, BinOp::Mul | BinOp::Div))
+            .then(atom.clone())
+            .repeated(),
+        |a, (op, b), extra| {
+            Spanned(
+                Expression::Binary(op, Box::new(a), Box::new(b)),
+                extra.span(),
+            )
+        },
+    );
+
+    let term = factor.clone().foldl_with(
+        bin_op
+            .filter(|op| matches!(op, BinOp::Add | BinOp::Sub))
+            .then(factor.clone())
+            .repeated(),
+        |a, (op, b), extra| {
+            Spanned(
+                Expression::Binary(op, Box::new(a), Box::new(b)),
+                extra.span(),
+            )
+        },
+    );
 
     let args = expression
         .clone()
@@ -61,42 +118,45 @@ where
 
     let call = args.delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
-    let intrinsic =
-        just(Token::At)
-            .ignore_then(identifier)
-            .then(call)
-            .try_map(|(id, call), span| match id {
-                "print" => Ok(Intrinsic::Print(call)),
-                _ => Err(Rich::custom(span, "Unknown intrinsic.")),
-            });
+    let intrinsic = just(Token::At)
+        .ignore_then(identifier)
+        .then(call)
+        .try_map(|(id, call), span| match id {
+            "print" => Ok(Intrinsic::Print(call)),
+            _ => Err(Rich::custom(span, "Unknown intrinsic.")),
+        })
+        .map_with(|intrinsic, extra| Spanned(Expression::Intrinsic(intrinsic), extra.span()));
 
-    expression.define(
-        choice((
-            identifier.map(|name| Expression::Identifier(name.to_owned())),
-            intrinsic.map(Expression::Intrinsic),
-            float.map(Expression::Float),
-            integer.map(Expression::Integer),
-            string.map(Expression::String),
-        ))
-        .labelled("expression"),
-    );
+    expression.define(choice((intrinsic, term)).labelled("expression"));
 
     let binding = just(Token::Id("let"))
         .ignore_then(identifier)
         .then_ignore(just(Token::Equal))
-        .then(expression.clone());
+        .then(expression.clone())
+        .map_with(|(ident, expr), extra| -> Spanned<Statement> {
+            Spanned(Statement::Binding(ident.to_owned(), expr), extra.span())
+        });
 
     let assignment = identifier
         .then_ignore(just(Token::Equal))
-        .then(expression.clone());
+        .then(expression.clone())
+        .map_with(|(ident, expr), extra| -> Spanned<Statement> {
+            Spanned(Statement::Assignment(ident.to_owned(), expr), extra.span())
+        });
 
-    let r#return = just(Token::Id("return")).ignore_then(expression.clone());
+    let r#return = just(Token::Id("return"))
+        .ignore_then(expression.clone())
+        .map_with(|expr: Spanned<Expression>, extra| -> Spanned<Statement> {
+            Spanned(Statement::Return(expr), extra.span())
+        });
 
     let statement = choice((
-        r#return.map(Statement::Return),
-        binding.map(|(a, b)| Statement::Binding(a.to_owned(), b)),
-        assignment.map(|(a, b)| Statement::Assignment(a.to_owned(), b)),
-        expression.map(Statement::Expression),
+        r#return,
+        binding,
+        assignment,
+        expression.map_with(|expr: Spanned<Expression>, extra| {
+            Spanned(Statement::Expression(expr), extra.span())
+        }),
     ))
     .then_ignore(just(Token::Semicolon));
 

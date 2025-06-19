@@ -7,6 +7,7 @@ edition = "2024"
 chumsky = "0.10"
 ariadne = "0.5"
 logos = "0.15"
+thiserror = "2.0"
 
 cranelift = "0.120"
 cranelift-native = "0.120"

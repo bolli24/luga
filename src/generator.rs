@@ -1,13 +1,24 @@
 use cranelift::{
-    codegen::{Context, verify_function},
+    codegen::{Context, verifier::VerifierError, verify_function},
     prelude::*,
 };
 use cranelift_module::Module;
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 
-use crate::parser::{Expression, Program, Statement};
+use crate::parser::{Expression, Program, Spanned, Statement};
 
-pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum CodeError {
+    #[error("Invalid return value: must be integer literal")]
+    InvalidReturn,
+}
+
+pub enum GeneratorErrors {
+    CodeErrors(Vec<Spanned<CodeError>>),
+    VerifierErrors(Vec<VerifierError>),
+}
+
+pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
     #[cfg(target_os = "linux")]
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux";
 
@@ -63,9 +74,16 @@ pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
     builder.switch_to_block(main_block);
     builder.seal_block(main_block);
 
+    let mut errors = Vec::new();
+
     for statement in &program.statements {
-        match statement {
-            Statement::Return(Expression::Integer(value)) => {
+        match &statement.0 {
+            Statement::Return(Spanned(expr, span)) => {
+                let Expression::Integer(value) = expr else {
+                    errors.push(Spanned(CodeError::InvalidReturn, *span));
+                    continue;
+                };
+
                 let integer = builder.ins().iconst(types::I64, *value);
                 let cast = builder.ins().ireduce(types::I32, integer);
                 builder.ins().return_(&[cast]);
@@ -81,15 +99,17 @@ pub fn generate(program: Program) -> Result<ObjectProduct, ()> {
         builder.ins().return_(&[zero]);
     }
 
+    if !errors.is_empty() {
+        return Err(GeneratorErrors::CodeErrors(errors));
+    }
+
     builder.finalize();
 
     println!("{}", context.func.display());
 
     let flags = settings::Flags::new(settings::builder());
     if let Err(errs) = verify_function(&context.func, &flags) {
-        for err in &errs.0 {
-            eprintln!("{err}");
-        }
+        return Err(GeneratorErrors::VerifierErrors(errs.0));
     }
 
     module.define_function(main_id, &mut context).unwrap();
