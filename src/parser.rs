@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::lexer::Token;
 use chumsky::{input::ValueInput, prelude::*};
 
@@ -33,6 +35,17 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+}
+
+impl Display for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BinOp::Add => write!(f, "+"),
+            BinOp::Sub => write!(f, "-"),
+            BinOp::Mul => write!(f, "*"),
+            BinOp::Div => write!(f, "/"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
