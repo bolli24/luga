@@ -15,11 +15,13 @@
 
 // let value = (3 + 6);
 
-@print("Hello World\n", 0);
-
 @print("Number: %d   \n", 2 * (3 + 6));
 
+@print("Hello World\n");
+
 @print("String: %s \n", "ßßßß");
+
+@print("A bunch of numbers: %d, %d, %f, %f", 1, 2, 3.0, 4.0);
 
 return 3 * (4 * 4 + 4) + 3 * 3;
 

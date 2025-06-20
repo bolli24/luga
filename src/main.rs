@@ -21,6 +21,7 @@ pub use chumsky::span::SimpleSpan;
 mod generator;
 mod lexer;
 mod parser;
+mod util;
 
 fn main() -> ExitCode {
     let file_path = PathBuf::from(env::args().nth(1).expect("Expected file argument"));

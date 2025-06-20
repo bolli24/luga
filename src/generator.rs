@@ -5,11 +5,14 @@ use cranelift::{
     codegen::{Context, verifier::VerifierError, verify_function},
     prelude::*,
 };
-use cranelift_codegen::ir::FuncRef;
-use cranelift_module::{DataDescription, Linkage, Module};
+use cranelift_codegen::{ir::FuncRef, isa::TargetIsa};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 
-use crate::parser::{BinOp, Expression, Intrinsic, Program, Spanned, Statement};
+use crate::{
+    parser::{BinOp, Expression, Intrinsic, Program, Spanned, Statement},
+    util::ResultCollectAll,
+};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CodeError {
@@ -24,17 +27,26 @@ pub enum CodeError {
     #[error("Invalid type '{}' for binary operator '{}'", .0 ,.1)]
     InvalidBinOpType(BinOp, Type),
 
-    #[error("Intrisic '{}' invoked with too few arguments. Expected {} but found {}.", .0, .1, .2)]
+    #[error("Intrisic '{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
     IntrinsicTooFewArguments(&'static str, usize, usize),
-    #[error("Intrisic '{}' invoked with too many arguments. Expected {} but found {}.", .0, .1, .2)]
+    #[error("Intrisic '{}' invoked with too many arguments. Expected at most {} but found {}.", .0, .1, .2)]
     IntrinsicTooManyArguments(&'static str, usize, usize),
     #[error("Intrisic '{}' invoked with wrong argument type. Expected one of '{}' but found '{}'.", .0, join(.1), .2)]
     IntrisicArgumentType(&'static str, &'static [Type], Type),
+
+    #[error("Expected string literal.")]
+    ExpectedStringLiteral,
+}
+
+impl From<Spanned<CodeError>> for Vec<Spanned<CodeError>> {
+    fn from(value: Spanned<CodeError>) -> Self {
+        vec![value]
+    }
 }
 
 impl CodeError {
-    fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
-        Spanned(self, span)
+    fn err<T>(self, span: SimpleSpan) -> Result<T, Vec<Spanned<Self>>> {
+        Err(Spanned(self, span).into())
     }
 }
 
@@ -49,6 +61,23 @@ pub enum Type {
     Float,
     Void,
     String,
+}
+
+impl From<Type> for types::Type {
+    fn from(val: Type) -> Self {
+        match val {
+            Type::Int => types::I64,
+            Type::Float => types::F64,
+            Type::Void => types::INVALID,
+            Type::String => types::I64, // TODO: platform ptr size
+        }
+    }
+}
+
+impl From<Type> for AbiParam {
+    fn from(value: Type) -> Self {
+        AbiParam::new(value.into())
+    }
 }
 
 impl Display for Type {
@@ -94,20 +123,6 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
     };
     let mut context = Context::new();
 
-    let printf_signature = Signature {
-        call_conv: isa.default_call_conv(),
-        params: vec![AbiParam::new(isa.pointer_type()), AbiParam::new(types::I64)],
-        returns: vec![AbiParam::new(types::I32)],
-    };
-
-    let printf_id = module
-        .declare_function(
-            "printf",
-            cranelift_module::Linkage::Import,
-            &printf_signature,
-        )
-        .unwrap();
-
     let mut data_desc = DataDescription::new();
     let string_data = b"%d\n\0";
     data_desc.define(string_data.to_vec().into_boxed_slice());
@@ -135,17 +150,30 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
     let mut builder = FunctionBuilder::new(&mut context.func, &mut function_context);
     builder.func.signature = main_signature;
 
-    let printf_ref = module.declare_func_in_func(printf_id, builder.func);
-
     let main_block = builder.create_block();
     builder.switch_to_block(main_block);
     builder.seal_block(main_block);
 
+    let printf_signature = Signature {
+        call_conv: isa.default_call_conv(),
+        params: vec![AbiParam::new(types::I64)],
+        returns: vec![AbiParam::new(types::I32)],
+    };
+
+    let printf_id = module
+        .declare_function(
+            "printf",
+            cranelift_module::Linkage::Import,
+            &printf_signature,
+        )
+        .unwrap();
+
     let generator = Generator {
+        isa: isa.clone(),
         builder,
         module: &mut module,
         strings: 0,
-        printf_ref,
+        printf_id,
         returned: false,
     };
 
@@ -163,13 +191,20 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
     Ok(module.finish())
 }
 
-type BuildValueResult = Result<(Value, Type), Spanned<CodeError>>;
+fn get_printf_ref() -> FuncRef {
+    todo!()
+}
+
+type BuildValueResult = Result<(Value, Type), Vec<Spanned<CodeError>>>;
+
+type BuildStatementResult = Result<(), Vec<Spanned<CodeError>>>;
 
 struct Generator<'a> {
+    isa: std::sync::Arc<dyn TargetIsa>,
     builder: FunctionBuilder<'a>,
     module: &'a mut ObjectModule,
     strings: usize,
-    printf_ref: FuncRef,
+    printf_id: FuncId,
     returned: bool,
 }
 
@@ -177,8 +212,8 @@ impl Generator<'_> {
     fn build(mut self, program: Program) -> Result<(), GeneratorErrors> {
         let mut errors = Vec::new();
         for statement in &program.statements {
-            if let Err(error) = self.build_statement(statement) {
-                errors.push(error);
+            if let Err(mut error) = self.build_statement(statement) {
+                errors.append(&mut error);
             }
         }
 
@@ -194,16 +229,13 @@ impl Generator<'_> {
         Ok(())
     }
 
-    fn build_statement(
-        &mut self,
-        statement: &Spanned<Statement>,
-    ) -> Result<(), Spanned<CodeError>> {
+    fn build_statement(&mut self, statement: &Spanned<Statement>) -> BuildStatementResult {
         match &statement.0 {
             Statement::Return(expr) => {
                 let value = self.build_expression(expr)?;
 
                 if value.1 != Type::Int {
-                    return Err(Spanned(CodeError::InvalidReturnType(value.1), expr.1));
+                    return CodeError::InvalidReturnType(value.1).err(expr.1);
                 }
 
                 let cast = self.builder.ins().ireduce(types::I32, value.0);
@@ -236,12 +268,7 @@ impl Generator<'_> {
                 self.strings += 1;
                 let string_data_id = self
                     .module
-                    .declare_data(
-                        &format!("format_string_{string_id}"),
-                        Linkage::Local,
-                        true,
-                        false,
-                    )
+                    .declare_data(&format!("string_{string_id}"), Linkage::Local, true, false)
                     .expect("Failed to declare string data");
 
                 self.module
@@ -263,10 +290,7 @@ impl Generator<'_> {
                 let b_value = self.build_expression(b.as_ref())?;
 
                 if a_value.1 != b_value.1 {
-                    return Err(Spanned(
-                        CodeError::IncompatipleBinOpTypes(*op, a_value.1, b_value.1),
-                        *span,
-                    ));
+                    return CodeError::IncompatipleBinOpTypes(*op, a_value.1, b_value.1).err(*span);
                 }
 
                 let result_type = a_value.1;
@@ -274,70 +298,16 @@ impl Generator<'_> {
                     Type::Int => self.build_int_bin_op(*op, a_value.0, b_value.0),
                     Type::Float => self.build_float_bin_op(*op, a_value.0, b_value.0),
                     _ => {
-                        return Err(CodeError::InvalidBinOpType(*op, result_type).spanned(*span));
+                        return CodeError::InvalidBinOpType(*op, result_type).err(*span);
                     }
                 };
 
                 Ok((result_value, a_value.1))
             }
             Expression::Intrinsic(intrinsic) => match intrinsic {
-                Intrinsic::Print(args) => {
-                    const ARG_COUNT: usize = 2;
-                    if args.len() < ARG_COUNT {
-                        return Err(CodeError::IntrinsicTooFewArguments(
-                            intrinsic.name(),
-                            ARG_COUNT,
-                            args.len(),
-                        )
-                        .spanned(*span));
-                    } else if args.len() > ARG_COUNT {
-                        return Err(CodeError::IntrinsicTooManyArguments(
-                            intrinsic.name(),
-                            ARG_COUNT,
-                            args.len(),
-                        )
-                        .spanned(*span));
-                    }
-
-                    let arg_a = &args[0];
-                    let arg_a_value = self.build_expression(arg_a)?;
-
-                    if arg_a_value.1 != Type::String {
-                        return Err(CodeError::IntrisicArgumentType(
-                            intrinsic.name(),
-                            &[Type::String],
-                            arg_a_value.1,
-                        )
-                        .spanned(arg_a.1));
-                    }
-
-                    let arg_b = &args[1];
-                    let arg_b_value = self.build_expression(arg_b)?;
-
-                    const PRINT_ARG_TYPES: [Type; 3] = [Type::Int, Type::Float, Type::String];
-                    if !PRINT_ARG_TYPES.contains(&arg_b_value.1) {
-                        return Err(CodeError::IntrisicArgumentType(
-                            intrinsic.name(),
-                            &PRINT_ARG_TYPES,
-                            arg_b_value.1,
-                        )
-                        .spanned(arg_b.1));
-                    }
-
-                    // TODO: use platform ptr size?
-                    let result = self
-                        .builder
-                        .ins()
-                        .call(self.printf_ref, &[arg_a_value.0, arg_b_value.0]);
-                    let value = self.builder.func.dfg.inst_results(result)[0];
-                    // TODO: Type::I32
-                    Ok((value, Type::Int))
-                }
+                Intrinsic::Print(args) => self.build_printf(span, args),
             },
-            _ => Err(Spanned(
-                CodeError::NoYetSupported(format!("{expression:?}",)),
-                *span,
-            )),
+            _ => CodeError::NoYetSupported(format!("{expression:?}",)).err(*span),
         }
     }
 
@@ -357,6 +327,68 @@ impl Generator<'_> {
             BinOp::Mul => self.builder.ins().fmul(a, b),
             BinOp::Div => self.builder.ins().fdiv(a, b),
         }
+    }
+
+    fn build_printf(
+        &mut self,
+        span: &SimpleSpan,
+        args: &[Spanned<Expression>],
+    ) -> BuildValueResult {
+        let Some((format_string_arg, other_args)) = args.split_first() else {
+            return CodeError::IntrinsicTooFewArguments("print", 1, args.len()).err(*span);
+        };
+
+        // TODO: validate format string/generate own format string
+        let Expression::String(_) = &format_string_arg.0 else {
+            return CodeError::ExpectedStringLiteral.err(format_string_arg.1);
+        };
+
+        let arg_values = other_args
+            .iter()
+            .map(|expr| {
+                let result = self.build_expression(expr);
+                if let Ok(value) = &result {
+                    const PRINT_ARG_TYPES: [Type; 3] = [Type::Int, Type::Float, Type::String];
+                    if !PRINT_ARG_TYPES.contains(&value.1) {
+                        return CodeError::IntrisicArgumentType("print", &PRINT_ARG_TYPES, value.1)
+                            .err(expr.1);
+                    }
+                }
+                result
+            })
+            .collect_all()
+            .map_err(|errors| {
+                errors
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<Spanned<CodeError>>>()
+            })?;
+
+        let format_string_value = self.build_expression(format_string_arg)?;
+        debug_assert_eq!(format_string_value.1, Type::String);
+
+        // Because printf is a variadic function we have to change it's signature on the fly
+        // See: adjust_call_for_c_variadic() in rustc_codegen_cranelift
+        let mut params = Vec::with_capacity(arg_values.len() + 1);
+        params.push(AbiParam::new(self.isa.pointer_type()));
+        params.extend(arg_values.iter().map(|(_, t)| AbiParam::from(*t)));
+
+        let printf_ref = self
+            .module
+            .declare_func_in_func(self.printf_id, self.builder.func);
+
+        let sig_ref = self.builder.func.dfg.ext_funcs[printf_ref].signature;
+        self.builder.func.dfg.signatures[sig_ref].params = params;
+
+        let mut call_args = Vec::with_capacity(arg_values.len() + 1);
+        call_args.push(format_string_value.0);
+        call_args.extend(arg_values.iter().map(|(val, _)| *val));
+
+        let result = self.builder.ins().call(printf_ref, &call_args);
+
+        let value = self.builder.func.dfg.inst_results(result)[0];
+        // TODO: Type::I32
+        Ok((value, Type::Int))
     }
 }
 
