@@ -53,6 +53,14 @@ pub enum Intrinsic {
     Print(Vec<Spanned<Expression>>),
 }
 
+impl Intrinsic {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Print(_) => "@print",
+        }
+    }
+}
+
 const KEY_WORDS: [&str; 2] = ["let", "return"];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone

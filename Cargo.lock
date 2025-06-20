@@ -372,6 +372,7 @@ dependencies = [
  "ariadne",
  "chumsky",
  "cranelift",
+ "cranelift-codegen",
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
