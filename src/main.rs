@@ -13,7 +13,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::PathBuf,
-    process::Command,
+    process::{Command, ExitCode},
 };
 
 pub use chumsky::span::SimpleSpan;
@@ -22,7 +22,7 @@ mod generator;
 mod lexer;
 mod parser;
 
-fn main() {
+fn main() -> ExitCode {
     let file_path = PathBuf::from(env::args().nth(1).expect("Expected file argument"));
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = PathBuf::from(base_name);
@@ -71,7 +71,7 @@ fn main() {
     }
 
     let Some(program) = result.into_output() else {
-        return;
+        return ExitCode::from(10);
     };
 
     println!();
@@ -93,14 +93,14 @@ fn main() {
                         .eprint((&file_name, src.clone()))
                         .unwrap();
                 }
-                return;
+                return ExitCode::from(11);
             }
             GeneratorErrors::VerifierErrors(verifier_errors) => {
                 for error in verifier_errors {
                     // TODO: make this printing nice
                     eprintln!("{error}");
                 }
-                return;
+                return ExitCode::from(12);
             }
         },
     };
@@ -131,4 +131,6 @@ fn main() {
     }
 
     println!("Saved executable to {}", exe_file.display());
+
+    ExitCode::SUCCESS
 }
