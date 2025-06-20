@@ -15,11 +15,11 @@
 
 // let value = (3 + 6);
 
-@print("Hello World ", 0);
+@print("Hello World\n", 0);
 
-@print("Number: %d   ", 2 * (3 + 6));
+@print("Number: %d   \n", 2 * (3 + 6));
 
-@print("String: %s", "ßßßß");
+@print("String: %s \n", "ßßßß");
 
 return 3 * (4 * 4 + 4) + 3 * 3;
 
