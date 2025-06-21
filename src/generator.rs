@@ -291,6 +291,17 @@ impl Generator<'_> {
                     }
                 }
             }
+            Statement::Block(statements) => {
+                let mut errors = Vec::new();
+                for statement in statements {
+                    if let Err(mut error) = self.build_statement(statement) {
+                        errors.append(&mut error);
+                    }
+                }
+                if !errors.is_empty() {
+                    return Err(errors);
+                }
+            }
         }
 
         Ok(())

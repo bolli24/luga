@@ -10,9 +10,10 @@
 
 // @print(2);
 
-
-let pi = 3;
-let tau = 2 * pi;
+{
+    let pi = 3;
+    let tau = 2 * pi;
+}
 
 @print("pi: %d \n", pi);
 @print("tau: %d\n", tau);

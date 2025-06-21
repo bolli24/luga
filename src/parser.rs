@@ -17,6 +17,7 @@ pub enum Statement {
     Binding(String, Spanned<Expression>),
     Assignment(String, Spanned<Expression>),
     Return(Spanned<Expression>),
+    Block(Vec<Spanned<Statement>>),
 }
 
 #[derive(Clone, Debug)]
@@ -171,15 +172,26 @@ where
             Spanned(Statement::Return(expr), extra.span())
         });
 
-    let statement = choice((
-        r#return,
-        binding,
-        assignment,
-        expression.map_with(|expr: Spanned<Expression>, extra| {
-            Spanned(Statement::Expression(expr), extra.span())
-        }),
-    ))
-    .then_ignore(just(Token::Semicolon));
+    let mut statement = Recursive::declare();
+
+    let block = statement
+        .clone()
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
+
+    statement.define(
+        choice((
+            r#return,
+            binding,
+            assignment,
+            expression.map_with(|expr: Spanned<Expression>, extra| {
+                Spanned(Statement::Expression(expr), extra.span())
+            }),
+        ))
+        .then_ignore(just(Token::Semicolon))
+        .or(block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span()))),
+    );
 
     let program = statement.repeated().collect::<Vec<_>>();
 
