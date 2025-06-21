@@ -182,7 +182,8 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
         strings: 0,
         printf_id,
         returned: false,
-        vars: HashMap::new(),
+        current_scope: Scope::new(),
+        var_count: 0,
     };
 
     generator.build(program)?;
@@ -207,6 +208,38 @@ type BuildValueResult = Result<(Value, Type), Vec<Spanned<CodeError>>>;
 
 type BuildStatementResult = Result<(), Vec<Spanned<CodeError>>>;
 
+struct Scope {
+    vars: HashMap<String, (Variable, Type)>,
+    parent: Option<Box<Scope>>,
+}
+
+impl Scope {
+    pub fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            parent: None,
+        }
+    }
+
+    pub fn get_var(&self, name: &str) -> Option<&(Variable, Type)> {
+        self.vars
+            .get(name)
+            .or_else(|| self.parent.as_ref()?.get_var(name))
+    }
+
+    pub fn insert(&mut self, name: String, var: (Variable, Type)) -> Result<(), ()> {
+        use std::collections::hash_map::Entry;
+
+        match self.vars.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(var);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(()),
+        }
+    }
+}
+
 struct Generator<'a> {
     isa: std::sync::Arc<dyn TargetIsa>,
     builder: FunctionBuilder<'a>,
@@ -214,7 +247,8 @@ struct Generator<'a> {
     strings: usize,
     printf_id: FuncId,
     returned: bool,
-    vars: HashMap<String, (Variable, Type)>,
+    current_scope: Scope,
+    var_count: usize,
 }
 
 impl Generator<'_> {
@@ -256,48 +290,52 @@ impl Generator<'_> {
             }
             Statement::Binding(name, expr) => {
                 let value = self.build_expression(expr)?;
-                use std::collections::hash_map::Entry::*;
 
-                let count = self.vars.len();
-                match self.vars.entry(name.clone()) {
-                    Occupied(_) => {
-                        return CodeError::VariableRedefinition(name.clone()).err(statement.1);
-                    }
-                    Vacant(entry) => {
-                        let var = Variable::new(count);
-                        self.builder.declare_var(var, value.1.into());
-                        self.builder.def_var(var, value.0);
+                let Ok(var) = self.new_var(name.clone(), value.1) else {
+                    return CodeError::VariableRedefinition(name.clone()).err(statement.1);
+                };
 
-                        entry.insert((var, value.1));
-                    }
-                }
+                self.builder.declare_var(var, value.1.into());
+                self.builder.def_var(var, value.0);
             }
             Statement::Assignment(name, expr) => {
                 let value = self.build_expression(expr)?;
-                use std::collections::hash_map::Entry::*;
 
-                match self.vars.entry(name.clone()) {
-                    Occupied(entry) => {
-                        let (var, var_type) = *entry.get();
-                        if value.1 != var_type {
-                            return CodeError::AssignmentIncompatibleTypes(var_type, value.1)
-                                .err(statement.1);
-                        }
+                if let Some(&(var, var_type)) = self.current_scope.get_var(name) {
+                    if value.1 != var_type {
+                        return CodeError::AssignmentIncompatibleTypes(var_type, value.1)
+                            .err(statement.1);
+                    }
 
-                        self.builder.def_var(var, value.0);
-                    }
-                    Vacant(_) => {
-                        return CodeError::UnknownVariable(name.clone()).err(statement.1);
-                    }
+                    self.builder.def_var(var, value.0);
+                } else {
+                    return CodeError::UnknownVariable(name.clone()).err(statement.1);
                 }
             }
             Statement::Block(statements) => {
                 let mut errors = Vec::new();
+
+                let new_block = self.builder.create_block();
+                self.builder.ins().jump(new_block, []);
+                self.builder.switch_to_block(new_block);
+                self.builder.seal_block(new_block);
+                self.push_scope();
+
                 for statement in statements {
                     if let Err(mut error) = self.build_statement(statement) {
                         errors.append(&mut error);
                     }
                 }
+
+                if !self.pop_scope() {
+                    unreachable!("Must always be able to pop scope after leaving block.");
+                }
+
+                let new_block = self.builder.create_block();
+                self.builder.ins().jump(new_block, []);
+                self.builder.switch_to_block(new_block);
+                self.builder.seal_block(new_block);
+
                 if !errors.is_empty() {
                     return Err(errors);
                 }
@@ -364,7 +402,7 @@ impl Generator<'_> {
                 Intrinsic::Print(args) => self.build_printf(span, args),
             },
             Expression::Identifier(name) => {
-                let Some((var, var_type)) = self.vars.get(name) else {
+                let Some((var, var_type)) = self.current_scope.get_var(name) else {
                     return CodeError::UnknownVariable(name.to_owned()).err(*span);
                 };
 
@@ -451,6 +489,34 @@ impl Generator<'_> {
         let value = self.builder.func.dfg.inst_results(result)[0];
         // TODO: Type::I32
         Ok((value, Type::Int))
+    }
+
+    fn push_scope(&mut self) {
+        let old_scope = std::mem::replace(
+            &mut self.current_scope,
+            Scope {
+                vars: HashMap::new(),
+                parent: None,
+            },
+        );
+        self.current_scope.parent = Some(Box::new(old_scope));
+    }
+
+    fn pop_scope(&mut self) -> bool {
+        if let Some(mut parent) = self.current_scope.parent.take() {
+            std::mem::swap(&mut self.current_scope, &mut *parent);
+            true
+        } else {
+            // No parent to pop to — already at root
+            false
+        }
+    }
+
+    fn new_var(&mut self, name: String, var_type: Type) -> Result<Variable, ()> {
+        let var = Variable::new(self.var_count);
+        self.current_scope.insert(name, (var, var_type))?;
+        self.var_count += 1;
+        Ok(var)
     }
 }
 

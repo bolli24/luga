@@ -13,10 +13,19 @@
 {
     let pi = 3;
     let tau = 2 * pi;
+    tau = 6;
+
+    {
+        @print("pi: %d \n", pi);
+        @print("tau: %d\n", tau);
+    }
+
+    {
+        let x = pi + tau;
+        @print("x: %d\n", x);
+    }
 }
 
-@print("pi: %d \n", pi);
-@print("tau: %d\n", tau);
 
 // let value = (3 + 6);
 
@@ -26,7 +35,7 @@
 
 // @print("String: %s \n", "ßßßß");
 
-@print("A bunch of numbers: %d, %d, %d, %d, %s, %d", 1, 2, 3, 4, "5", 6);
+// @print("A bunch of numbers: %d, %d, %d, %d, %s, %d", 1, 2, 3, 4, "5", 6);
 
 return 3 * (4 * 4 + 4) + 3 * 3;
 
