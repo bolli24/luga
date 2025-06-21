@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{collections::HashMap, fmt::Display};
 
 use chumsky::span::SimpleSpan;
 use cranelift::{
@@ -36,6 +36,13 @@ pub enum CodeError {
 
     #[error("Expected string literal.")]
     ExpectedStringLiteral,
+
+    #[error("Redefinition of existing variable '{}'.", .0)]
+    VariableRedefinition(String),
+    #[error("Use of unknown variable '{}'.", .0)]
+    UnknownVariable(String),
+    #[error("Can't assign value of type '{}' to variable of type '{}'.", .1, .0)]
+    AssignmentIncompatibleTypes(Type, Type),
 }
 
 impl From<Spanned<CodeError>> for Vec<Spanned<CodeError>> {
@@ -175,6 +182,7 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
         strings: 0,
         printf_id,
         returned: false,
+        vars: HashMap::new(),
     };
 
     generator.build(program)?;
@@ -206,6 +214,7 @@ struct Generator<'a> {
     strings: usize,
     printf_id: FuncId,
     returned: bool,
+    vars: HashMap<String, (Variable, Type)>,
 }
 
 impl Generator<'_> {
@@ -245,7 +254,43 @@ impl Generator<'_> {
             Statement::Expression(expr) => {
                 self.build_expression(expr)?;
             }
-            _ => todo!("{statement:?}"),
+            Statement::Binding(name, expr) => {
+                let value = self.build_expression(expr)?;
+                use std::collections::hash_map::Entry::*;
+
+                let count = self.vars.len();
+                match self.vars.entry(name.clone()) {
+                    Occupied(_) => {
+                        return CodeError::VariableRedefinition(name.clone()).err(statement.1);
+                    }
+                    Vacant(entry) => {
+                        let var = Variable::new(count);
+                        self.builder.declare_var(var, value.1.into());
+                        self.builder.def_var(var, value.0);
+
+                        entry.insert((var, value.1));
+                    }
+                }
+            }
+            Statement::Assignment(name, expr) => {
+                let value = self.build_expression(expr)?;
+                use std::collections::hash_map::Entry::*;
+
+                match self.vars.entry(name.clone()) {
+                    Occupied(entry) => {
+                        let (var, var_type) = *entry.get();
+                        if value.1 != var_type {
+                            return CodeError::AssignmentIncompatibleTypes(var_type, value.1)
+                                .err(statement.1);
+                        }
+
+                        self.builder.def_var(var, value.0);
+                    }
+                    Vacant(_) => {
+                        return CodeError::UnknownVariable(name.clone()).err(statement.1);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -307,7 +352,13 @@ impl Generator<'_> {
             Expression::Intrinsic(intrinsic) => match intrinsic {
                 Intrinsic::Print(args) => self.build_printf(span, args),
             },
-            _ => CodeError::NoYetSupported(format!("{expression:?}",)).err(*span),
+            Expression::Identifier(name) => {
+                let Some((var, var_type)) = self.vars.get(name) else {
+                    return CodeError::UnknownVariable(name.to_owned()).err(*span);
+                };
+
+                Ok((self.builder.use_var(*var), *var_type))
+            }
         }
     }
 
@@ -348,7 +399,7 @@ impl Generator<'_> {
             .map(|expr| {
                 let result = self.build_expression(expr);
                 if let Ok(value) = &result {
-                    const PRINT_ARG_TYPES: [Type; 3] = [Type::Int, Type::Float, Type::String];
+                    const PRINT_ARG_TYPES: [Type; 2] = [Type::Int, Type::String];
                     if !PRINT_ARG_TYPES.contains(&value.1) {
                         return CodeError::IntrisicArgumentType("print", &PRINT_ARG_TYPES, value.1)
                             .err(expr.1);
