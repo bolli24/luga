@@ -1,0 +1,5 @@
+@assert(69 == 20 * 3 + 9);
+
+@assert(true);
+
+@exit(100);

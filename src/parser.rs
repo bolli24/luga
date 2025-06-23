@@ -61,12 +61,16 @@ impl Display for BinOp {
 #[derive(Clone, Debug)]
 pub enum Intrinsic {
     Print(Vec<Spanned<Expression>>),
+    Assert(Vec<Spanned<Expression>>),
+    Exit(Vec<Spanned<Expression>>),
 }
 
 impl Intrinsic {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Print(_) => "@print",
+            Self::Assert(_) => "@assert",
+            Self::Exit(_) => "@exit",
         }
     }
 }
@@ -182,6 +186,8 @@ where
         .then(call)
         .try_map(|(id, call), span| match id {
             "print" => Ok(Intrinsic::Print(call)),
+            "assert" => Ok(Intrinsic::Assert(call)),
+            "exit" => Ok(Intrinsic::Exit(call)),
             _ => Err(Rich::custom(span, "Unknown intrinsic.")),
         })
         .map_with(|intrinsic, extra| Spanned(Expression::Intrinsic(intrinsic), extra.span()));

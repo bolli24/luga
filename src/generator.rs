@@ -17,6 +17,8 @@ use crate::{
     util::ResultCollectAll,
 };
 
+const UNREACHABLE: TrapCode = TrapCode::unwrap_user(100);
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CodeError {
     #[error("Return value type must be integer, found: {}", .0)]
@@ -30,11 +32,13 @@ pub enum CodeError {
     #[error("Invalid type '{}' for binary operator '{}'", .0 ,.1)]
     InvalidBinOpType(BinOp, Type),
 
-    #[error("Intrisic '{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
+    #[error("Intrisic '@{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
     IntrinsicTooFewArguments(&'static str, usize, usize),
-    #[error("Intrisic '{}' invoked with too many arguments. Expected at most {} but found {}.", .0, .1, .2)]
+    #[error("Intrisic '@{}' invoked with too many arguments. Expected at most {} but found {}.", .0, .1, .2)]
     IntrinsicTooManyArguments(&'static str, usize, usize),
-    #[error("Intrisic '{}' invoked with wrong argument type. Expected one of '{}' but found '{}'.", .0, join(.1), .2)]
+    #[error("Intrisic '@{}' invoked wrong number of arguments. Expected exactly {} but found {}.", .0, .1, .2)]
+    IntrinsicArgumentCount(&'static str, usize, usize),
+    #[error("Intrisic '@{}' invoked with wrong argument type. Expected one of '{}' but found '{}'.", .0, join(.1), .2)]
     IntrisicArgumentType(&'static str, &'static [Type], Type),
 
     #[error("Expected string literal.")]
@@ -46,6 +50,8 @@ pub enum CodeError {
     UnknownVariable(String),
     #[error("Can't assign value of type '{}' to variable of type '{}'.", .1, .0)]
     AssignmentIncompatibleTypes(Type, Type),
+    #[error("Can't create variable of type '{}'.", .0)]
+    BindingType(Type),
 
     #[error("Invalid type '{}' for condition. Must be 'bool'.", .0)]
     InvalidConditionType(Type),
@@ -79,6 +85,7 @@ pub enum Type {
     Int,
     Float,
     Void,
+    Never,
     String,
     Bool,
 }
@@ -89,6 +96,7 @@ impl From<Type> for types::Type {
             Type::Int => types::I64,
             Type::Float => types::F64,
             Type::Void => types::INVALID,
+            Type::Never => types::INVALID,
             Type::String => types::I64, // TODO: platform ptr size
             Type::Bool => types::I8,
         }
@@ -107,6 +115,7 @@ impl Display for Type {
             Type::Int => write!(f, "integer"),
             Type::Float => write!(f, "float"),
             Type::Void => write!(f, "void"),
+            Type::Never => write!(f, "never"),
             Type::String => write!(f, "string"),
             Type::Bool => write!(f, "bool"),
         }
@@ -190,12 +199,23 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
         )
         .unwrap();
 
+    let exit_signature = Signature {
+        call_conv: isa.default_call_conv(),
+        params: vec![AbiParam::new(types::I32)],
+        returns: vec![],
+    };
+
+    let exit_id = module
+        .declare_function("exit", cranelift_module::Linkage::Import, &exit_signature)
+        .unwrap();
+
     let generator = Generator {
         isa: isa.clone(),
         builder,
         module: &mut module,
         strings: 0,
         printf_id,
+        exit_id,
         returned: false,
         current_scope: Scope::new(),
         var_count: 0,
@@ -258,6 +278,7 @@ struct Generator<'a> {
     module: &'a mut ObjectModule,
     strings: usize,
     printf_id: FuncId,
+    exit_id: FuncId,
     returned: bool,
     current_scope: Scope,
     var_count: usize,
@@ -306,6 +327,10 @@ impl Generator<'_> {
                 let Ok(var) = self.new_var(name.clone(), value) else {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
+
+                if !matches!(value.1, Type::Int | Type::Float | Type::String | Type::Bool) {
+                    return CodeError::BindingType(value.1).err(expr.1);
+                }
 
                 self.builder.declare_var(var, value.1.into());
                 self.builder.def_var(var, value.0);
@@ -421,6 +446,8 @@ impl Generator<'_> {
             }
             Expression::Intrinsic(intrinsic) => match intrinsic {
                 Intrinsic::Print(args) => self.build_printf(span, args),
+                Intrinsic::Assert(args) => self.build_assert(span, args),
+                Intrinsic::Exit(args) => self.build_exit(span, args),
             },
             Expression::Identifier(name) => {
                 let Some((var, var_type)) = self.current_scope.get_var(name) else {
@@ -619,6 +646,69 @@ impl Generator<'_> {
             return Err(errors);
         }
         Ok((Value::new((u32::MAX - 1) as usize), Type::Void))
+    }
+
+    fn build_assert(
+        &mut self,
+        span: &SimpleSpan,
+        args: &[Spanned<Expression>],
+    ) -> Result<(Value, Type), ManyErrors> {
+        if args.len() != 1 {
+            return CodeError::IntrinsicArgumentCount("assert", 1, args.len()).err(*span);
+        }
+
+        let condition = self.build_expression(&args[0])?;
+        if condition.1 != Type::Bool {
+            return CodeError::IntrisicArgumentType("assert", &[Type::Bool], condition.1)
+                .err(args[0].1);
+        }
+
+        let exit_code = self.builder.ins().iconst(types::I32, 1);
+
+        let exit_ref = self
+            .module
+            .declare_func_in_func(self.exit_id, self.builder.func);
+
+        let exit_block = self.builder.create_block();
+        let continue_block = self.builder.create_block();
+
+        self.builder
+            .ins()
+            .brif(condition.0, continue_block, [], exit_block, []);
+
+        self.builder.seal_block(exit_block);
+        self.builder.seal_block(continue_block);
+
+        self.builder.switch_to_block(exit_block);
+        self.builder.ins().call(exit_ref, &[exit_code]);
+        self.builder.ins().trap(UNREACHABLE);
+
+        self.builder.switch_to_block(continue_block);
+
+        Ok((Value::from_u32(u32::MAX - 1), Type::Void))
+    }
+
+    fn build_exit(
+        &mut self,
+        span: &SimpleSpan,
+        args: &[Spanned<Expression>],
+    ) -> Result<(Value, Type), ManyErrors> {
+        if args.len() != 1 {
+            return CodeError::IntrinsicArgumentCount("exit", 1, args.len()).err(*span);
+        }
+
+        let expr = self.build_expression(&args[0])?;
+        if expr.1 != Type::Int {
+            return CodeError::IntrisicArgumentType("exit", &[Type::Bool], expr.1).err(args[0].1);
+        }
+
+        let exit_ref = self
+            .module
+            .declare_func_in_func(self.exit_id, self.builder.func);
+
+        let cast = self.builder.ins().ireduce(types::I32, expr.0);
+        self.builder.ins().call(exit_ref, &[cast]);
+        Ok((Value::from_u32(u32::MAX - 1), Type::Never))
     }
 }
 
