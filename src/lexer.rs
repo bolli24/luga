@@ -20,6 +20,8 @@ pub enum Token<'a> {
 
     #[token("=")]
     Equal,
+    #[token("==")]
+    EqualEqual,
 
     #[token(";")]
     Semicolon,
@@ -125,6 +127,7 @@ impl Display for Token<'_> {
             Token::Star => write!(f, "*"),
             Token::Slash => write!(f, "/"),
             Token::Equal => write!(f, "="),
+            Token::EqualEqual => write!(f, "=="),
         }
     }
 }

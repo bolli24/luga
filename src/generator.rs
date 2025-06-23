@@ -1,11 +1,14 @@
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
 use chumsky::span::SimpleSpan;
 use cranelift::{
     codegen::{Context, verifier::VerifierError, verify_function},
     prelude::*,
 };
-use cranelift_codegen::{ir::FuncRef, isa::TargetIsa};
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 
@@ -43,9 +46,14 @@ pub enum CodeError {
     UnknownVariable(String),
     #[error("Can't assign value of type '{}' to variable of type '{}'.", .1, .0)]
     AssignmentIncompatibleTypes(Type, Type),
+
+    #[error("Invalid type '{}' for condition. Must be 'bool'.", .0)]
+    InvalidConditionType(Type),
+    #[error("All branches of an if expression must have same type.")]
+    IfExpressionType,
 }
 
-impl From<Spanned<CodeError>> for Vec<Spanned<CodeError>> {
+impl From<Spanned<CodeError>> for ManyErrors {
     fn from(value: Spanned<CodeError>) -> Self {
         vec![value]
     }
@@ -55,10 +63,14 @@ impl CodeError {
     fn err<T>(self, span: SimpleSpan) -> Result<T, Vec<Spanned<Self>>> {
         Err(Spanned(self, span).into())
     }
+
+    fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
+        Spanned(self, span)
+    }
 }
 
 pub enum GeneratorErrors {
-    CodeErrors(Vec<Spanned<CodeError>>),
+    CodeErrors(ManyErrors),
     VerifierErrors(Vec<VerifierError>),
 }
 
@@ -68,6 +80,7 @@ pub enum Type {
     Float,
     Void,
     String,
+    Bool,
 }
 
 impl From<Type> for types::Type {
@@ -77,6 +90,7 @@ impl From<Type> for types::Type {
             Type::Float => types::F64,
             Type::Void => types::INVALID,
             Type::String => types::I64, // TODO: platform ptr size
+            Type::Bool => types::I8,
         }
     }
 }
@@ -94,6 +108,7 @@ impl Display for Type {
             Type::Float => write!(f, "float"),
             Type::Void => write!(f, "void"),
             Type::String => write!(f, "string"),
+            Type::Bool => write!(f, "bool"),
         }
     }
 }
@@ -200,39 +215,36 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
     Ok(module.finish())
 }
 
-fn get_printf_ref() -> FuncRef {
-    todo!()
-}
-
-type BuildValueResult = Result<(Value, Type), Vec<Spanned<CodeError>>>;
-
-type BuildStatementResult = Result<(), Vec<Spanned<CodeError>>>;
+type ManyErrors = Vec<Spanned<CodeError>>;
 
 struct Scope {
-    vars: HashMap<String, (Variable, Type)>,
+    vars_name: HashMap<String, (Variable, Type)>,
+    vars: HashSet<usize>,
     parent: Option<Box<Scope>>,
 }
 
 impl Scope {
     pub fn new() -> Self {
         Self {
-            vars: HashMap::new(),
+            vars_name: HashMap::new(),
+            vars: HashSet::new(),
             parent: None,
         }
     }
 
     pub fn get_var(&self, name: &str) -> Option<&(Variable, Type)> {
-        self.vars
+        self.vars_name
             .get(name)
             .or_else(|| self.parent.as_ref()?.get_var(name))
     }
 
-    pub fn insert(&mut self, name: String, var: (Variable, Type)) -> Result<(), ()> {
+    pub fn insert(&mut self, name: String, var: Variable, value: (Value, Type)) -> Result<(), ()> {
         use std::collections::hash_map::Entry;
 
-        match self.vars.entry(name) {
+        match self.vars_name.entry(name) {
             Entry::Vacant(entry) => {
-                entry.insert(var);
+                entry.insert((var, value.1));
+                self.vars.insert(var.index());
                 Ok(())
             }
             Entry::Occupied(_) => Err(()),
@@ -272,7 +284,7 @@ impl Generator<'_> {
         Ok(())
     }
 
-    fn build_statement(&mut self, statement: &Spanned<Statement>) -> BuildStatementResult {
+    fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<(), ManyErrors> {
         match &statement.0 {
             Statement::Return(expr) => {
                 let value = self.build_expression(expr)?;
@@ -291,7 +303,7 @@ impl Generator<'_> {
             Statement::Binding(name, expr) => {
                 let value = self.build_expression(expr)?;
 
-                let Ok(var) = self.new_var(name.clone(), value.1) else {
+                let Ok(var) = self.new_var(name.clone(), value) else {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
 
@@ -327,7 +339,7 @@ impl Generator<'_> {
                     }
                 }
 
-                if !self.pop_scope() {
+                if self.pop_scope().is_none() {
                     unreachable!("Must always be able to pop scope after leaving block.");
                 }
 
@@ -340,12 +352,19 @@ impl Generator<'_> {
                     return Err(errors);
                 }
             }
+            Statement::If(condition, then_block, else_block) => {
+                // build_if_example(&mut self.builder);
+                self.build_if(condition, then_block, else_block)?;
+            }
         }
 
         Ok(())
     }
 
-    fn build_expression(&mut self, expression: &Spanned<Expression>) -> BuildValueResult {
+    fn build_expression(
+        &mut self,
+        expression: &Spanned<Expression>,
+    ) -> Result<(Value, Type), ManyErrors> {
         let Spanned(expression, span) = expression;
         match expression {
             Expression::Float(value) => Ok((self.builder.ins().f64const(*value), Type::Float)),
@@ -379,24 +398,26 @@ impl Generator<'_> {
 
                 Ok((value, Type::String))
             }
-            Expression::Binary(op, a, b) => {
-                let a_value = self.build_expression(a.as_ref())?;
-                let b_value = self.build_expression(b.as_ref())?;
+            Expression::Bool(value) => Ok((
+                self.builder.ins().iconst(types::I8, *value as i64),
+                Type::Bool,
+            )),
+            Expression::Binary(op, x, y) => {
+                let x_value = self.build_expression(x.as_ref())?;
+                let y_value = self.build_expression(y.as_ref())?;
 
-                if a_value.1 != b_value.1 {
-                    return CodeError::IncompatipleBinOpTypes(*op, a_value.1, b_value.1).err(*span);
+                if x_value.1 != y_value.1 {
+                    return CodeError::IncompatipleBinOpTypes(*op, x_value.1, y_value.1).err(*span);
                 }
 
-                let result_type = a_value.1;
-                let result_value = match result_type {
-                    Type::Int => self.build_int_bin_op(*op, a_value.0, b_value.0),
-                    Type::Float => self.build_float_bin_op(*op, a_value.0, b_value.0),
-                    _ => {
-                        return CodeError::InvalidBinOpType(*op, result_type).err(*span);
-                    }
-                };
-
-                Ok((result_value, a_value.1))
+                let result = match x_value.1 {
+                    Type::Int => self.build_int_bin_op(*op, x_value.0, y_value.0),
+                    Type::Float => self.build_float_bin_op(*op, x_value.0, y_value.0),
+                    Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
+                    _ => None,
+                }
+                .ok_or(CodeError::InvalidBinOpType(*op, x_value.1).spanned(*span))?;
+                Ok(result)
             }
             Expression::Intrinsic(intrinsic) => match intrinsic {
                 Intrinsic::Print(args) => self.build_printf(span, args),
@@ -411,29 +432,50 @@ impl Generator<'_> {
         }
     }
 
-    fn build_int_bin_op(&mut self, op: BinOp, a: Value, b: Value) -> Value {
-        match op {
-            BinOp::Add => self.builder.ins().iadd(a, b),
-            BinOp::Sub => self.builder.ins().isub(a, b),
-            BinOp::Mul => self.builder.ins().imul(a, b),
-            BinOp::Div => self.builder.ins().sdiv(a, b),
-        }
+    fn build_int_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
+        Some((
+            match op {
+                BinOp::Add => self.builder.ins().iadd(x, y),
+                BinOp::Sub => self.builder.ins().isub(x, y),
+                BinOp::Mul => self.builder.ins().imul(x, y),
+                BinOp::Div => self.builder.ins().sdiv(x, y),
+                BinOp::Equal => self.builder.ins().icmp(IntCC::Equal, x, y),
+            },
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Type::Int,
+                BinOp::Equal => Type::Bool,
+            },
+        ))
     }
 
-    fn build_float_bin_op(&mut self, op: BinOp, a: Value, b: Value) -> Value {
-        match op {
-            BinOp::Add => self.builder.ins().fadd(a, b),
-            BinOp::Sub => self.builder.ins().fsub(a, b),
-            BinOp::Mul => self.builder.ins().fmul(a, b),
-            BinOp::Div => self.builder.ins().fdiv(a, b),
-        }
+    fn build_float_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
+        Some((
+            match op {
+                BinOp::Add => self.builder.ins().fadd(x, y),
+                BinOp::Sub => self.builder.ins().fsub(x, y),
+                BinOp::Mul => self.builder.ins().fmul(x, y),
+                BinOp::Div => self.builder.ins().fdiv(x, y),
+                BinOp::Equal => self.builder.ins().fcmp(FloatCC::Equal, x, y),
+            },
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Type::Int,
+                BinOp::Equal => Type::Bool,
+            },
+        ))
+    }
+
+    fn build_bool_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
+        Some(match op {
+            BinOp::Equal => (self.builder.ins().icmp(IntCC::Equal, x, y), Type::Bool),
+            _ => return None,
+        })
     }
 
     fn build_printf(
         &mut self,
         span: &SimpleSpan,
         args: &[Spanned<Expression>],
-    ) -> BuildValueResult {
+    ) -> Result<(Value, Type), ManyErrors> {
         let Some((format_string_arg, other_args)) = args.split_first() else {
             return CodeError::IntrinsicTooFewArguments("print", 1, args.len()).err(*span);
         };
@@ -457,12 +499,7 @@ impl Generator<'_> {
                 result
             })
             .collect_all()
-            .map_err(|errors| {
-                errors
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<Spanned<CodeError>>>()
-            })?;
+            .map_err(|errors| errors.into_iter().flatten().collect::<ManyErrors>())?;
 
         let format_string_value = self.build_expression(format_string_arg)?;
         debug_assert_eq!(format_string_value.1, Type::String);
@@ -492,31 +529,96 @@ impl Generator<'_> {
     }
 
     fn push_scope(&mut self) {
-        let old_scope = std::mem::replace(
-            &mut self.current_scope,
-            Scope {
-                vars: HashMap::new(),
-                parent: None,
-            },
-        );
+        let old_scope = std::mem::replace(&mut self.current_scope, Scope::new());
         self.current_scope.parent = Some(Box::new(old_scope));
     }
 
-    fn pop_scope(&mut self) -> bool {
+    fn pop_scope(&mut self) -> Option<Scope> {
         if let Some(mut parent) = self.current_scope.parent.take() {
             std::mem::swap(&mut self.current_scope, &mut *parent);
-            true
+            let child = parent;
+            Some(*child)
         } else {
             // No parent to pop to — already at root
-            false
+            None
         }
     }
 
-    fn new_var(&mut self, name: String, var_type: Type) -> Result<Variable, ()> {
+    fn new_var(&mut self, name: String, value: (Value, Type)) -> Result<Variable, ()> {
         let var = Variable::new(self.var_count);
-        self.current_scope.insert(name, (var, var_type))?;
+        self.current_scope.insert(name, var, value)?;
         self.var_count += 1;
         Ok(var)
+    }
+
+    // TODO: if expression
+    fn build_if(
+        &mut self,
+        condition: &Spanned<Expression>,
+        then_body: &[Spanned<Statement>],
+        else_body: &[Spanned<Statement>],
+    ) -> Result<(), ManyErrors> {
+        let condition_block = self.builder.create_block();
+        self.builder.ins().jump(condition_block, []);
+        self.builder.switch_to_block(condition_block);
+        self.builder.seal_block(condition_block);
+
+        let condition_value = self.build_expression(condition)?;
+
+        if condition_value.1 != Type::Bool {
+            return CodeError::InvalidConditionType(condition_value.1).err(condition.1);
+        }
+
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let exit_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(condition_value.0, then_block, [], else_block, []);
+
+        self.builder.seal_block(then_block);
+        self.builder.seal_block(else_block);
+
+        self.builder.switch_to_block(then_block);
+        let then_value = self.build_block_body(then_body)?;
+        self.builder.ins().jump(exit_block, []);
+
+        self.builder.switch_to_block(else_block);
+        let else_value = self.build_block_body(else_body)?;
+        self.builder.ins().jump(exit_block, []);
+
+        self.builder.switch_to_block(exit_block);
+
+        if then_value.1 != else_value.1 {
+            return CodeError::IfExpressionType
+                .err(else_body.last().or(then_body.last()).unwrap().1);
+        }
+
+        Ok(())
+    }
+
+    fn build_block_body(
+        &mut self,
+        then_body: &[Spanned<Statement>],
+    ) -> Result<(Value, Type), ManyErrors> {
+        self.push_scope();
+
+        let mut errors = Vec::new();
+
+        for statement in then_body {
+            if let Err(mut error) = self.build_statement(statement) {
+                errors.append(&mut error);
+            }
+        }
+
+        let Some(_) = self.pop_scope() else {
+            unreachable!("Must always be able to pop scope after leaving block.");
+        };
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        Ok((Value::new((u32::MAX - 1) as usize), Type::Void))
     }
 }
 

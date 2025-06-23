@@ -18,6 +18,11 @@ pub enum Statement {
     Assignment(String, Spanned<Expression>),
     Return(Spanned<Expression>),
     Block(Vec<Spanned<Statement>>),
+    If(
+        Box<Spanned<Expression>>,
+        Vec<Spanned<Statement>>,
+        Vec<Spanned<Statement>>,
+    ),
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +31,8 @@ pub enum Expression {
     Float(f64),
     Integer(i64),
     String(String),
+    Bool(bool),
+
     Intrinsic(Intrinsic),
     Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
 }
@@ -36,6 +43,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Equal,
 }
 
 impl Display for BinOp {
@@ -45,6 +53,7 @@ impl Display for BinOp {
             BinOp::Sub => write!(f, "-"),
             BinOp::Mul => write!(f, "*"),
             BinOp::Div => write!(f, "/"),
+            BinOp::Equal => write!(f, "=="),
         }
     }
 }
@@ -62,7 +71,7 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 2] = ["let", "return"];
+const KEY_WORDS: [&str; 6] = ["let", "return", "if", "else", "true", "false"];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
 where
@@ -86,11 +95,17 @@ where
 
     let string = select! {Token::Quoted(s) => s.to_owned()};
 
+    let bool = select! {
+        Token::Id("true") => Expression::Bool(true),
+        Token::Id("false") => Expression::Bool(false)
+    };
+
     let bin_op = select! {
         Token::Plus => BinOp::Add,
         Token::Minus => BinOp::Sub,
         Token::Star => BinOp::Mul,
         Token::Slash => BinOp::Div,
+        Token::EqualEqual => BinOp::Equal,
     };
 
     let mut expression = Recursive::declare();
@@ -100,6 +115,7 @@ where
         float.map(Expression::Float),
         integer.map(Expression::Integer),
         string.map(Expression::String),
+        bool,
         expression
             .clone()
             .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
@@ -133,6 +149,27 @@ where
         },
     );
 
+    let equality = term.clone().foldl_with(
+        bin_op
+            .filter(|op| matches!(op, BinOp::Equal))
+            .then(term.clone())
+            .repeated(),
+        |a, (op, b), extra| {
+            Spanned(
+                Expression::Binary(op, Box::new(a), Box::new(b)),
+                extra.span(),
+            )
+        },
+    );
+
+    let mut statement = Recursive::declare();
+
+    let block = statement
+        .clone()
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
+
     let args = expression
         .clone()
         .separated_by(just(Token::Comma))
@@ -149,7 +186,24 @@ where
         })
         .map_with(|intrinsic, extra| Spanned(Expression::Intrinsic(intrinsic), extra.span()));
 
-    expression.define(choice((intrinsic, term)).labelled("expression"));
+    let else_block = just(Token::Id("else")).ignore_then(block.clone());
+
+    let if_statement = just(Token::Id("if"))
+        .ignore_then(
+            expression
+                .clone()
+                .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
+        )
+        .then(block.clone())
+        .then(else_block.or_not())
+        .map_with(|((condition, block), else_block), extra| {
+            Spanned(
+                Statement::If(Box::new(condition), block, else_block.unwrap_or(Vec::new())),
+                extra.span(),
+            )
+        });
+
+    expression.define(choice((intrinsic, equality)).labelled("expression"));
 
     let binding = just(Token::Id("let"))
         .ignore_then(identifier)
@@ -172,14 +226,6 @@ where
             Spanned(Statement::Return(expr), extra.span())
         });
 
-    let mut statement = Recursive::declare();
-
-    let block = statement
-        .clone()
-        .repeated()
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
-
     statement.define(
         choice((
             r#return,
@@ -190,7 +236,8 @@ where
             }),
         ))
         .then_ignore(just(Token::Semicolon))
-        .or(block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span()))),
+        .or(block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())))
+        .or(if_statement),
     );
 
     let program = statement.repeated().collect::<Vec<_>>();
