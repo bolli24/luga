@@ -122,7 +122,7 @@ impl Display for Type {
     }
 }
 
-pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
+pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, GeneratorErrors> {
     #[cfg(target_os = "linux")]
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux";
 
@@ -223,7 +223,9 @@ pub fn generate(program: Program) -> Result<ObjectProduct, GeneratorErrors> {
 
     generator.build(program)?;
 
-    println!("{}", context.func.display());
+    if verbose {
+        println!("{}", context.func.display());
+    }
 
     let flags = settings::Flags::new(settings::builder());
     if let Err(errs) = verify_function(&context.func, &flags) {
@@ -665,6 +667,7 @@ impl Generator<'_> {
 
         let exit_code = self.builder.ins().iconst(types::I32, 1);
 
+        // TODO: use abort instead of exit
         let exit_ref = self
             .module
             .declare_func_in_func(self.exit_id, self.builder.func);
