@@ -9,7 +9,7 @@ use logos::Logos;
 use parser::{Spanned, luga_parser};
 use thiserror::Error;
 
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, remove_dir_all};
 use std::path::Path;
 use std::process::ExitCode;
 use std::{
@@ -43,6 +43,7 @@ enum CliCommand {
     Build { path: PathBuf },
     Run { path: PathBuf },
     Test,
+    Clean,
 }
 
 #[derive(Error, Debug)]
@@ -61,9 +62,10 @@ fn main() -> ExitCode {
     let cli = <Cli as clap::Parser>::parse();
 
     let result = match &cli.command {
-        CliCommand::Build { path } => build_files(&cli, path),
+        CliCommand::Build { path } => build_files(&cli, path).map(|_| ()),
         CliCommand::Run { path } => run_file(&cli, path),
         CliCommand::Test => todo!(),
+        CliCommand::Clean => clean(),
     };
 
     match result {
@@ -71,6 +73,8 @@ fn main() -> ExitCode {
         Err(_) => ExitCode::from(1),
     }
 }
+
+const OUTPUT_DIR: &str = "output";
 
 fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
     if path.is_dir() {
@@ -94,7 +98,7 @@ fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
     })
 }
 
-fn run_file(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
+fn run_file(cli: &Cli, path: &Path) -> Result<(), ()> {
     if path.is_dir() {
         panic!("Can't run more than one file.");
     }
@@ -130,8 +134,10 @@ fn run_file(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
                 );
             }
         }
+        Ok(())
+    } else {
+        Err(())
     }
-    result
 }
 
 fn build_file(file_path: &Path, output_dir: &Path, verbose: bool) -> Result<PathBuf, BuildError> {
@@ -231,7 +237,7 @@ fn build_file(file_path: &Path, output_dir: &Path, verbose: bool) -> Result<Path
     f.write_all(&bytes).unwrap();
 
     if verbose {
-        println!("Wrote object to {}", object_file.display());
+        println!("Wrote object to '{}'.", object_file.display());
     }
 
     #[cfg(target_os = "windows")]
@@ -254,4 +260,19 @@ fn build_file(file_path: &Path, output_dir: &Path, verbose: bool) -> Result<Path
     println!("Saved executable to '{}'", exe_file.display());
 
     Ok(exe_file)
+}
+
+fn clean() -> Result<(), ()> {
+    println!("Cleaning build directory.");
+    let output_dir = env::current_dir()
+        .map_err(|err| eprintln!("{err}"))?
+        .join(OUTPUT_DIR);
+
+    if output_dir.exists() {
+        remove_dir_all(&output_dir)
+            .map_err(|err| eprintln!("Error cleaning build directory: {err}"))?;
+    }
+
+    println!("Cleaned build directory '{}'.", output_dir.display());
+    Ok(())
 }

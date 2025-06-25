@@ -5,7 +5,7 @@ use std::{
 
 use chumsky::span::SimpleSpan;
 use cranelift::{
-    codegen::{Context, verifier::VerifierError, verify_function},
+    codegen::{verifier::VerifierError, verify_function, Context},
     prelude::*,
 };
 use cranelift_codegen::isa::TargetIsa;
