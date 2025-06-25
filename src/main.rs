@@ -10,7 +10,6 @@ use parser::{Spanned, luga_parser};
 use thiserror::Error;
 
 use std::fs::create_dir_all;
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::{
@@ -120,12 +119,16 @@ fn run_file(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
                 );
             }
         }
-        if let Some(signal) = exit_status.signal() {
-            eprintln!(
-                "Executable '{}' exited with signal '{}",
-                exe_name.display(),
-                signal
-            );
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = exit_status.signal() {
+                eprintln!(
+                    "Executable '{}' exited with signal '{}",
+                    exe_name.display(),
+                    signal
+                );
+            }
         }
     }
     result
