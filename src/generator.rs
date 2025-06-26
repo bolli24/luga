@@ -5,12 +5,11 @@ use std::{
 
 use chumsky::span::SimpleSpan;
 use cranelift::{
-    codegen::{verifier::VerifierError, verify_function, Context},
+    codegen::{Context, verifier::VerifierError, verify_function},
+    module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
+    object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::*,
 };
-use cranelift_codegen::isa::TargetIsa;
-use cranelift_module::{DataDescription, FuncId, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 
 use crate::{
     parser::{BinOp, Expression, Intrinsic, Program, Spanned, Statement},
@@ -147,7 +146,7 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
 
     let mut module = {
         let translation_unit_name = b"output_a_binary";
-        let libcall_names = cranelift_module::default_libcall_names();
+        let libcall_names = default_libcall_names();
         let builder =
             ObjectBuilder::new(isa.clone(), translation_unit_name, libcall_names).unwrap();
         ObjectModule::new(builder)
@@ -173,7 +172,7 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
     };
 
     let main_id = module
-        .declare_function("main", cranelift_module::Linkage::Export, &main_signature)
+        .declare_function("main", Linkage::Export, &main_signature)
         .unwrap();
 
     let mut function_context = FunctionBuilderContext::new();
@@ -192,11 +191,7 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
     };
 
     let printf_id = module
-        .declare_function(
-            "printf",
-            cranelift_module::Linkage::Import,
-            &printf_signature,
-        )
+        .declare_function("printf", Linkage::Import, &printf_signature)
         .unwrap();
 
     let exit_signature = Signature {
@@ -206,7 +201,7 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
     };
 
     let exit_id = module
-        .declare_function("exit", cranelift_module::Linkage::Import, &exit_signature)
+        .declare_function("exit", Linkage::Import, &exit_signature)
         .unwrap();
 
     let generator = Generator {
@@ -275,7 +270,7 @@ impl Scope {
 }
 
 struct Generator<'a> {
-    isa: std::sync::Arc<dyn TargetIsa>,
+    isa: std::sync::Arc<dyn isa::TargetIsa>,
     builder: FunctionBuilder<'a>,
     module: &'a mut ObjectModule,
     strings: usize,
