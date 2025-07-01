@@ -23,7 +23,25 @@ pub enum Statement {
         Vec<Spanned<Statement>>,
         Vec<Spanned<Statement>>,
     ),
+    FunctionDecl(FunctionDecl),
 }
+
+#[derive(Clone, Debug)]
+pub struct FunctionDecl {
+    pub name: String,
+    pub r#extern: bool,
+    pub params: Vec<Param>,
+    pub body: Vec<Spanned<Statement>>,
+    pub return_type: TypeName,
+}
+
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub name: Spanned<String>,
+    pub type_name: Spanned<String>,
+}
+
+type TypeName = String;
 
 #[derive(Clone, Debug)]
 pub enum Expression {
@@ -34,6 +52,7 @@ pub enum Expression {
     Bool(bool),
 
     Intrinsic(Intrinsic),
+    FunctionCall(Spanned<String>, Vec<Spanned<Expression>>),
     Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
 }
 
@@ -75,7 +94,7 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 6] = ["let", "return", "if", "else", "true", "false"];
+const KEY_WORDS: [&str; 7] = ["let", "return", "if", "else", "true", "false", "fn"];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
 where
@@ -86,6 +105,8 @@ where
     }
     .filter(|name| !KEY_WORDS.iter().any(|key_word| key_word == name))
     .labelled("identifier");
+
+    let identifier_spanned = identifier.map_with(|id, extra| Spanned(id.to_owned(), extra.span()));
 
     let float = select! {Token::Float(n) => n}.try_map(|n, span| {
         n.parse::<f64>()
@@ -177,13 +198,41 @@ where
     let args = expression
         .clone()
         .separated_by(just(Token::Comma))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
-    let call = args.delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
+    let decl_params = (identifier_spanned
+        .then_ignore(just(Token::Colon))
+        .then(identifier_spanned)
+        .map(|(name, type_name)| Param {
+            name: name.to_owned(),
+            type_name,
+        }))
+    .separated_by(just(Token::Comma))
+    .collect()
+    .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
+
+    let function_decl = just(Token::Id("fn"))
+        .ignore_then(identifier)
+        .then(decl_params)
+        .then(block.clone())
+        .map(|((name, params), body)| FunctionDecl {
+            name: name.to_owned(),
+            r#extern: false,
+            params,
+            body,
+            return_type: "void".to_owned(),
+        });
+
+    let function_call = identifier_spanned
+        .then(args.clone())
+        .map_with(|(name, args), extra| {
+            Spanned(Expression::FunctionCall(name, args), extra.span())
+        });
 
     let intrinsic = just(Token::At)
         .ignore_then(identifier)
-        .then(call)
+        .then(args)
         .try_map(|(id, call), span| match id {
             "print" => Ok(Intrinsic::Print(call)),
             "assert" => Ok(Intrinsic::Assert(call)),
@@ -209,7 +258,7 @@ where
             )
         });
 
-    expression.define(choice((intrinsic, equality)).labelled("expression"));
+    expression.define(choice((intrinsic, function_call, equality)).labelled("expression"));
 
     let binding = just(Token::Id("let"))
         .ignore_then(identifier)
@@ -242,8 +291,12 @@ where
             }),
         ))
         .then_ignore(just(Token::Semicolon))
-        .or(block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())))
-        .or(if_statement),
+        .or(choice((
+            if_statement,
+            block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())),
+            function_decl
+                .map_with(|decl, extra| Spanned(Statement::FunctionDecl(decl), extra.span())),
+        ))),
     );
 
     let program = statement.repeated().collect::<Vec<_>>();

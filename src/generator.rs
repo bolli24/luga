@@ -12,7 +12,7 @@ use cranelift::{
 };
 
 use crate::{
-    parser::{BinOp, Expression, Intrinsic, Program, Spanned, Statement},
+    parser::{BinOp, Expression, FunctionDecl, Intrinsic, Param, Program, Spanned, Statement},
     util::ResultCollectAll,
 };
 
@@ -56,6 +56,19 @@ pub enum CodeError {
     InvalidConditionType(Type),
     #[error("All branches of an if expression must have same type.")]
     IfExpressionType,
+
+    #[error("Invalid type name '{}' as function parameter.", .0)]
+    FunctionParamType(String),
+    #[error("Duplicate function parameter '{}'", .0)]
+    FunctionParamDuplicate(String),
+    #[error("Function '{}' already declared.", .0)]
+    FunctionRedeclaration(String),
+    #[error("Call to unknown function '{}'.",.0)]
+    UnknownFunction(String),
+    #[error("Function '{}' called with wrong number of arguments. Expected {} but found {}.", .0, .1, .2)]
+    FunctionCallArgumentCount(String, usize, usize),
+    #[error("Function '{}' called with wrong argument type. Expected '{}' but found '{}'.", .0, .1, .2)]
+    FunctionCallArgumentType(String, Type, Type),
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -79,7 +92,7 @@ pub enum GeneratorErrors {
     VerifierErrors(Vec<VerifierError>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Int,
     Float,
@@ -87,24 +100,34 @@ pub enum Type {
     Never,
     String,
     Bool,
+    Fn(FuncType),
+    // TODO: Named(String),
 }
 
-impl From<Type> for types::Type {
-    fn from(val: Type) -> Self {
-        match val {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncType {
+    name: String,
+    params: Vec<Type>,
+    return_type: Box<Type>,
+}
+
+impl TryFrom<&Type> for types::Type {
+    type Error = ();
+    fn try_from(val: &Type) -> Result<Self, Self::Error> {
+        Ok(match val {
             Type::Int => types::I64,
             Type::Float => types::F64,
-            Type::Void => types::INVALID,
-            Type::Never => types::INVALID,
             Type::String => types::I64, // TODO: platform ptr size
             Type::Bool => types::I8,
-        }
+            _ => return Err(()),
+        })
     }
 }
 
-impl From<Type> for AbiParam {
-    fn from(value: Type) -> Self {
-        AbiParam::new(value.into())
+impl TryFrom<&Type> for AbiParam {
+    type Error = ();
+    fn try_from(value: &Type) -> Result<Self, Self::Error> {
+        Ok(AbiParam::new(value.try_into()?))
     }
 }
 
@@ -117,6 +140,21 @@ impl Display for Type {
             Type::Never => write!(f, "never"),
             Type::String => write!(f, "string"),
             Type::Bool => write!(f, "bool"),
+            // TODO: Type::Named(name) => write!(f, "{name}"),
+            Type::Fn(fn_type) => {
+                write!(
+                    f,
+                    "fn {} ({}) : {}",
+                    fn_type.name,
+                    fn_type
+                        .params
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    fn_type.return_type
+                )
+            }
         }
     }
 }
@@ -151,7 +189,7 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
             ObjectBuilder::new(isa.clone(), translation_unit_name, libcall_names).unwrap();
         ObjectModule::new(builder)
     };
-    let mut context = Context::new();
+    let mut main_context = Context::new();
 
     let mut data_desc = DataDescription::new();
     let string_data = b"%d\n\0";
@@ -175,14 +213,14 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
         .declare_function("main", Linkage::Export, &main_signature)
         .unwrap();
 
-    let mut function_context = FunctionBuilderContext::new();
+    let mut main_fn_context = FunctionBuilderContext::new();
 
-    let mut builder = FunctionBuilder::new(&mut context.func, &mut function_context);
-    builder.func.signature = main_signature;
+    let mut main_builder = FunctionBuilder::new(&mut main_context.func, &mut main_fn_context);
+    main_builder.func.signature = main_signature;
 
-    let main_block = builder.create_block();
-    builder.switch_to_block(main_block);
-    builder.seal_block(main_block);
+    let main_block = main_builder.create_block();
+    main_builder.switch_to_block(main_block);
+    main_builder.seal_block(main_block);
 
     let printf_signature = Signature {
         call_conv: isa.default_call_conv(),
@@ -206,7 +244,9 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
 
     let generator = Generator {
         isa: isa.clone(),
-        builder,
+        fn_context: Context::new(),
+        fn_builder_context: FunctionBuilderContext::new(),
+        builder: main_builder,
         module: &mut module,
         strings: 0,
         printf_id,
@@ -214,20 +254,21 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
         returned: false,
         current_scope: Scope::new(),
         var_count: 0,
+        verbose,
     };
 
     generator.build(program)?;
 
     if verbose {
-        println!("{}", context.func.display());
+        println!("{}", main_context.func.display());
     }
 
     let flags = settings::Flags::new(settings::builder());
-    if let Err(errs) = verify_function(&context.func, &flags) {
+    if let Err(errs) = verify_function(&main_context.func, &flags) {
         return Err(GeneratorErrors::VerifierErrors(errs.0));
     }
 
-    module.define_function(main_id, &mut context).unwrap();
+    module.define_function(main_id, &mut main_context).unwrap();
 
     Ok(module.finish())
 }
@@ -238,6 +279,7 @@ struct Scope {
     vars_name: HashMap<String, (Variable, Type)>,
     vars: HashSet<usize>,
     parent: Option<Box<Scope>>,
+    functions: HashMap<String, (FuncId, FuncType)>,
 }
 
 impl Scope {
@@ -246,6 +288,7 @@ impl Scope {
             vars_name: HashMap::new(),
             vars: HashSet::new(),
             parent: None,
+            functions: HashMap::new(),
         }
     }
 
@@ -267,10 +310,22 @@ impl Scope {
             Entry::Occupied(_) => Err(()),
         }
     }
+
+    pub fn get_func(&self, name: &str) -> Option<&(FuncId, FuncType)> {
+        self.functions
+            .get(name)
+            .or_else(|| self.parent.as_ref()?.get_func(name))
+    }
+
+    pub fn insert_func(&mut self, name: String, func_id: FuncId, func_type: FuncType) {
+        self.functions.insert(name, (func_id, func_type));
+    }
 }
 
 struct Generator<'a> {
     isa: std::sync::Arc<dyn isa::TargetIsa>,
+    fn_context: Context,
+    fn_builder_context: FunctionBuilderContext,
     builder: FunctionBuilder<'a>,
     module: &'a mut ObjectModule,
     strings: usize,
@@ -279,6 +334,7 @@ struct Generator<'a> {
     returned: bool,
     current_scope: Scope,
     var_count: usize,
+    verbose: bool,
 }
 
 impl Generator<'_> {
@@ -321,27 +377,27 @@ impl Generator<'_> {
             Statement::Binding(name, expr) => {
                 let value = self.build_expression(expr)?;
 
-                let Ok(var) = self.new_var(name.clone(), value) else {
+                let Ok(var) = self.new_var(name.clone(), value.clone()) else {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
 
-                if !matches!(value.1, Type::Int | Type::Float | Type::String | Type::Bool) {
+                let Ok(var_type) = (&value.1).try_into() else {
                     return CodeError::BindingType(value.1).err(expr.1);
-                }
+                };
 
-                self.builder.declare_var(var, value.1.into());
+                self.builder.declare_var(var, var_type);
                 self.builder.def_var(var, value.0);
             }
             Statement::Assignment(name, expr) => {
                 let value = self.build_expression(expr)?;
 
-                if let Some(&(var, var_type)) = self.current_scope.get_var(name) {
-                    if value.1 != var_type {
-                        return CodeError::AssignmentIncompatibleTypes(var_type, value.1)
+                if let Some((var, var_type)) = self.current_scope.get_var(name) {
+                    if value.1 != *var_type {
+                        return CodeError::AssignmentIncompatibleTypes(var_type.clone(), value.1)
                             .err(statement.1);
                     }
 
-                    self.builder.def_var(var, value.0);
+                    self.builder.def_var(*var, value.0);
                 } else {
                     return CodeError::UnknownVariable(name.clone()).err(statement.1);
                 }
@@ -378,6 +434,7 @@ impl Generator<'_> {
                 // build_if_example(&mut self.builder);
                 self.build_if(condition, then_block, else_block)?;
             }
+            Statement::FunctionDecl(decl) => self.build_fn_decl(decl, &statement.1)?,
         }
 
         Ok(())
@@ -451,8 +508,9 @@ impl Generator<'_> {
                     return CodeError::UnknownVariable(name.to_owned()).err(*span);
                 };
 
-                Ok((self.builder.use_var(*var), *var_type))
+                Ok((self.builder.use_var(*var), var_type.clone()))
             }
+            Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
         }
     }
 
@@ -516,8 +574,12 @@ impl Generator<'_> {
                 if let Ok(value) = &result {
                     const PRINT_ARG_TYPES: [Type; 2] = [Type::Int, Type::String];
                     if !PRINT_ARG_TYPES.contains(&value.1) {
-                        return CodeError::IntrisicArgumentType("print", &PRINT_ARG_TYPES, value.1)
-                            .err(expr.1);
+                        return CodeError::IntrisicArgumentType(
+                            "print",
+                            &PRINT_ARG_TYPES,
+                            value.1.clone(),
+                        )
+                        .err(expr.1);
                     }
                 }
                 result
@@ -532,7 +594,11 @@ impl Generator<'_> {
         // See: adjust_call_for_c_variadic() in rustc_codegen_cranelift
         let mut params = Vec::with_capacity(arg_values.len() + 1);
         params.push(AbiParam::new(self.isa.pointer_type()));
-        params.extend(arg_values.iter().map(|(_, t)| AbiParam::from(*t)));
+        params.extend(
+            arg_values
+                .iter()
+                .map(|(_, t)| AbiParam::try_from(t).expect("Type must be valid @print parameter.")),
+        );
 
         let printf_ref = self
             .module
@@ -707,6 +773,194 @@ impl Generator<'_> {
         let cast = self.builder.ins().ireduce(types::I32, expr.0);
         self.builder.ins().call(exit_ref, &[cast]);
         Ok((Value::from_u32(u32::MAX - 1), Type::Never))
+    }
+
+    fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
+        let &FunctionDecl {
+            name,
+            r#extern,
+            params,
+            body,
+            return_type,
+        } = &decl;
+
+        if return_type != "void" {
+            todo!("non-void return types");
+        }
+
+        if *r#extern {
+            todo!("Extern functions")
+        }
+
+        let mut abi_params: Vec<(String, Type)> = Vec::new();
+        let mut errors = Vec::new();
+        let mut func_type = FuncType {
+            name: name.to_owned(),
+            params: Vec::new(),
+            return_type: Type::Void.into(),
+        };
+
+        if self.current_scope.get_func(name).is_some() {
+            errors.push(CodeError::FunctionRedeclaration(name.to_owned()).spanned(*span));
+        }
+
+        for Param { name, type_name } in params {
+            let Some(r#type) = self.param_type_from_name(&type_name.0) else {
+                errors.push(CodeError::FunctionParamType(type_name.0.clone()).spanned(type_name.1));
+                continue;
+            };
+
+            if abi_params
+                .iter()
+                .any(|(other_name, _)| &name.0 == other_name)
+            {
+                errors.push(CodeError::FunctionParamDuplicate(name.0.to_owned()).spanned(name.1));
+            }
+            func_type.params.push(r#type.clone());
+            abi_params.push((name.0.clone(), r#type));
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let signature = Signature {
+            call_conv: self.isa.default_call_conv(),
+            params: abi_params
+                .iter()
+                .map(|(_, r#type)| r#type.try_into().expect("Param type must be valid."))
+                .collect(),
+            returns: Vec::new(),
+        };
+
+        let func_id = self
+            .module
+            .declare_function(name, Linkage::Local, &signature)
+            .expect("Function must be declarable.");
+
+        println!("{func_type:?}");
+
+        // Create a completely separate generator for the function
+        let mut fn_context = Context::new();
+        let mut fn_builder_context = FunctionBuilderContext::new();
+        let mut fn_builder = FunctionBuilder::new(&mut fn_context.func, &mut fn_builder_context);
+
+        fn_builder.func.signature = signature;
+
+        let entry_block = fn_builder.create_block();
+        fn_builder.append_block_params_for_function_params(entry_block);
+        fn_builder.switch_to_block(entry_block);
+        fn_builder.seal_block(entry_block);
+
+        let mut fn_generator = Generator {
+            isa: self.isa.clone(),
+            fn_context: Context::new(), // This won't be used for the function itself
+            fn_builder_context: FunctionBuilderContext::new(), // This won't be used either
+            builder: fn_builder,
+            module: self.module,
+            strings: self.strings, // Share string counter
+            printf_id: self.printf_id,
+            exit_id: self.exit_id,
+            returned: false,
+            current_scope: Scope::new(),
+            var_count: 0,
+            verbose: self.verbose,
+        };
+
+        for (i, (param_name, param_type)) in abi_params.iter().enumerate() {
+            let param_value = fn_generator.builder.block_params(entry_block)[i];
+
+            let var = fn_generator
+                .new_var(param_name.clone(), (param_value, param_type.clone()))
+                .expect("Function parameters should never redefine variables");
+
+            let var_type = param_type
+                .try_into()
+                .expect("Parameter type should be valid");
+
+            fn_generator.builder.declare_var(var, var_type);
+            fn_generator.builder.def_var(var, param_value);
+        }
+
+        for statement in body {
+            if let Err(mut error) = fn_generator.build_statement(statement) {
+                errors.append(&mut error);
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        // Ensure function returns properly (void functions don't need explicit return)
+        if !fn_generator.returned {
+            fn_generator.builder.ins().return_(&[]);
+        }
+
+        self.strings = fn_generator.strings;
+
+        self.module
+            .define_function(func_id, &mut fn_context)
+            .unwrap();
+        self.current_scope
+            .insert_func(name.to_owned(), func_id, func_type);
+
+        Ok(())
+    }
+
+    fn param_type_from_name(&self, type_name: &str) -> Option<Type> {
+        Some(match type_name {
+            "int" => Type::Int,
+            "float" => Type::Float,
+            "bool" => Type::Bool,
+            "string" => Type::String,
+            _ => return None,
+        })
+    }
+
+    fn build_fn_call(
+        &mut self,
+        name: &Spanned<String>,
+        args: &[Spanned<Expression>],
+        span: &SimpleSpan,
+    ) -> Result<(Value, Type), ManyErrors> {
+        let Some((func_id, func_type)) = self.current_scope.get_func(&name.0).cloned() else {
+            return CodeError::UnknownFunction(name.0.clone()).err(*span);
+        };
+
+        if args.len() != func_type.params.len() {
+            return CodeError::FunctionCallArgumentCount(
+                name.0.clone(),
+                func_type.params.len(),
+                args.len(),
+            )
+            .err(*span);
+        }
+
+        let arg_values = args
+            .iter()
+            .zip(func_type.params.iter())
+            .map(|(expr, param_type)| {
+                let value = self.build_expression(expr)?;
+                if value.1 != *param_type {
+                    return CodeError::FunctionCallArgumentType(
+                        name.0.clone(),
+                        param_type.clone(),
+                        value.1.clone(),
+                    )
+                    .err(*span);
+                }
+                Ok(value.0)
+            })
+            .collect::<Result<Vec<Value>, ManyErrors>>()?;
+
+        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+        let inst = self.builder.ins().call(func_ref, &arg_values);
+        if !self.builder.inst_results(inst).is_empty() {
+            todo!("Return values.")
+        }
+
+        Ok((Value::from_u32(u32::MAX - 1), Type::Void))
     }
 }
 

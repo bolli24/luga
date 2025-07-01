@@ -27,6 +27,8 @@ pub enum Token<'a> {
     Semicolon,
     #[token(",")]
     Comma,
+    #[token(":")]
+    Colon,
 
     #[token("@")]
     At,
@@ -115,6 +117,7 @@ impl Display for Token<'_> {
             Token::ParenOpen => write!(f, "("),
             Token::ParenClose => write!(f, ")"),
             Token::Semicolon => write!(f, ";"),
+            Token::Colon => write!(f, ":"),
             Token::Comma => write!(f, ","),
             Token::At => write!(f, "@"),
             Token::Id(ident) => write!(f, "{}", ident),
