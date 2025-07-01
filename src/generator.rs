@@ -82,7 +82,7 @@ impl CodeError {
         Err(Spanned(self, span).into())
     }
 
-    fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
+    const fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
         Spanned(self, span)
     }
 }
@@ -127,21 +127,21 @@ impl TryFrom<&Type> for types::Type {
 impl TryFrom<&Type> for AbiParam {
     type Error = ();
     fn try_from(value: &Type) -> Result<Self, Self::Error> {
-        Ok(AbiParam::new(value.try_into()?))
+        Ok(Self::new(value.try_into()?))
     }
 }
 
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Type::Int => write!(f, "integer"),
-            Type::Float => write!(f, "float"),
-            Type::Void => write!(f, "void"),
-            Type::Never => write!(f, "never"),
-            Type::String => write!(f, "string"),
-            Type::Bool => write!(f, "bool"),
+            Self::Int => write!(f, "integer"),
+            Self::Float => write!(f, "float"),
+            Self::Void => write!(f, "void"),
+            Self::Never => write!(f, "never"),
+            Self::String => write!(f, "string"),
+            Self::Bool => write!(f, "bool"),
             // TODO: Type::Named(name) => write!(f, "{name}"),
-            Type::Fn(fn_type) => {
+            Self::Fn(fn_type) => {
                 write!(
                     f,
                     "fn {} ({}) : {}",
@@ -478,7 +478,7 @@ impl Generator<'_> {
                 Ok((value, Type::String))
             }
             Expression::Bool(value) => Ok((
-                self.builder.ins().iconst(types::I8, *value as i64),
+                self.builder.ins().iconst(types::I8, i64::from(*value)),
                 Type::Bool,
             )),
             Expression::Binary(op, x, y) => {
@@ -495,7 +495,7 @@ impl Generator<'_> {
                     Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
                     _ => None,
                 }
-                .ok_or(CodeError::InvalidBinOpType(*op, x_value.1).spanned(*span))?;
+                .ok_or_else(|| CodeError::InvalidBinOpType(*op, x_value.1).spanned(*span))?;
                 Ok(result)
             }
             Expression::Intrinsic(intrinsic) => match intrinsic {
@@ -681,7 +681,7 @@ impl Generator<'_> {
 
         if then_value.1 != else_value.1 {
             return CodeError::IfExpressionType
-                .err(else_body.last().or(then_body.last()).unwrap().1);
+                .err(else_body.last().or_else(|| then_body.last()).unwrap().1);
         }
 
         Ok(())
@@ -814,7 +814,7 @@ impl Generator<'_> {
                 .iter()
                 .any(|(other_name, _)| &name.0 == other_name)
             {
-                errors.push(CodeError::FunctionParamDuplicate(name.0.to_owned()).spanned(name.1));
+                errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
             func_type.params.push(r#type.clone());
             abi_params.push((name.0.clone(), r#type));
@@ -946,7 +946,7 @@ impl Generator<'_> {
                     return CodeError::FunctionCallArgumentType(
                         name.0.clone(),
                         param_type.clone(),
-                        value.1.clone(),
+                        value.1,
                     )
                     .err(*span);
                 }

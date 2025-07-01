@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use logos::{Lexer, Logos, Skip};
 
-#[derive(Logos, Debug, Clone, PartialEq)]
+#[derive(Logos, Debug, Clone, PartialEq, Eq)]
 #[logos(skip r"[ \t\r\n\f]+")]
 #[logos(error = LexingError)]
 #[logos(extras = (usize, bool))]
@@ -59,7 +59,7 @@ pub enum Token<'a> {
     Quoted(String),
 }
 
-#[derive(Default, Debug, Clone, PartialEq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub enum LexingError {
     #[default]
     UnexpectedCharacter,
@@ -120,10 +120,10 @@ impl Display for Token<'_> {
             Token::Colon => write!(f, ":"),
             Token::Comma => write!(f, ","),
             Token::At => write!(f, "@"),
-            Token::Id(ident) => write!(f, "{}", ident),
-            Token::Float(num) => write!(f, "{}", num),
-            Token::Integer(num) => write!(f, "{}", num),
-            Token::Quoted(string) => write!(f, "\"{}\"", string),
+            Token::Id(ident) => write!(f, "{ident}"),
+            Token::Float(num) => write!(f, "{num}"),
+            Token::Integer(num) => write!(f, "{num}"),
+            Token::Quoted(string) => write!(f, "\"{string}\""),
             Token::Comment => write!(f, "// ..."),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn test_string_display() {
         let token = Token::Quoted("hello world".to_string());
-        assert_eq!(format!("{}", token), "\"hello world\"");
+        assert_eq!(format!("{token}"), "\"hello world\"");
     }
 
     #[test]

@@ -69,8 +69,8 @@ fn main() -> ExitCode {
     };
 
     match result {
-        Ok(_) => ExitCode::from(0),
-        Err(_) => ExitCode::from(1),
+        Ok(()) => ExitCode::from(0),
+        Err(()) => ExitCode::from(1),
     }
 }
 
@@ -81,9 +81,7 @@ fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
         todo!("Build directories");
     }
 
-    if !path.is_file() {
-        panic!("Invalid input path.");
-    }
+    assert!(path.is_file(), "Invalid input path.");
 
     let output_dir = env::current_dir()
         .expect("Current working directory is invalid.")
@@ -99,13 +97,9 @@ fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
 }
 
 fn run_file(cli: &Cli, path: &Path) -> Result<(), ()> {
-    if path.is_dir() {
-        panic!("Can't run more than one file.");
-    }
+    assert!(!path.is_dir(), "Can't run more than one file.");
 
-    if !path.is_file() {
-        panic!("Invalid input path.");
-    }
+    assert!(path.is_file(), "Invalid input path.");
 
     let result = build_files(cli, path);
     if let Ok(exe_path) = &result {
@@ -114,14 +108,14 @@ fn run_file(cli: &Cli, path: &Path) -> Result<(), ()> {
         let exit_status = Command::new(exe_path)
             .status()
             .expect("Unable to spawn command.");
-        if let Some(exit_code) = exit_status.code() {
-            if exit_code != 0 {
-                eprintln!(
-                    "Executable '{}' exited with code '{}'",
-                    exe_name.display(),
-                    exit_code
-                );
-            }
+        if let Some(exit_code) = exit_status.code()
+            && exit_code != 0
+        {
+            eprintln!(
+                "Executable '{}' exited with code '{}'",
+                exe_name.display(),
+                exit_code
+            );
         }
         #[cfg(target_family = "unix")]
         {
@@ -169,11 +163,11 @@ fn build_file(file_path: &Path, output_dir: &Path, verbose: bool) -> Result<Path
 
     let result = luga_parser().parse(token_stream);
 
-    if let Some(program) = result.output() {
-        if verbose {
-            for statement in &program.statements {
-                println!("{statement:?}");
-            }
+    if let Some(program) = result.output()
+        && verbose
+    {
+        for statement in &program.statements {
+            println!("{statement:?}");
         }
     }
 

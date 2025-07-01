@@ -68,11 +68,11 @@ pub enum BinOp {
 impl Display for BinOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BinOp::Add => write!(f, "+"),
-            BinOp::Sub => write!(f, "-"),
-            BinOp::Mul => write!(f, "*"),
-            BinOp::Div => write!(f, "/"),
-            BinOp::Equal => write!(f, "=="),
+            Self::Add => write!(f, "+"),
+            Self::Sub => write!(f, "-"),
+            Self::Mul => write!(f, "*"),
+            Self::Div => write!(f, "/"),
+            Self::Equal => write!(f, "=="),
         }
     }
 }
@@ -85,7 +85,7 @@ pub enum Intrinsic {
 }
 
 impl Intrinsic {
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Print(_) => "@print",
             Self::Assert(_) => "@assert",
@@ -118,7 +118,7 @@ where
             .map_err(|_| Rich::custom(span, "Invalid integer literal."))
     });
 
-    let string = select! {Token::Quoted(s) => s.to_owned()};
+    let string = select! {Token::Quoted(s) => s};
 
     let bool = select! {
         Token::Id("true") => Expression::Bool(true),
@@ -205,7 +205,7 @@ where
         .then_ignore(just(Token::Colon))
         .then(identifier_spanned)
         .map(|(name, type_name)| Param {
-            name: name.to_owned(),
+            name,
             type_name,
         }))
     .separated_by(just(Token::Comma))
