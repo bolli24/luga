@@ -1,7 +1,11 @@
 fn hallo(test: string, number: int) {
     @print("%s \n", test);
-    @print("%d", number);
+    @print("%d\n", number);
 } 
 
+fn halloAlso() {
+   @print("Hello from me too.");
+}
 
 hallo("Hello world.", 10);
+halloAlso();

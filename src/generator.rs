@@ -141,21 +141,24 @@ impl Display for Type {
             Self::String => write!(f, "string"),
             Self::Bool => write!(f, "bool"),
             // TODO: Type::Named(name) => write!(f, "{name}"),
-            Self::Fn(fn_type) => {
-                write!(
-                    f,
-                    "fn {} ({}) : {}",
-                    fn_type.name,
-                    fn_type
-                        .params
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    fn_type.return_type
-                )
-            }
+            Self::Fn(func_type) => write!(f, "{func_type}"),
         }
+    }
+}
+
+impl Display for FuncType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fn {} ({}) : {}",
+            self.name,
+            self.params
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.return_type
+        )
     }
 }
 
@@ -838,7 +841,9 @@ impl Generator<'_> {
             .declare_function(name, Linkage::Local, &signature)
             .expect("Function must be declarable.");
 
-        println!("{func_type:?}");
+        if self.verbose {
+            println!("{func_type}");
+        }
 
         // Create a completely separate generator for the function
         let mut fn_context = Context::new();
@@ -898,6 +903,10 @@ impl Generator<'_> {
         }
 
         self.strings = fn_generator.strings;
+
+        if self.verbose {
+            println!("{}", fn_generator.fn_context.func.display());
+        }
 
         self.module
             .define_function(func_id, &mut fn_context)
