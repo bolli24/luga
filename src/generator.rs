@@ -501,10 +501,11 @@ impl Generator<'_> {
                 .ok_or_else(|| CodeError::InvalidBinOpType(*op, x_value.1).spanned(*span))?;
                 Ok(result)
             }
-            Expression::Intrinsic(intrinsic) => match intrinsic {
-                Intrinsic::Print(args) => self.build_printf(span, args),
-                Intrinsic::Assert(args) => self.build_assert(span, args),
-                Intrinsic::Exit(args) => self.build_exit(span, args),
+            Expression::Intrinsic(intrinsic, args) => match intrinsic {
+                Intrinsic::Print => self.build_printf(span, args, false),
+                Intrinsic::Println => self.build_printf(span, args, true),
+                Intrinsic::Assert => self.build_assert(span, args),
+                Intrinsic::Exit => self.build_exit(span, args),
             },
             Expression::Identifier(name) => {
                 let Some((var, var_type)) = self.current_scope.get_var(name) else {
@@ -560,13 +561,20 @@ impl Generator<'_> {
         &mut self,
         span: &SimpleSpan,
         args: &[Spanned<Expression>],
+        new_line: bool,
     ) -> Result<(Value, Type), ManyErrors> {
         let Some((format_string_arg, other_args)) = args.split_first() else {
             return CodeError::IntrinsicTooFewArguments("print", 1, args.len()).err(*span);
         };
 
+        let mut format_string_arg = format_string_arg.clone();
+
         // TODO: validate format string/generate own format string
-        let Expression::String(_) = &format_string_arg.0 else {
+        if let Expression::String(format_string) = &mut format_string_arg.0 {
+            if new_line {
+                format_string.push('\n');
+            }
+        } else {
             return CodeError::ExpectedStringLiteral.err(format_string_arg.1);
         };
 
@@ -590,7 +598,7 @@ impl Generator<'_> {
             .collect_all()
             .map_err(|errors| errors.into_iter().flatten().collect::<ManyErrors>())?;
 
-        let format_string_value = self.build_expression(format_string_arg)?;
+        let format_string_value = self.build_expression(&format_string_arg)?;
         debug_assert_eq!(format_string_value.1, Type::String);
 
         // Because printf is a variadic function we have to change it's signature on the fly

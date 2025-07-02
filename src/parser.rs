@@ -51,7 +51,7 @@ pub enum Expression {
     String(String),
     Bool(bool),
 
-    Intrinsic(Intrinsic),
+    Intrinsic(Intrinsic, Vec<Spanned<Expression>>),
     FunctionCall(Spanned<String>, Vec<Spanned<Expression>>),
     Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
 }
@@ -79,17 +79,19 @@ impl Display for BinOp {
 
 #[derive(Clone, Debug)]
 pub enum Intrinsic {
-    Print(Vec<Spanned<Expression>>),
-    Assert(Vec<Spanned<Expression>>),
-    Exit(Vec<Spanned<Expression>>),
+    Print,
+    Println,
+    Assert,
+    Exit,
 }
 
 impl Intrinsic {
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::Print(_) => "@print",
-            Self::Assert(_) => "@assert",
-            Self::Exit(_) => "@exit",
+            Self::Print => "@print",
+            Self::Println => "@println",
+            Self::Assert => "@assert",
+            Self::Exit => "@exit",
         }
     }
 }
@@ -204,10 +206,7 @@ where
     let decl_params = (identifier_spanned
         .then_ignore(just(Token::Colon))
         .then(identifier_spanned)
-        .map(|(name, type_name)| Param {
-            name,
-            type_name,
-        }))
+        .map(|(name, type_name)| Param { name, type_name }))
     .separated_by(just(Token::Comma))
     .collect()
     .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
@@ -232,14 +231,17 @@ where
 
     let intrinsic = just(Token::At)
         .ignore_then(identifier)
-        .then(args)
-        .try_map(|(id, call), span| match id {
-            "print" => Ok(Intrinsic::Print(call)),
-            "assert" => Ok(Intrinsic::Assert(call)),
-            "exit" => Ok(Intrinsic::Exit(call)),
+        .try_map(|id, span| match id {
+            "print" => Ok(Intrinsic::Print),
+            "println" => Ok(Intrinsic::Println),
+            "assert" => Ok(Intrinsic::Assert),
+            "exit" => Ok(Intrinsic::Exit),
             _ => Err(Rich::custom(span, "Unknown intrinsic.")),
         })
-        .map_with(|intrinsic, extra| Spanned(Expression::Intrinsic(intrinsic), extra.span()));
+        .then(args)
+        .map_with(|(intrinsic, args), extra| {
+            Spanned(Expression::Intrinsic(intrinsic, args), extra.span())
+        });
 
     let else_block = just(Token::Id("else")).ignore_then(block.clone());
 
