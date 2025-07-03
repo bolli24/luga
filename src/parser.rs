@@ -18,12 +18,20 @@ pub enum Statement {
     Assignment(String, Spanned<Expression>),
     Return(Spanned<Expression>),
     Block(Vec<Spanned<Statement>>),
-    If(
-        Box<Spanned<Expression>>,
-        Vec<Spanned<Statement>>,
-        Vec<Spanned<Statement>>,
-    ),
+    If(If),
     FunctionDecl(FunctionDecl),
+}
+
+#[derive(Clone, Debug)]
+pub struct If {
+    pub if_branches: Vec<Conditional>,
+    pub else_branch: Option<Vec<Spanned<Statement>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Conditional {
+    pub condition: Box<Spanned<Expression>>,
+    pub block: Vec<Spanned<Statement>>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,17 +253,30 @@ where
 
     let else_block = just(Token::Id("else")).ignore_then(block.clone());
 
-    let if_statement = just(Token::Id("if"))
+    let simple_if = just(Token::Id("if"))
         .ignore_then(
             expression
                 .clone()
                 .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
         )
         .then(block.clone())
+        .map(|(condition, block)| Conditional {
+            condition: condition.into(),
+            block,
+        });
+
+    // TODO: If expression
+    let if_statement = simple_if
+        .separated_by(just(Token::Id("else")))
+        .at_least(1)
+        .collect::<Vec<_>>()
         .then(else_block.or_not())
-        .map_with(|((condition, block), else_block), extra| {
+        .map_with(|(if_branches, else_branch), extra| {
             Spanned(
-                Statement::If(Box::new(condition), block, else_block.unwrap_or(Vec::new())),
+                Statement::If(If {
+                    if_branches,
+                    else_branch,
+                }),
                 extra.span(),
             )
         });

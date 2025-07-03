@@ -20,9 +20,11 @@ if (c == 11) {
             c = c - b;
             @print("Level 3 Else: c = %d\n", c);
         }
-    } else {
+    } else if (true) {
         d = d * 2;
         @print("Level 2 Else: d = %d\n", d);
+    } else {
+        @print("never");
     }
 } else {
     a = 0;

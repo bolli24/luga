@@ -12,7 +12,7 @@ use cranelift::{
 };
 
 use crate::{
-    parser::{BinOp, Expression, FunctionDecl, Intrinsic, Param, Program, Spanned, Statement},
+    parser::{BinOp, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned, Statement},
     util::ResultCollectAll,
 };
 
@@ -433,9 +433,8 @@ impl Generator<'_> {
                     return Err(errors);
                 }
             }
-            Statement::If(condition, then_block, else_block) => {
-                // build_if_example(&mut self.builder);
-                self.build_if(condition, then_block, else_block)?;
+            Statement::If(r#if) => {
+                self.build_if(r#if)?;
             }
             Statement::FunctionDecl(decl) => self.build_fn_decl(decl, &statement.1)?,
         }
@@ -518,6 +517,7 @@ impl Generator<'_> {
         }
     }
 
+    #[must_use]
     fn build_int_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
         Some((
             match op {
@@ -534,6 +534,7 @@ impl Generator<'_> {
         ))
     }
 
+    #[must_use]
     fn build_float_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
         Some((
             match op {
@@ -550,6 +551,7 @@ impl Generator<'_> {
         ))
     }
 
+    #[must_use]
     fn build_bool_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
         Some(match op {
             BinOp::Equal => (self.builder.ins().icmp(IntCC::Equal, x, y), Type::Bool),
@@ -653,47 +655,88 @@ impl Generator<'_> {
     }
 
     // TODO: if expression
-    fn build_if(
-        &mut self,
-        condition: &Spanned<Expression>,
-        then_body: &[Spanned<Statement>],
-        else_body: &[Spanned<Statement>],
-    ) -> Result<(), ManyErrors> {
-        let condition_block = self.builder.create_block();
-        self.builder.ins().jump(condition_block, []);
-        self.builder.switch_to_block(condition_block);
-        self.builder.seal_block(condition_block);
+    // TODO: add clif comments to blocks
+    fn build_if(&mut self, if_statement: &If) -> Result<(), ManyErrors> {
+        let condition_blocks: Vec<_> = if_statement
+            .if_branches
+            .iter()
+            .map(|_| self.builder.create_block())
+            .collect();
 
-        let condition_value = self.build_expression(condition)?;
+        let else_block = if_statement
+            .else_branch
+            .as_ref()
+            .map(|_| self.builder.create_block());
 
-        if condition_value.1 != Type::Bool {
-            return CodeError::InvalidConditionType(condition_value.1).err(condition.1);
-        }
-
-        let then_block = self.builder.create_block();
-        let else_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(condition_value.0, then_block, [], else_block, []);
 
-        self.builder.seal_block(then_block);
-        self.builder.seal_block(else_block);
+        let mut errors = Vec::new();
 
-        self.builder.switch_to_block(then_block);
-        let then_value = self.build_block_body(then_body)?;
-        self.builder.ins().jump(exit_block, []);
+        self.builder.ins().jump(condition_blocks[0], []);
 
-        self.builder.switch_to_block(else_block);
-        let else_value = self.build_block_body(else_body)?;
-        self.builder.ins().jump(exit_block, []);
+        for (index, conditional) in if_statement.if_branches.iter().enumerate() {
+            let condition_block = condition_blocks[index];
+            let then_block = self.builder.create_block();
+            self.builder.seal_block(condition_block);
+            self.builder.switch_to_block(condition_block);
+            let condition_value = match self.build_expression(&conditional.condition) {
+                Ok(condition_value) if condition_value.1 == Type::Bool => condition_value,
+                Ok((_, r#type)) => {
+                    errors.push(
+                        CodeError::InvalidConditionType(r#type).spanned(conditional.condition.1),
+                    );
+                    continue;
+                }
+                Err(mut err) => {
+                    errors.append(&mut err);
+                    continue;
+                }
+            };
 
-        self.builder.switch_to_block(exit_block);
+            let next_block: Block = condition_blocks
+                .get(index + 1)
+                .copied()
+                .or(else_block)
+                .unwrap_or(exit_block);
 
-        if then_value.1 != else_value.1 {
-            return CodeError::IfExpressionType
-                .err(else_body.last().or_else(|| then_body.last()).unwrap().1);
+            self.builder
+                .ins()
+                .brif(condition_value.0, then_block, [], next_block, []);
+
+            self.builder.seal_block(then_block);
+            self.builder.switch_to_block(then_block);
+            match self.build_block_body(&conditional.block) {
+                Ok(then_value) => {
+                    assert!(then_value.1 == Type::Void || then_value.1 == Type::Never); // TODO: if expression
+                }
+                Err(mut err) => {
+                    errors.append(&mut err);
+                }
+            }
+            self.builder.ins().jump(exit_block, []);
         }
+
+        if let Some(else_block) = else_block {
+            self.builder.seal_block(else_block);
+            self.builder.switch_to_block(else_block);
+
+            match self.build_block_body(
+                if_statement
+                    .else_branch
+                    .as_ref()
+                    .expect("Else branch must exist."),
+            ) {
+                Ok(_) => { // TODO: if expression
+                }
+                Err(mut err) => {
+                    errors.append(&mut err);
+                }
+            }
+            self.builder.ins().jump(exit_block, []);
+        }
+
+        self.builder.seal_block(exit_block);
+        self.builder.switch_to_block(exit_block);
 
         Ok(())
     }
