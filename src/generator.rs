@@ -738,6 +738,10 @@ impl Generator<'_> {
         self.builder.seal_block(exit_block);
         self.builder.switch_to_block(exit_block);
 
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
         Ok(())
     }
 
