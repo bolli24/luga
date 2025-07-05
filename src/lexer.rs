@@ -22,6 +22,14 @@ pub enum Token<'a> {
     Equal,
     #[token("==")]
     EqualEqual,
+    #[token("<")]
+    Lt,
+    #[token(">")]
+    Gt,
+    #[token("<=")]
+    ArrowLeft,
+    #[token("=>")]
+    ArrowRight,
 
     #[token(";")]
     Semicolon,
@@ -131,6 +139,10 @@ impl Display for Token<'_> {
             Token::Slash => write!(f, "/"),
             Token::Equal => write!(f, "="),
             Token::EqualEqual => write!(f, "=="),
+            Self::Lt => write!(f, "<"),
+            Self::Gt => write!(f, ">"),
+            Self::ArrowLeft => write!(f, "<="),
+            Self::ArrowRight => write!(f, ">="),
         }
     }
 }

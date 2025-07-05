@@ -1,0 +1,23 @@
+fn fibonacci(number: int) : int {
+    if (number < 2) {
+        return number;
+    } else {
+        return fibonacci(number - 1) + fibonacci(number - 2);
+    }
+}
+
+fn less(number: int) : bool {
+    if (number < 2) {
+        @print("Yes!");
+        return true;
+    } else {
+        @print("NOOOO!");
+        return false;
+    }
+}
+
+//less(3);
+
+@print("%d", fibonacci(10));
+@assert(fibonacci(10) == 55);
+

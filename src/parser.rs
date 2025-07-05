@@ -40,7 +40,7 @@ pub struct FunctionDecl {
     pub r#extern: bool,
     pub params: Vec<Param>,
     pub body: Vec<Spanned<Statement>>,
-    pub return_type: TypeName,
+    pub return_type: Option<Spanned<TypeName>>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +71,10 @@ pub enum BinOp {
     Mul,
     Div,
     Equal,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
 }
 
 impl Display for BinOp {
@@ -81,6 +85,10 @@ impl Display for BinOp {
             Self::Mul => write!(f, "*"),
             Self::Div => write!(f, "/"),
             Self::Equal => write!(f, "=="),
+            Self::Lt => write!(f, "<"),
+            Self::Gt => write!(f, ">"),
+            Self::Lte => write!(f, "<="),
+            Self::Gte => write!(f, ">="),
         }
     }
 }
@@ -141,11 +149,28 @@ where
         Token::Star => BinOp::Mul,
         Token::Slash => BinOp::Div,
         Token::EqualEqual => BinOp::Equal,
+        Token::Lt => BinOp::Lt,
+        Token::Gt => BinOp::Gt,
+        Token::ArrowLeft => BinOp::Lte,
+        Token::ArrowRight => BinOp::Gte,
     };
 
     let mut expression = Recursive::declare();
 
+    let args = expression
+        .clone()
+        .separated_by(just(Token::Comma))
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
+
+    let function_call = identifier_spanned
+        .then(args.clone())
+        .map_with(|(name, args), extra| {
+            Spanned(Expression::FunctionCall(name, args), extra.span())
+        });
+
     let atom = choice((
+        function_call.map(|fc| fc.0),
         identifier.map(|name| Expression::Identifier(name.to_owned())),
         float.map(Expression::Float),
         integer.map(Expression::Integer),
@@ -184,9 +209,9 @@ where
         },
     );
 
-    let equality = term.clone().foldl_with(
+    let comparision = term.clone().foldl_with(
         bin_op
-            .filter(|op| matches!(op, BinOp::Equal))
+            .filter(|op| matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte))
             .then(term.clone())
             .repeated(),
         |a, (op, b), extra| {
@@ -197,6 +222,21 @@ where
         },
     );
 
+    let equality = comparision.clone().foldl_with(
+        bin_op
+            .filter(|op| matches!(op, BinOp::Equal))
+            .then(comparision.clone())
+            .repeated(),
+        |a, (op, b), extra| {
+            Spanned(
+                Expression::Binary(op, Box::new(a), Box::new(b)),
+                extra.span(),
+            )
+        },
+    );
+
+    let binary = equality;
+
     let mut statement = Recursive::declare();
 
     let block = statement
@@ -204,12 +244,6 @@ where
         .repeated()
         .collect::<Vec<_>>()
         .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
-
-    let args = expression
-        .clone()
-        .separated_by(just(Token::Comma))
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
     let decl_params = (identifier_spanned
         .then_ignore(just(Token::Colon))
@@ -222,19 +256,14 @@ where
     let function_decl = just(Token::Id("fn"))
         .ignore_then(identifier)
         .then(decl_params)
+        .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
         .then(block.clone())
-        .map(|((name, params), body)| FunctionDecl {
+        .map(|(((name, params), return_type), body)| FunctionDecl {
             name: name.to_owned(),
             r#extern: false,
             params,
             body,
-            return_type: "void".to_owned(),
-        });
-
-    let function_call = identifier_spanned
-        .then(args.clone())
-        .map_with(|(name, args), extra| {
-            Spanned(Expression::FunctionCall(name, args), extra.span())
+            return_type,
         });
 
     let intrinsic = just(Token::At)
@@ -281,7 +310,7 @@ where
             )
         });
 
-    expression.define(choice((intrinsic, function_call, equality)).labelled("expression"));
+    expression.define(choice((intrinsic, binary)).labelled("expression"));
 
     let binding = just(Token::Id("let"))
         .ignore_then(identifier)

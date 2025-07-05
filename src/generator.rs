@@ -20,15 +20,15 @@ const UNREACHABLE: TrapCode = TrapCode::unwrap_user(100);
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CodeError {
-    #[error("Return value type must be integer, found: {}", .0)]
-    InvalidReturnType(Type),
+    #[error("Invalid type of return value. Exprected '{}' but found: '{}'", .0, .1)]
+    InvalidReturnType(Type, Type),
 
     #[error("{} isn't supported yet.", .0)]
     NoYetSupported(String),
 
     #[error("Incompatiple types for binary operator '{}': '{}' and '{}'", .0, .1, .2)]
     IncompatipleBinOpTypes(BinOp, Type, Type),
-    #[error("Invalid type '{}' for binary operator '{}'", .0 ,.1)]
+    #[error("Invalid type '{}' for binary operator '{}'", .1 ,.0)]
     InvalidBinOpType(BinOp, Type),
 
     #[error("Intrisic '@{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
@@ -57,8 +57,9 @@ pub enum CodeError {
     #[error("All branches of an if expression must have same type.")]
     IfExpressionType,
 
-    #[error("Invalid type name '{}' as function parameter.", .0)]
-    FunctionParamType(String),
+    #[error("Unknown type '{}'.", .0)]
+    UnknownType(String),
+
     #[error("Duplicate function parameter '{}'", .0)]
     FunctionParamDuplicate(String),
     #[error("Function '{}' already declared.", .0)]
@@ -69,6 +70,13 @@ pub enum CodeError {
     FunctionCallArgumentCount(String, usize, usize),
     #[error("Function '{}' called with wrong argument type. Expected '{}' but found '{}'.", .0, .1, .2)]
     FunctionCallArgumentType(String, Type, Type),
+
+    #[error("Unreachable statement.")]
+    UnreachableStatement,
+    #[error("Function does not return on all code paths.")]
+    MissingReturnStatement,
+    #[error("Must declare function in top level scope.")]
+    FunctionDeclNotTopLevel,
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -258,6 +266,11 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
         current_scope: Scope::new(),
         var_count: 0,
         verbose,
+        current_func_type: FuncType {
+            name: "main".to_owned(),
+            params: Vec::new(),
+            return_type: Type::Int.into(), // TODO: I32
+        },
     };
 
     generator.build(program)?;
@@ -295,6 +308,12 @@ impl Scope {
         }
     }
 
+    pub fn function_scope(&self) -> Self {
+        let mut new_scope = Self::new();
+        new_scope.functions = self.functions.clone();
+        new_scope
+    }
+
     pub fn get_var(&self, name: &str) -> Option<&(Variable, Type)> {
         self.vars_name
             .get(name)
@@ -320,8 +339,19 @@ impl Scope {
             .or_else(|| self.parent.as_ref()?.get_func(name))
     }
 
-    pub fn insert_func(&mut self, name: String, func_id: FuncId, func_type: FuncType) {
-        self.functions.insert(name, (func_id, func_type));
+    #[must_use]
+    pub fn insert_func(
+        &mut self,
+        name: String,
+        func_id: FuncId,
+        func_type: FuncType,
+    ) -> Option<()> {
+        if self.parent.is_some() {
+            None
+        } else {
+            self.functions.insert(name, (func_id, func_type));
+            Some(())
+        }
     }
 }
 
@@ -338,41 +368,78 @@ struct Generator<'a> {
     current_scope: Scope,
     var_count: usize,
     verbose: bool,
+    current_func_type: FuncType,
 }
 
 impl Generator<'_> {
     fn build(mut self, program: Program) -> Result<(), GeneratorErrors> {
+        match self.build_statements(&program.statements) {
+            Ok(returned) => {
+                if !returned {
+                    let zero = self.builder.ins().iconst(types::I32, 0);
+                    self.builder.ins().return_(&[zero]);
+                }
+                Ok(())
+            }
+            Err(errors) => Err(GeneratorErrors::CodeErrors(errors)),
+        }
+    }
+
+    fn build_statements(&mut self, statements: &[Spanned<Statement>]) -> Result<bool, ManyErrors> {
         let mut errors = Vec::new();
-        for statement in &program.statements {
-            if let Err(mut error) = self.build_statement(statement) {
-                errors.append(&mut error);
+        let mut iter = statements.iter().peekable();
+        let mut returned = false;
+        while let Some(statement) = iter.next() {
+            match self.build_statement(statement) {
+                Err(mut error) => {
+                    errors.append(&mut error);
+                }
+                Ok(true) => {
+                    if let Some(next) = iter.peek() {
+                        errors.push(CodeError::UnreachableStatement.spanned(next.1))
+                    }
+                    returned = true;
+                    break;
+                }
+                Ok(false) => {}
             }
         }
 
-        if !self.returned {
-            let zero = self.builder.ins().iconst(types::I32, 0);
-            self.builder.ins().return_(&[zero]);
-        }
-
         if !errors.is_empty() {
-            return Err(GeneratorErrors::CodeErrors(errors));
+            return Err(errors);
         }
 
-        Ok(())
+        Ok(returned)
     }
 
-    fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<(), ManyErrors> {
+    fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<bool, ManyErrors> {
+        let mut returned = false;
         match &statement.0 {
             Statement::Return(expr) => {
                 let value = self.build_expression(expr)?;
 
-                if value.1 != Type::Int {
-                    return CodeError::InvalidReturnType(value.1).err(expr.1);
+                if self.current_func_type.name == "main" {
+                    if value.1 != Type::Int {
+                        // self.builder.ins().return_(&[]);
+                        return CodeError::InvalidReturnType(Type::Int, value.1).err(expr.1);
+                    }
+                    let cast = self.builder.ins().ireduce(types::I32, value.0);
+                    self.builder.ins().return_(&[cast]);
+                } else {
+                    if *self.current_func_type.return_type != value.1 {
+                        return CodeError::InvalidReturnType(
+                            (*self.current_func_type.return_type).clone(),
+                            value.1.clone(),
+                        )
+                        .err(expr.1);
+                    }
+                    match value.1 {
+                        Type::Never => panic!("Trying to return from unreachable code."),
+                        Type::Void => self.builder.ins().return_(&[]),
+                        _ => self.builder.ins().return_(&[value.0]),
+                    };
                 }
-
-                let cast = self.builder.ins().ireduce(types::I32, value.0);
-                self.builder.ins().return_(&[cast]);
-                self.returned = true;
+                returned = true;
             }
             Statement::Expression(expr) => {
                 self.build_expression(expr)?;
@@ -406,19 +473,13 @@ impl Generator<'_> {
                 }
             }
             Statement::Block(statements) => {
-                let mut errors = Vec::new();
-
                 let new_block = self.builder.create_block();
                 self.builder.ins().jump(new_block, []);
                 self.builder.switch_to_block(new_block);
                 self.builder.seal_block(new_block);
                 self.push_scope();
 
-                for statement in statements {
-                    if let Err(mut error) = self.build_statement(statement) {
-                        errors.append(&mut error);
-                    }
-                }
+                let result = self.build_statements(statements);
 
                 if self.pop_scope().is_none() {
                     unreachable!("Must always be able to pop scope after leaving block.");
@@ -429,17 +490,15 @@ impl Generator<'_> {
                 self.builder.switch_to_block(new_block);
                 self.builder.seal_block(new_block);
 
-                if !errors.is_empty() {
-                    return Err(errors);
-                }
+                return result;
             }
             Statement::If(r#if) => {
-                self.build_if(r#if)?;
+                return self.build_if(r#if);
             }
             Statement::FunctionDecl(decl) => self.build_fn_decl(decl, &statement.1)?,
         }
 
-        Ok(())
+        Ok(returned)
     }
 
     fn build_expression(
@@ -526,10 +585,17 @@ impl Generator<'_> {
                 BinOp::Mul => self.builder.ins().imul(x, y),
                 BinOp::Div => self.builder.ins().sdiv(x, y),
                 BinOp::Equal => self.builder.ins().icmp(IntCC::Equal, x, y),
+                BinOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, x, y),
+                BinOp::Gt => self.builder.ins().icmp(IntCC::SignedGreaterThan, x, y),
+                BinOp::Lte => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, x, y),
+                BinOp::Gte => self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, x, y),
             },
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Type::Int,
-                BinOp::Equal => Type::Bool,
+                BinOp::Equal | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => Type::Bool,
             },
         ))
     }
@@ -543,10 +609,14 @@ impl Generator<'_> {
                 BinOp::Mul => self.builder.ins().fmul(x, y),
                 BinOp::Div => self.builder.ins().fdiv(x, y),
                 BinOp::Equal => self.builder.ins().fcmp(FloatCC::Equal, x, y),
+                BinOp::Lt => self.builder.ins().fcmp(FloatCC::LessThan, x, y),
+                BinOp::Gt => self.builder.ins().fcmp(FloatCC::GreaterThan, x, y),
+                BinOp::Lte => self.builder.ins().fcmp(FloatCC::LessThanOrEqual, x, y),
+                BinOp::Gte => self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, x, y),
             },
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Type::Int,
-                BinOp::Equal => Type::Bool,
+                BinOp::Equal | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => Type::Bool,
             },
         ))
     }
@@ -656,7 +726,7 @@ impl Generator<'_> {
 
     // TODO: if expression
     // TODO: add clif comments to blocks
-    fn build_if(&mut self, if_statement: &If) -> Result<(), ManyErrors> {
+    fn build_if(&mut self, if_statement: &If) -> Result<bool, ManyErrors> {
         let condition_blocks: Vec<_> = if_statement
             .if_branches
             .iter()
@@ -673,6 +743,8 @@ impl Generator<'_> {
         let mut errors = Vec::new();
 
         self.builder.ins().jump(condition_blocks[0], []);
+
+        let mut returned = true;
 
         for (index, conditional) in if_statement.if_branches.iter().enumerate() {
             let condition_block = condition_blocks[index];
@@ -706,14 +778,18 @@ impl Generator<'_> {
             self.builder.seal_block(then_block);
             self.builder.switch_to_block(then_block);
             match self.build_block_body(&conditional.block) {
-                Ok(then_value) => {
-                    assert!(then_value.1 == Type::Void || then_value.1 == Type::Never); // TODO: if expression
+                Ok((_, block_type)) => {
+                    assert!(block_type == Type::Void || block_type == Type::Never); // TODO: if expression
+                    if block_type != Type::Never {
+                        self.builder.ins().jump(exit_block, []);
+                        returned = false;
+                    }
                 }
                 Err(mut err) => {
                     errors.append(&mut err);
+                    self.builder.ins().jump(exit_block, []);
                 }
             }
-            self.builder.ins().jump(exit_block, []);
         }
 
         if let Some(else_block) = else_block {
@@ -726,13 +802,18 @@ impl Generator<'_> {
                     .as_ref()
                     .expect("Else branch must exist."),
             ) {
-                Ok(_) => { // TODO: if expression
+                Ok((_, block_type)) => {
+                    assert!(block_type == Type::Void || block_type == Type::Never); // TODO: if expression
+                    if block_type != Type::Never {
+                        self.builder.ins().jump(exit_block, []);
+                        returned = false;
+                    }
                 }
                 Err(mut err) => {
                     errors.append(&mut err);
+                    self.builder.ins().jump(exit_block, []);
                 }
             }
-            self.builder.ins().jump(exit_block, []);
         }
 
         self.builder.seal_block(exit_block);
@@ -742,31 +823,26 @@ impl Generator<'_> {
             return Err(errors);
         }
 
-        Ok(())
+        Ok(returned)
     }
 
     fn build_block_body(
         &mut self,
-        then_body: &[Spanned<Statement>],
+        body: &[Spanned<Statement>],
     ) -> Result<(Value, Type), ManyErrors> {
         self.push_scope();
 
-        let mut errors = Vec::new();
-
-        for statement in then_body {
-            if let Err(mut error) = self.build_statement(statement) {
-                errors.append(&mut error);
-            }
-        }
+        let result = self.build_statements(body);
 
         let Some(_) = self.pop_scope() else {
             unreachable!("Must always be able to pop scope after leaving block.");
         };
 
-        if !errors.is_empty() {
-            return Err(errors);
+        match result {
+            Ok(true) => Ok((Value::new((u32::MAX - 1) as usize), Type::Never)),
+            Ok(false) => Ok((Value::new((u32::MAX - 1) as usize), Type::Void)),
+            Err(errors) => Err(errors),
         }
-        Ok((Value::new((u32::MAX - 1) as usize), Type::Void))
     }
 
     fn build_assert(
@@ -842,29 +918,21 @@ impl Generator<'_> {
             return_type,
         } = &decl;
 
-        if return_type != "void" {
-            todo!("non-void return types");
-        }
-
         if *r#extern {
             todo!("Extern functions")
         }
 
         let mut abi_params: Vec<(String, Type)> = Vec::new();
         let mut errors = Vec::new();
-        let mut func_type = FuncType {
-            name: name.to_owned(),
-            params: Vec::new(),
-            return_type: Type::Void.into(),
-        };
+        let mut param_types = Vec::new();
 
         if self.current_scope.get_func(name).is_some() {
             errors.push(CodeError::FunctionRedeclaration(name.to_owned()).spanned(*span));
         }
 
         for Param { name, type_name } in params {
-            let Some(r#type) = self.param_type_from_name(&type_name.0) else {
-                errors.push(CodeError::FunctionParamType(type_name.0.clone()).spanned(type_name.1));
+            let Some(r#type) = self.type_from_name(&type_name.0) else {
+                errors.push(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1));
                 continue;
             };
 
@@ -874,12 +942,36 @@ impl Generator<'_> {
             {
                 errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
-            func_type.params.push(r#type.clone());
+            param_types.push(r#type.clone());
             abi_params.push((name.0.clone(), r#type));
         }
 
         if !errors.is_empty() {
             return Err(errors);
+        }
+
+        let return_type = match return_type {
+            Some(type_name) => self
+                .type_from_name(&type_name.0)
+                .ok_or(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1))?,
+            None => Type::Void,
+        };
+
+        let returns = match &return_type {
+            Type::Void => Vec::new(),
+            return_type => {
+                vec![AbiParam::try_from(return_type).expect("Return type must be valid.")]
+            }
+        };
+
+        let func_type = FuncType {
+            name: name.to_owned(),
+            params: param_types,
+            return_type: return_type.into(),
+        };
+
+        if self.verbose {
+            println!("{func_type}");
         }
 
         let signature = Signature {
@@ -888,7 +980,7 @@ impl Generator<'_> {
                 .iter()
                 .map(|(_, r#type)| r#type.try_into().expect("Param type must be valid."))
                 .collect(),
-            returns: Vec::new(),
+            returns,
         };
 
         let func_id = self
@@ -896,9 +988,10 @@ impl Generator<'_> {
             .declare_function(name, Linkage::Local, &signature)
             .expect("Function must be declarable.");
 
-        if self.verbose {
-            println!("{func_type}");
-        }
+        // FIXME:
+        self.current_scope
+            .insert_func(name.to_owned(), func_id, func_type.clone())
+            .ok_or(CodeError::FunctionDeclNotTopLevel.spanned(*span))?;
 
         // Create a completely separate generator for the function
         let mut fn_context = Context::new();
@@ -922,9 +1015,10 @@ impl Generator<'_> {
             printf_id: self.printf_id,
             exit_id: self.exit_id,
             returned: false,
-            current_scope: Scope::new(),
+            current_scope: self.current_scope.function_scope(),
             var_count: 0,
             verbose: self.verbose,
+            current_func_type: func_type.clone(),
         };
 
         for (i, (param_name, param_type)) in abi_params.iter().enumerate() {
@@ -942,42 +1036,41 @@ impl Generator<'_> {
             fn_generator.builder.def_var(var, param_value);
         }
 
-        for statement in body {
-            if let Err(mut error) = fn_generator.build_statement(statement) {
-                errors.append(&mut error);
+        match fn_generator.build_statements(body) {
+            Err(mut new_errors) => {
+                errors.append(&mut new_errors);
             }
+            Ok(false) if *func_type.return_type == Type::Void => {
+                fn_generator.builder.ins().return_(&[]);
+            }
+            Ok(false) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
+            Ok(true) => {}
         }
+
+        self.strings = fn_generator.strings;
 
         if !errors.is_empty() {
             return Err(errors);
         }
 
-        // Ensure function returns properly (void functions don't need explicit return)
-        if !fn_generator.returned {
-            fn_generator.builder.ins().return_(&[]);
-        }
-
-        self.strings = fn_generator.strings;
-
         if self.verbose {
-            println!("{}", fn_generator.fn_context.func.display());
+            println!("{}", fn_generator.builder.func.display());
         }
 
         self.module
             .define_function(func_id, &mut fn_context)
             .unwrap();
-        self.current_scope
-            .insert_func(name.to_owned(), func_id, func_type);
 
         Ok(())
     }
 
-    fn param_type_from_name(&self, type_name: &str) -> Option<Type> {
+    fn type_from_name(&self, type_name: &str) -> Option<Type> {
         Some(match type_name {
             "int" => Type::Int,
             "float" => Type::Float,
             "bool" => Type::Bool,
             "string" => Type::String,
+            "void" => Type::Void,
             _ => return None,
         })
     }
@@ -1020,11 +1113,11 @@ impl Generator<'_> {
 
         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
         let inst = self.builder.ins().call(func_ref, &arg_values);
-        if !self.builder.inst_results(inst).is_empty() {
-            todo!("Return values.")
+        match self.builder.inst_results(inst) {
+            [] => Ok((Value::from_u32(u32::MAX - 1), Type::Void)),
+            [value] => Ok((*value, *func_type.return_type)),
+            _ => panic!("Invalid number of return values. Must be 0 or 1."),
         }
-
-        Ok((Value::from_u32(u32::MAX - 1), Type::Void))
     }
 }
 
