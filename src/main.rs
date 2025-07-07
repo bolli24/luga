@@ -90,7 +90,7 @@ fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
 
     create_dir_all(&output_dir).expect("Unable to create output directory.");
 
-    build_file(path, &output_dir, cli.verbose).map_err(|err| {
+    build_file(path, &output_dir, cli.verbose, cli.release).map_err(|err| {
         eprintln!("Error building executable.");
         eprintln!("{err}");
     })
@@ -134,7 +134,12 @@ fn run_file(cli: &Cli, path: &Path) -> Result<(), ()> {
     }
 }
 
-fn build_file(file_path: &Path, output_dir: &Path, verbose: bool) -> Result<PathBuf, BuildError> {
+fn build_file(
+    file_path: &Path,
+    output_dir: &Path,
+    verbose: bool,
+    release: bool,
+) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
     let file_name = base_name.to_string_lossy().to_string();
@@ -195,7 +200,7 @@ fn build_file(file_path: &Path, output_dir: &Path, verbose: bool) -> Result<Path
         println!();
     }
 
-    let product = match generate(program, verbose) {
+    let product = match generate(program, verbose, release) {
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::CodeErrors(errors) => {

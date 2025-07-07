@@ -170,7 +170,11 @@ impl Display for FuncType {
     }
 }
 
-pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, GeneratorErrors> {
+pub fn generate(
+    program: Program,
+    verbose: bool,
+    release: bool,
+) -> Result<ObjectProduct, GeneratorErrors> {
     #[cfg(target_os = "linux")]
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux";
 
@@ -181,7 +185,9 @@ pub fn generate(program: Program, verbose: bool) -> Result<ObjectProduct, Genera
         let mut builder = settings::builder();
 
         // disable optimizations so dissassembly will more directly correlated to our Cranelift usage
-        builder.set("opt_level", "none").unwrap();
+        builder
+            .set("opt_level", if release { "speed" } else { "none" })
+            .unwrap();
 
         builder.enable("is_pic").unwrap();
 
