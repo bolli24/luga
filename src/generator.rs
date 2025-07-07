@@ -16,7 +16,7 @@ use crate::{
     util::ResultCollectAll,
 };
 
-const UNREACHABLE: TrapCode = TrapCode::unwrap_user(100);
+const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CodeError {
@@ -988,12 +988,10 @@ impl Generator<'_> {
             .declare_function(name, Linkage::Local, &signature)
             .expect("Function must be declarable.");
 
-        // FIXME:
         self.current_scope
             .insert_func(name.to_owned(), func_id, func_type.clone())
             .ok_or(CodeError::FunctionDeclNotTopLevel.spanned(*span))?;
 
-        // Create a completely separate generator for the function
         let mut fn_context = Context::new();
         let mut fn_builder_context = FunctionBuilderContext::new();
         let mut fn_builder = FunctionBuilder::new(&mut fn_context.func, &mut fn_builder_context);
