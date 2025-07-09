@@ -750,7 +750,7 @@ impl Generator<'_> {
 
         self.builder.ins().jump(condition_blocks[0], []);
 
-        let mut returned = true;
+        let mut returned = else_block.is_some();
 
         for (index, conditional) in if_statement.if_branches.iter().enumerate() {
             let condition_block = condition_blocks[index];
