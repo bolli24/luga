@@ -1,0 +1,22 @@
+fn fibonacci(n: int) : int {
+    if (n <= 1) {
+        return 0;
+    }
+
+    let a = 0;
+    let b = 1;
+    let i = 2;
+
+    while (i < n + 1) {
+        let c = b;
+        b = a + b;
+        a = c;
+
+        i = i + 1;
+    }
+
+    return b;
+}
+
+@print("%d", fibonacci(10));
+@assert(fibonacci(10) == 55);

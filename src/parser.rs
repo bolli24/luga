@@ -19,6 +19,7 @@ pub enum Statement {
     Return(Spanned<Expression>),
     Block(Vec<Spanned<Statement>>),
     If(If),
+    While(Conditional),
     FunctionDecl(FunctionDecl),
 }
 
@@ -310,6 +311,23 @@ where
             )
         });
 
+    let while_statement = just(Token::Id("while"))
+        .ignore_then(
+            expression
+                .clone()
+                .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
+        )
+        .then(block.clone())
+        .map_with(|(condition, block), extra| {
+            Spanned(
+                Statement::While(Conditional {
+                    condition: condition.into(),
+                    block,
+                }),
+                extra.span(),
+            )
+        });
+
     expression.define(choice((intrinsic, binary)).labelled("expression"));
 
     let binding = just(Token::Id("let"))
@@ -345,6 +363,7 @@ where
         .then_ignore(just(Token::Semicolon))
         .or(choice((
             if_statement,
+            while_statement,
             block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())),
             function_decl
                 .map_with(|decl, extra| Spanned(Statement::FunctionDecl(decl), extra.span())),

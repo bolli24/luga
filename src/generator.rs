@@ -12,7 +12,10 @@ use cranelift::{
 };
 
 use crate::{
-    parser::{BinOp, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned, Statement},
+    parser::{
+        BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
+        Statement,
+    },
     util::ResultCollectAll,
 };
 
@@ -418,6 +421,7 @@ impl Generator<'_> {
         Ok(returned)
     }
 
+    /// Returns Ok(true) if all paths return from the function
     fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<bool, ManyErrors> {
         let mut returned = false;
         match &statement.0 {
@@ -501,6 +505,7 @@ impl Generator<'_> {
             Statement::If(r#if) => {
                 return self.build_if(r#if);
             }
+            Statement::While(r#while) => return self.build_while(r#while),
             Statement::FunctionDecl(decl) => self.build_fn_decl(decl, &statement.1)?,
         }
 
@@ -830,6 +835,38 @@ impl Generator<'_> {
         }
 
         Ok(returned)
+    }
+
+    fn build_while(&mut self, conditional: &Conditional) -> Result<bool, Vec<Spanned<CodeError>>> {
+        let Conditional { condition, block } = conditional;
+
+        let while_block = self.builder.create_block();
+        let exit_block = self.builder.create_block();
+        let condition_block = self.builder.create_block();
+        self.builder.ins().jump(condition_block, []);
+        self.builder.switch_to_block(condition_block);
+
+        let condition_value = self.build_expression(condition)?;
+        if condition_value.1 != Type::Bool {
+            return CodeError::InvalidConditionType(condition_value.1.clone()).err(condition.1);
+        }
+
+        self.builder
+            .ins()
+            .brif(condition_value.0, while_block, [], exit_block, []);
+
+        self.builder.switch_to_block(while_block);
+
+        self.build_block_body(block)?;
+
+        self.builder.ins().jump(condition_block, []);
+
+        self.builder.switch_to_block(exit_block);
+        self.builder.seal_block(condition_block);
+        self.builder.seal_block(while_block);
+        self.builder.seal_block(exit_block);
+
+        Ok(false)
     }
 
     fn build_block_body(
