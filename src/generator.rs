@@ -10,11 +10,12 @@ use cranelift::{
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::*,
 };
+use indexmap::IndexMap;
 
 use crate::{
     parser::{
         BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
-        Statement,
+        Statement, StructDecl,
     },
     util::ResultCollectAll,
 };
@@ -67,7 +68,7 @@ pub enum CodeError {
     FunctionParamDuplicate(String),
     #[error("Function '{}' already declared.", .0)]
     FunctionRedeclaration(String),
-    #[error("Call to unknown function '{}'.",.0)]
+    #[error("Call to unknown function '{}'.", .0)]
     UnknownFunction(String),
     #[error("Function '{}' called with wrong number of arguments. Expected {} but found {}.", .0, .1, .2)]
     FunctionCallArgumentCount(String, usize, usize),
@@ -80,6 +81,13 @@ pub enum CodeError {
     MissingReturnStatement,
     #[error("Must declare function in top level scope.")]
     FunctionDeclNotTopLevel,
+
+    #[error("Must declare function in top level scope.")]
+    StructDeclNotTopLevel,
+    #[error("Struct '{}' already declared.", .0)]
+    StrutRedeclaration(String),
+    #[error("Struct field '{}' already declared.", .0)]
+    StructDuplicateField(String),
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -112,7 +120,27 @@ pub enum Type {
     String,
     Bool,
     Fn(FuncType),
+    Struct(StructType),
     // TODO: Named(String),
+}
+
+impl Type {
+    fn size(&self) -> usize {
+        match self {
+            Type::Int => 8,
+            Type::Float => 8,
+            Type::Void => 0,
+            Type::Never => 0,
+            Type::String => 8, // TODO: platform pointer size
+            Type::Bool => 1,
+            Type::Fn(_) => 0,
+            Type::Struct(struct_type) => struct_type
+                .fields
+                .values()
+                .map(|field| field.r#type.size())
+                .sum(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +148,18 @@ pub struct FuncType {
     name: String,
     params: Vec<Type>,
     return_type: Box<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructType {
+    name: String,
+    fields: IndexMap<String, StructField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructField {
+    r#type: Type,
+    offset: usize,
 }
 
 impl TryFrom<&Type> for types::Type {
@@ -153,6 +193,7 @@ impl Display for Type {
             Self::Bool => write!(f, "bool"),
             // TODO: Type::Named(name) => write!(f, "{name}"),
             Self::Fn(func_type) => write!(f, "{func_type}"),
+            Self::Struct(struct_type) => write!(f, "{struct_type}"),
         }
     }
 }
@@ -169,6 +210,21 @@ impl Display for FuncType {
                 .collect::<Vec<_>>()
                 .join(", "),
             self.return_type
+        )
+    }
+}
+
+impl Display for StructType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "struct {} {{ {} }}",
+            self.name,
+            self.fields
+                .iter()
+                .map(|field| { format!("{}@{}: {}", field.0, field.1.offset, field.1.r#type) })
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 }
@@ -280,6 +336,7 @@ pub fn generate(
             params: Vec::new(),
             return_type: Type::Int.into(), // TODO: I32
         },
+        new_types: HashMap::new(),
     };
 
     generator.build(program)?;
@@ -378,6 +435,7 @@ struct Generator<'a> {
     var_count: usize,
     verbose: bool,
     current_func_type: FuncType,
+    new_types: HashMap<String, StructType>,
 }
 
 impl Generator<'_> {
@@ -423,7 +481,6 @@ impl Generator<'_> {
 
     /// Returns Ok(true) if all paths return from the function
     fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<bool, ManyErrors> {
-        let mut returned = false;
         match &statement.0 {
             Statement::Return(expr) => {
                 let value = self.build_expression(expr)?;
@@ -449,7 +506,7 @@ impl Generator<'_> {
                         _ => self.builder.ins().return_(&[value.0]),
                     };
                 }
-                returned = true;
+                return Ok(true);
             }
             Statement::Expression(expr) => {
                 self.build_expression(expr)?;
@@ -506,10 +563,15 @@ impl Generator<'_> {
                 return self.build_if(r#if);
             }
             Statement::While(r#while) => return self.build_while(r#while),
-            Statement::FunctionDecl(decl) => self.build_fn_decl(decl, &statement.1)?,
+            Statement::FunctionDecl(decl) => {
+                return self.build_fn_decl(decl, &statement.1).map(|_| false);
+            }
+            Statement::StructDecl(decl) => {
+                return self.build_struct_decl(decl, &statement.1).map(|_| false);
+            }
         }
 
-        Ok(returned)
+        Ok(false)
     }
 
     fn build_expression(
@@ -1060,6 +1122,7 @@ impl Generator<'_> {
             var_count: 0,
             verbose: self.verbose,
             current_func_type: func_type.clone(),
+            new_types: HashMap::new(),
         };
 
         for (i, (param_name, param_type)) in abi_params.iter().enumerate() {
@@ -1159,6 +1222,61 @@ impl Generator<'_> {
             [value] => Ok((*value, *func_type.return_type)),
             _ => panic!("Invalid number of return values. Must be 0 or 1."),
         }
+    }
+
+    fn build_struct_decl(
+        &mut self,
+        decl: &StructDecl,
+        span: &SimpleSpan,
+    ) -> Result<(), ManyErrors> {
+        let mut errors = Vec::new();
+        if self.current_scope.parent.is_some() {
+            errors.push(CodeError::StructDeclNotTopLevel.spanned(*span));
+        }
+
+        if self.new_types.contains_key(&decl.name.0) {
+            errors.push(CodeError::StrutRedeclaration(decl.name.0.clone()).spanned(decl.name.1));
+        }
+
+        let mut fields = IndexMap::new();
+        let mut current_offset = 0;
+
+        for (name, type_name) in &decl.fields {
+            if fields.contains_key(&name.0) {
+                errors.push(CodeError::StructDuplicateField(name.0.clone()).spanned(name.1));
+                continue;
+            }
+
+            let Some(field_type) = self.type_from_name(&type_name.0) else {
+                errors.push(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1));
+                continue;
+            };
+
+            let field_size = field_type.size();
+            fields.insert(
+                name.0.clone(),
+                StructField {
+                    r#type: field_type,
+                    offset: current_offset,
+                },
+            );
+            current_offset += field_size;
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let struct_type = StructType {
+            name: decl.name.0.clone(),
+            fields,
+        };
+
+        if self.verbose {
+            println!("Defined struct: \n {struct_type:?}");
+        }
+        self.new_types.insert(decl.name.0.clone(), struct_type);
+        Ok(())
     }
 }
 

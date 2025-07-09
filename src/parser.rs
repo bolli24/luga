@@ -21,6 +21,7 @@ pub enum Statement {
     If(If),
     While(Conditional),
     FunctionDecl(FunctionDecl),
+    StructDecl(StructDecl),
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +48,13 @@ pub struct FunctionDecl {
 #[derive(Clone, Debug)]
 pub struct Param {
     pub name: Spanned<String>,
-    pub type_name: Spanned<String>,
+    pub type_name: Spanned<TypeName>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub name: Spanned<String>,
+    pub fields: Vec<(Spanned<String>, Spanned<TypeName>)>,
 }
 
 type TypeName = String;
@@ -113,7 +120,9 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 7] = ["let", "return", "if", "else", "true", "false", "fn"];
+const KEY_WORDS: [&str; 8] = [
+    "let", "return", "if", "else", "true", "false", "fn", "struct",
+];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
 where
@@ -267,6 +276,24 @@ where
             return_type,
         });
 
+    let struct_decl = just(Token::Id("struct"))
+        .ignore_then(identifier_spanned)
+        .then(
+            identifier_spanned
+                .then_ignore(just(Token::Colon))
+                .then(identifier_spanned)
+                .then_ignore(just(Token::Semicolon))
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
+        )
+        .map_with(|(name, fields), extra| {
+            Spanned(
+                Statement::StructDecl(StructDecl { name, fields }),
+                extra.span(),
+            )
+        });
+
     let intrinsic = just(Token::At)
         .ignore_then(identifier)
         .try_map(|id, span| match id {
@@ -367,6 +394,7 @@ where
             block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())),
             function_decl
                 .map_with(|decl, extra| Spanned(Statement::FunctionDecl(decl), extra.span())),
+            struct_decl,
         ))),
     );
 

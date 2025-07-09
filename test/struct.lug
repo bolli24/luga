@@ -1,0 +1,8 @@
+struct Vec {
+    x: float;
+    y: float;
+}
+
+fn printVec(vec: Vec) {
+    @print("TOOD");
+}
