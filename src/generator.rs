@@ -243,7 +243,6 @@ pub fn generate(
     let isa = {
         let mut builder = settings::builder();
 
-        // disable optimizations so dissassembly will more directly correlated to our Cranelift usage
         builder
             .set("opt_level", if release { "speed" } else { "none" })
             .unwrap();
