@@ -3,9 +3,9 @@ use std::{
     fmt::Display,
 };
 
-use chumsky::span::SimpleSpan;
+use chumsky::span::{SimpleSpan, Span};
 use cranelift::{
-    codegen::{Context, verifier::VerifierError, verify_function},
+    codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError, verify_function},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::*,
@@ -88,6 +88,16 @@ pub enum CodeError {
     StrutRedeclaration(String),
     #[error("Struct field '{}' already declared.", .0)]
     StructDuplicateField(String),
+    #[error("Type '{}' has no field named '{}'.", .0, .1)]
+    UnknownField(Type, String),
+    #[error("Type '{}' is not a struct type.", .0)]
+    NotStructType(Type),
+    #[error("Duplicate initialization of field '{}'.", .0)]
+    StructInitArgDuplicate(String),
+    #[error("Missing initialization of field '{}'.", .0)]
+    StructInitMissingArg(String),
+    #[error("Invalid type for field initialization. Expected '{}' but found '{}'.", .0, .1)]
+    StructInitInvalidType(Type, Type),
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -125,7 +135,7 @@ pub enum Type {
 }
 
 impl Type {
-    fn size(&self) -> usize {
+    fn size(&self) -> u32 {
         match self {
             Type::Int => 8,
             Type::Float => 8,
@@ -134,12 +144,12 @@ impl Type {
             Type::String => 8, // TODO: platform pointer size
             Type::Bool => 1,
             Type::Fn(_) => 0,
-            Type::Struct(struct_type) => struct_type
-                .fields
-                .values()
-                .map(|field| field.r#type.size())
-                .sum(),
+            Type::Struct(struct_type) => struct_type.size(),
         }
+    }
+
+    fn alignment(&self) -> u32 {
+        8
     }
 }
 
@@ -156,10 +166,16 @@ pub struct StructType {
     fields: IndexMap<String, StructField>,
 }
 
+impl StructType {
+    fn size(&self) -> u32 {
+        self.fields.values().map(|field| field.r#type.size()).sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructField {
     r#type: Type,
-    offset: usize,
+    offset: i32,
 }
 
 impl TryFrom<&Type> for types::Type {
@@ -170,6 +186,8 @@ impl TryFrom<&Type> for types::Type {
             Type::Float => types::F64,
             Type::String => types::I64, // TODO: platform ptr size
             Type::Bool => types::I8,
+            Type::Struct(_) => types::I64, // TODO: platform ptr size
+
             _ => return Err(()),
         })
     }
@@ -335,6 +353,7 @@ pub fn generate(
             params: Vec::new(),
             return_type: Type::Int.into(), // TODO: I32
         },
+        return_dest: None,
         new_types: HashMap::new(),
     };
 
@@ -434,6 +453,7 @@ struct Generator<'a> {
     var_count: usize,
     verbose: bool,
     current_func_type: FuncType,
+    return_dest: Option<Variable>,
     new_types: HashMap<String, StructType>,
 }
 
@@ -482,30 +502,7 @@ impl Generator<'_> {
     fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<bool, ManyErrors> {
         match &statement.0 {
             Statement::Return(expr) => {
-                let value = self.build_expression(expr)?;
-
-                if self.current_func_type.name == "main" {
-                    if value.1 != Type::Int {
-                        // self.builder.ins().return_(&[]);
-                        return CodeError::InvalidReturnType(Type::Int, value.1).err(expr.1);
-                    }
-                    let cast = self.builder.ins().ireduce(types::I32, value.0);
-                    self.builder.ins().return_(&[cast]);
-                } else {
-                    if *self.current_func_type.return_type != value.1 {
-                        return CodeError::InvalidReturnType(
-                            (*self.current_func_type.return_type).clone(),
-                            value.1.clone(),
-                        )
-                        .err(expr.1);
-                    }
-                    match value.1 {
-                        Type::Never => panic!("Trying to return from unreachable code."),
-                        Type::Void => self.builder.ins().return_(&[]),
-                        _ => self.builder.ins().return_(&[value.0]),
-                    };
-                }
-                return Ok(true);
+                return self.build_return(expr);
             }
             Statement::Expression(expr) => {
                 self.build_expression(expr)?;
@@ -571,6 +568,96 @@ impl Generator<'_> {
         }
 
         Ok(false)
+    }
+
+    fn build_return_field_copy(
+        &mut self,
+        struct_field: &StructField,
+        current_offset: &mut i32,
+        struct_addr: Value,
+        return_dest: Value,
+    ) {
+        // Align current offset to field's alignment requirement
+        let field_alignment = struct_field.r#type.alignment();
+        *current_offset = Self::align_to(*current_offset, field_alignment);
+
+        match &struct_field.r#type {
+            Type::Struct(struct_type) => {
+                // For nested structs, recursively copy each field
+                for field in struct_type.fields.values() {
+                    self.build_return_field_copy(field, current_offset, struct_addr, return_dest);
+                }
+            }
+            _ => {
+                // Copy primitive field
+                let value = self.builder.ins().load(
+                    (&struct_field.r#type)
+                        .try_into()
+                        .expect("Field type must be valid"),
+                    MemFlags::trusted(),
+                    struct_addr,
+                    *current_offset,
+                );
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), value, return_dest, *current_offset);
+
+                // Advance offset by field size
+                *current_offset += struct_field.r#type.size() as i32;
+            }
+        }
+    }
+
+    // Helper function for alignment
+    fn align_to(offset: i32, alignment: u32) -> i32 {
+        let align = alignment as i32;
+        (offset + align - 1) & !(align - 1)
+    }
+
+    fn build_return(&mut self, expr: &Spanned<Expression>) -> Result<bool, ManyErrors> {
+        let value = self.build_expression(expr)?;
+        if self.current_func_type.name == "main" {
+            if value.1 != Type::Int {
+                // self.builder.ins().return_(&[]);
+                return CodeError::InvalidReturnType(Type::Int, value.1).err(expr.1);
+            }
+            let cast = self.builder.ins().ireduce(types::I32, value.0);
+            self.builder.ins().return_(&[cast]);
+        } else {
+            if *self.current_func_type.return_type != value.1 {
+                return CodeError::InvalidReturnType(
+                    (*self.current_func_type.return_type).clone(),
+                    value.1.clone(),
+                )
+                .err(expr.1);
+            }
+            match value.1 {
+                Type::Never => panic!("Trying to return from unreachable code."),
+                Type::Void => self.builder.ins().return_(&[]),
+                Type::Struct(struct_type) => {
+                    let return_dest = self
+                        .return_dest
+                        .expect("Return destination must be valid when returning struct.");
+
+                    let return_dest = self.builder.use_var(return_dest);
+
+                    let mut current_offset = 0;
+
+                    for field in struct_type.fields.values() {
+                        self.build_return_field_copy(
+                            field,
+                            &mut current_offset,
+                            value.0,
+                            return_dest,
+                        );
+                    }
+
+                    self.builder.ins().return_(&[])
+                }
+                _ => self.builder.ins().return_(&[value.0]),
+            };
+        }
+        Ok(true)
     }
 
     fn build_expression(
@@ -645,6 +732,98 @@ impl Generator<'_> {
                 Ok((self.builder.use_var(*var), var_type.clone()))
             }
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
+            Expression::FieldAccess(expr, name) => {
+                let expr_value = self.build_expression(expr)?;
+                let field = match &expr_value.1 {
+                    Type::Struct(struct_type) if struct_type.fields.contains_key(&name.0) => {
+                        &struct_type.fields[&name.0]
+                    }
+                    _ => {
+                        return CodeError::UnknownField(expr_value.1, name.0.clone()).err(name.1);
+                    }
+                };
+
+                let struct_value = self.builder.ins().load(
+                    (&field.r#type)
+                        .try_into()
+                        .expect("Field type must be valid."),
+                    MemFlags::new(),
+                    expr_value.0,
+                    field.offset,
+                );
+
+                Ok((struct_value, field.r#type.clone()))
+            }
+            Expression::StructInit(struct_init) => {
+                let mut errors = Vec::new();
+                let mut arg_values = HashMap::with_capacity(struct_init.args.len());
+
+                for arg in &struct_init.args {
+                    match self.build_expression(&arg.1) {
+                        Ok(value) => {
+                            if arg_values.insert(arg.0.0.clone(), value).is_some() {
+                                errors.push(
+                                    CodeError::StructInitArgDuplicate(arg.0.0.clone())
+                                        .spanned(combine_spans(arg.0.1, arg.1.1)),
+                                );
+                            }
+                        }
+                        Err(mut errs) => errors.append(&mut errs),
+                    }
+                }
+
+                let Some(r#type) = self.type_from_name(&struct_init.name.0) else {
+                    errors.push(
+                        CodeError::UnknownType(struct_init.name.0.clone())
+                            .spanned(struct_init.name.1),
+                    );
+                    return Err(errors);
+                };
+                let Type::Struct(struct_type) = &r#type else {
+                    errors.push(CodeError::NotStructType(r#type).spanned(struct_init.name.1));
+                    return Err(errors);
+                };
+
+                if !errors.is_empty() {
+                    return Err(errors);
+                }
+
+                let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    struct_type.size(),
+                    3, // TODO: calculate this correctly
+                ));
+
+                let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
+
+                for (name, field) in &struct_type.fields {
+                    let Some(value) = arg_values.get(name) else {
+                        errors.push(CodeError::StructInitMissingArg(name.clone()).spanned(*span));
+                        continue;
+                    };
+
+                    if value.1 != field.r#type {
+                        errors.push(
+                            CodeError::StructInitInvalidType(field.r#type.clone(), value.1.clone())
+                                .spanned(*span),
+                        );
+                        continue;
+                    }
+
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        value.0,
+                        struct_addr,
+                        field.offset,
+                    );
+                }
+
+                if !errors.is_empty() {
+                    return Err(errors);
+                }
+
+                Ok((struct_addr, r#type))
+            }
         }
     }
 
@@ -1026,7 +1205,7 @@ impl Generator<'_> {
             todo!("Extern functions")
         }
 
-        let mut abi_params: Vec<(String, Type)> = Vec::new();
+        let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = Vec::new();
         let mut errors = Vec::new();
         let mut param_types = Vec::new();
 
@@ -1040,14 +1219,18 @@ impl Generator<'_> {
                 continue;
             };
 
-            if abi_params
+            if fn_params
                 .iter()
-                .any(|(other_name, _)| &name.0 == other_name)
+                .any(|(other_name, _, _)| &name.0 == other_name)
             {
                 errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
             param_types.push(r#type.clone());
-            abi_params.push((name.0.clone(), r#type));
+            fn_params.push((
+                name.0.clone(),
+                r#type.try_into().expect("Param type must be valid."),
+                ArgumentPurpose::Normal,
+            ));
         }
 
         if !errors.is_empty() {
@@ -1063,6 +1246,14 @@ impl Generator<'_> {
 
         let returns = match &return_type {
             Type::Void => Vec::new(),
+            Type::Struct(_) => {
+                fn_params.push((
+                    "@return_addr".to_owned(),
+                    return_type.clone(),
+                    ArgumentPurpose::StructReturn,
+                ));
+                Vec::new()
+            }
             return_type => {
                 vec![AbiParam::try_from(return_type).expect("Return type must be valid.")]
             }
@@ -1080,9 +1271,14 @@ impl Generator<'_> {
 
         let signature = Signature {
             call_conv: self.isa.default_call_conv(),
-            params: abi_params
+            params: fn_params
                 .iter()
-                .map(|(_, r#type)| r#type.try_into().expect("Param type must be valid."))
+                .map(|(_, r#type, purpose)| {
+                    let mut abi_param: AbiParam =
+                        r#type.try_into().expect("Param type must be valid.");
+                    abi_param.purpose = *purpose;
+                    abi_param
+                })
                 .collect(),
             returns,
         };
@@ -1121,10 +1317,11 @@ impl Generator<'_> {
             var_count: 0,
             verbose: self.verbose,
             current_func_type: func_type.clone(),
-            new_types: HashMap::new(),
+            new_types: self.new_types.clone(),
+            return_dest: None,
         };
 
-        for (i, (param_name, param_type)) in abi_params.iter().enumerate() {
+        for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
             let param_value = fn_generator.builder.block_params(entry_block)[i];
 
             let var = fn_generator
@@ -1137,6 +1334,11 @@ impl Generator<'_> {
 
             fn_generator.builder.declare_var(var, var_type);
             fn_generator.builder.def_var(var, param_value);
+
+            if *purpose == ArgumentPurpose::StructReturn {
+                debug_assert!(fn_generator.return_dest.is_none());
+                fn_generator.return_dest = Some(var);
+            }
         }
 
         match fn_generator.build_statements(body) {
@@ -1174,7 +1376,12 @@ impl Generator<'_> {
             "bool" => Type::Bool,
             "string" => Type::String,
             "void" => Type::Void,
-            _ => return None,
+            name => {
+                return self
+                    .new_types
+                    .get(name)
+                    .map(|struct_type| Type::Struct(struct_type.clone()));
+            }
         })
     }
 
@@ -1197,7 +1404,7 @@ impl Generator<'_> {
             .err(*span);
         }
 
-        let arg_values = args
+        let mut arg_values = args
             .iter()
             .zip(func_type.params.iter())
             .map(|(expr, param_type)| {
@@ -1214,9 +1421,28 @@ impl Generator<'_> {
             })
             .collect::<Result<Vec<Value>, ManyErrors>>()?;
 
+        if let Type::Struct(struct_type) = &*func_type.return_type {
+            let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                struct_type.size(),
+                3, // TODO: calculate this correctly
+            ));
+
+            let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
+            arg_values.push(struct_addr);
+        }
+
         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
         let inst = self.builder.ins().call(func_ref, &arg_values);
         match self.builder.inst_results(inst) {
+            // Struct return
+            [] if *func_type.return_type != Type::Void => {
+                let return_dest = *arg_values
+                    .last()
+                    .expect("Return destination must be defined.");
+
+                Ok((return_dest, *func_type.return_type))
+            }
             [] => Ok((Value::from_u32(u32::MAX - 1), Type::Void)),
             [value] => Ok((*value, *func_type.return_type)),
             _ => panic!("Invalid number of return values. Must be 0 or 1."),
@@ -1259,7 +1485,7 @@ impl Generator<'_> {
                     offset: current_offset,
                 },
             );
-            current_offset += field_size;
+            current_offset += field_size as i32;
         }
 
         if !errors.is_empty() {
@@ -1277,6 +1503,10 @@ impl Generator<'_> {
         self.new_types.insert(decl.name.0.clone(), struct_type);
         Ok(())
     }
+}
+
+fn combine_spans(a: SimpleSpan, b: SimpleSpan) -> SimpleSpan {
+    SimpleSpan::new(a.context, a.start..b.end)
 }
 
 fn join<T: ToString>(items: &[T]) -> String {

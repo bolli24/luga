@@ -1,8 +1,24 @@
-struct Vec {
-    x: float;
-    y: float;
+struct iVec {
+    x: int;
+    y: int;
 }
 
-fn printVec(vec: Vec) {
-    @print("TOOD");
+fn printVec(vec: iVec) {
+    @println("(%d, %d)", vec.x, vec.y);
 }
+
+fn add(a: iVec, b: iVec) : iVec {
+    return iVec {x: a.x + b.x, y: a.y + b.y};
+}
+
+let a = iVec {x: 2, y: -2};
+let b = iVec {x: -2, y: -2};
+
+printVec(iVec {x: 0, y: -4});
+
+let c = add(a, b);
+
+printVec(c);
+
+@assert(0 == c.x);
+@assert(-4 == c.y);

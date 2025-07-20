@@ -57,6 +57,12 @@ pub struct StructDecl {
     pub fields: Vec<(Spanned<String>, Spanned<TypeName>)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StructInit {
+    pub name: Spanned<String>,
+    pub args: Vec<(Spanned<String>, Box<Spanned<Expression>>)>,
+}
+
 type TypeName = String;
 
 #[derive(Clone, Debug)]
@@ -67,9 +73,12 @@ pub enum Expression {
     String(String),
     Bool(bool),
 
+    Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
+
     Intrinsic(Intrinsic, Vec<Spanned<Expression>>),
     FunctionCall(Spanned<String>, Vec<Spanned<Expression>>),
-    Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
+    FieldAccess(Box<Spanned<Expression>>, Spanned<String>),
+    StructInit(StructInit),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,8 +188,21 @@ where
             Spanned(Expression::FunctionCall(name, args), extra.span())
         });
 
+    let struct_init = identifier_spanned
+        .then(
+            identifier_spanned
+                .then_ignore(just(Token::Colon))
+                .then(expression.clone().map(Box::new))
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
+        )
+        .map(|(name, args)| Expression::StructInit(StructInit { name, args }));
+
     let atom = choice((
         function_call.map(|fc| fc.0),
+        struct_init,
         identifier.map(|name| Expression::Identifier(name.to_owned())),
         float.map(Expression::Float),
         integer.map(Expression::Integer),
@@ -193,10 +215,15 @@ where
     ))
     .map_with(|expr: Expression, extra| -> Spanned<Expression> { Spanned(expr, extra.span()) });
 
-    let factor = atom.clone().foldl_with(
+    let field_access = atom.clone().foldl_with(
+        just(Token::Dot).ignore_then(identifier_spanned).repeated(),
+        |expr, field, extra| Spanned(Expression::FieldAccess(Box::new(expr), field), extra.span()),
+    );
+
+    let factor = field_access.clone().foldl_with(
         bin_op
             .filter(|op| matches!(op, BinOp::Mul | BinOp::Div))
-            .then(atom.clone())
+            .then(field_access.clone())
             .repeated(),
         |a, (op, b), extra| {
             Spanned(
