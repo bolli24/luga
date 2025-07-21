@@ -1,4 +1,4 @@
-fn hallo(test: string, number: int) {
+fn hallo(test: string, number: i32) {
     @print("%s ", test);
     @println("%d", number);
 } 

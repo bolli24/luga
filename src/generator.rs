@@ -8,7 +8,7 @@ use cranelift::{
     codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError, verify_function},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
-    prelude::*,
+    prelude::{isa::CallConv, *},
 };
 use indexmap::IndexMap;
 
@@ -67,6 +67,8 @@ pub enum CodeError {
     UnknownType(String),
     #[error("Type '{}' already declared.", .0)]
     TypeRedeclaration(String),
+    #[error("Can't coerse integer literal of value '{}' into integer type '{}'", .0, .0)]
+    CoerseInt(Type, i64),
 
     #[error("Duplicate function parameter '{}'", .0)]
     FunctionParamDuplicate(String),
@@ -125,11 +127,16 @@ pub enum GeneratorErrors {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
-    Byte,
-    Int,
-    Long,
-    Float,
-    Double,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
     Void,
     Never,
     String,
@@ -142,13 +149,13 @@ pub enum Type {
 impl Type {
     fn size(&self) -> u32 {
         match self {
-            Self::Byte => 1,
-            Self::Int => 4,
-            Self::Long => 8,
-            Self::Float => 4,
-            Self::Double => 8,
-            Self::Void => 0,
-            Self::Never => 0,
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 => 4,
+            Self::I64 | Self::U64 => 8,
+            Self::F32 => 4,
+            Self::F64 => 8,
+            Self::Void | Self::Never => 0,
             Self::String => 8, // TODO: platform pointer size
             Self::Bool => 1,
             Self::Fn(_) => 0,
@@ -158,18 +165,48 @@ impl Type {
 
     fn align_shift(&self) -> u8 {
         match self {
-            Self::Byte => 0,
-            Self::Int => 2,
-            Self::Long => 3,
-            Self::Float => 2,
-            Self::Double => 3,
-            Self::Void => 0,
-            Self::Never => 0,
+            Self::I8 | Self::U8 => 0,
+            Self::I16 | Self::U16 => 1,
+            Self::I32 | Self::U32 => 2,
+            Self::I64 | Self::U64 => 3,
+            Self::F32 => 2,
+            Self::F64 => 3,
+            Self::Void | Self::Never => 0,
             Self::String => 3,
             Self::Bool => 0,
             Self::Fn(_) => 0,
             Self::Struct(struct_type) => struct_type.align_shift(),
         }
+    }
+
+    fn struct_type(&self) -> Option<&StructType> {
+        if let Type::Struct(struct_type) = self {
+            Some(struct_type)
+        } else {
+            None
+        }
+    }
+
+    fn is_int(&self) -> bool {
+        matches!(
+            self,
+            Self::I8
+                | Self::U8
+                | Self::I16
+                | Self::U16
+                | Self::I32
+                | Self::U32
+                | Self::I64
+                | Self::U64
+        )
+    }
+
+    fn is_signed_int(&self) -> bool {
+        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+    }
+
+    fn is_unsigned_int(&self) -> bool {
+        matches!(self, Self::U8 | Self::U16 | Self::U32 | Self::U64)
     }
 }
 
@@ -203,6 +240,15 @@ impl StructType {
         offset + padding
     }
 
+    fn size_pad_8(&self) -> u32 {
+        let size = self.size();
+        if size % 8 == 0 {
+            size
+        } else {
+            size + (8 - size % 8)
+        }
+    }
+
     fn align_shift(&self) -> u8 {
         self.fields
             .values()
@@ -218,44 +264,23 @@ pub struct StructField {
     offset: i32,
 }
 
-impl TryFrom<&Type> for types::Type {
-    type Error = ();
-    fn try_from(val: &Type) -> Result<Self, Self::Error> {
-        Ok(match val {
-            Type::Byte => types::I8,
-            Type::Int => types::I32,
-            Type::Long => types::I64,
-            Type::Float => types::F32,
-            Type::Double => types::F64,
-            Type::String => types::I64, // TODO: platform ptr size
-            Type::Bool => types::I8,
-            Type::Struct(_) => types::I64, // TODO: platform ptr size
-
-            _ => return Err(()),
-        })
-    }
-}
-
-impl TryFrom<&Type> for AbiParam {
-    type Error = ();
-    fn try_from(value: &Type) -> Result<Self, Self::Error> {
-        Ok(Self::new(value.try_into()?))
-    }
-}
-
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Byte => write!(f, "byte"),
-            Self::Int => write!(f, "int"),
-            Self::Long => write!(f, "long"),
-            Self::Float => write!(f, "float"),
-            Self::Double => write!(f, "double"),
+            Self::I8 => write!(f, "i8"),
+            Self::I16 => write!(f, "i16"),
+            Self::I32 => write!(f, "i32"),
+            Self::I64 => write!(f, "i64"),
+            Self::U8 => write!(f, "u8"),
+            Self::U16 => write!(f, "u16"),
+            Self::U32 => write!(f, "u32"),
+            Self::U64 => write!(f, "u64"),
+            Self::F32 => write!(f, "f32"),
+            Self::F64 => write!(f, "f64"),
             Self::Void => write!(f, "void"),
             Self::Never => write!(f, "never"),
             Self::String => write!(f, "string"),
             Self::Bool => write!(f, "bool"),
-            // TODO: Type::Named(name) => write!(f, "{name}"),
             Self::Fn(func_type) => write!(f, "{func_type}"),
             Self::Struct(struct_type) => write!(f, "{struct_type}"),
         }
@@ -398,7 +423,7 @@ pub fn generate(
         current_func_type: FuncType {
             name: "main".to_owned(),
             params: Vec::new(),
-            return_type: Type::Int.into(), // TODO: I32
+            return_type: Type::I32.into(), // TODO: I32
             is_extern: false,
         },
         return_dest: None,
@@ -553,16 +578,16 @@ impl Generator<'_> {
                 return self.build_return(expr);
             }
             Statement::Expression(expr) => {
-                self.build_expression(expr)?;
+                self.build_expression(expr, None)?;
             }
             Statement::Binding(name, expr) => {
-                let value = self.build_expression(expr)?;
+                let value = self.build_expression(expr, None)?;
 
                 let Ok(var) = self.new_var(name.clone(), value.clone()) else {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
 
-                let Ok(var_type) = (&value.1).try_into() else {
+                let Some(var_type) = self.get_crane_type(&value.1) else {
                     return CodeError::BindingType(value.1).err(expr.1);
                 };
 
@@ -570,15 +595,15 @@ impl Generator<'_> {
                 self.builder.def_var(var, value.0);
             }
             Statement::Assignment(name, expr) => {
-                let value = self.build_expression(expr)?;
+                if let Some((var, var_type)) = self.current_scope.get_var(name).cloned() {
+                    let value = self.build_expression(expr, Some(var_type.clone()))?;
 
-                if let Some((var, var_type)) = self.current_scope.get_var(name) {
-                    if value.1 != *var_type {
+                    if value.1 != var_type {
                         return CodeError::AssignmentIncompatibleTypes(var_type.clone(), value.1)
                             .err(statement.1);
                     }
 
-                    self.builder.def_var(*var, value.0);
+                    self.builder.def_var(var, value.0);
                 } else {
                     return CodeError::UnknownVariable(name.clone()).err(statement.1);
                 }
@@ -638,10 +663,11 @@ impl Generator<'_> {
             }
             _ => {
                 // Copy primitive field
+                let crane_type = self
+                    .get_crane_type(&struct_field.r#type)
+                    .expect("Field type must be valid");
                 let value = self.builder.ins().load(
-                    (&struct_field.r#type)
-                        .try_into()
-                        .expect("Field type must be valid"),
+                    crane_type,
                     MemFlags::trusted(),
                     struct_addr,
                     *current_offset,
@@ -663,11 +689,12 @@ impl Generator<'_> {
     }
 
     fn build_return(&mut self, expr: &Spanned<Expression>) -> Result<bool, ManyErrors> {
-        let value = self.build_expression(expr)?;
+        let value =
+            self.build_expression(expr, Some(*self.current_func_type.return_type.clone()))?;
         if self.current_func_type.name == "main" {
-            if value.1 != Type::Int {
+            if value.1 != Type::I32 {
                 // self.builder.ins().return_(&[]);
-                return CodeError::InvalidReturnType(Type::Int, value.1).err(expr.1);
+                return CodeError::InvalidReturnType(Type::I32, value.1).err(expr.1);
             }
             self.builder.ins().return_(&[value.0]);
         } else {
@@ -710,14 +737,47 @@ impl Generator<'_> {
     fn build_expression(
         &mut self,
         expression: &Spanned<Expression>,
+        try_into_type: Option<Type>,
     ) -> Result<(Value, Type), ManyErrors> {
         let Spanned(expression, span) = expression;
         match expression {
-            Expression::Float(value) => {
-                Ok((self.builder.ins().f32const(*value as f32), Type::Float))
-            }
+            Expression::Float(value) => Ok((self.builder.ins().f32const(*value as f32), Type::F32)),
             Expression::Integer(value) => {
-                Ok((self.builder.ins().iconst(types::I32, *value), Type::Int))
+                let into_type = try_into_type.unwrap_or(Type::I32);
+
+                let mut check_and_emit = |min: i64, max: i64, cranelift_type, out_type: Type| {
+                    if *value < min || *value > max {
+                        CodeError::CoerseInt(out_type.clone(), *value).err(*span)
+                    } else {
+                        Ok((self.builder.ins().iconst(cranelift_type, *value), out_type))
+                    }
+                };
+
+                match &into_type {
+                    Type::I8 => check_and_emit(i8::MIN as i64, i8::MAX as i64, types::I8, Type::I8),
+                    Type::U8 => check_and_emit(u8::MIN as i64, u8::MAX as i64, types::I8, Type::U8),
+                    Type::I16 => {
+                        check_and_emit(i16::MIN as i64, i16::MAX as i64, types::I16, Type::I16)
+                    }
+                    Type::U16 => {
+                        check_and_emit(u16::MIN as i64, u16::MAX as i64, types::I16, Type::U16)
+                    }
+                    Type::I32 => {
+                        check_and_emit(i32::MIN as i64, i32::MAX as i64, types::I32, Type::I32)
+                    }
+                    Type::U32 => {
+                        check_and_emit(u32::MIN as i64, u32::MAX as i64, types::I32, Type::U32)
+                    }
+                    Type::I64 => Ok((self.builder.ins().iconst(types::I64, *value), Type::I64)),
+                    Type::U64 => {
+                        if *value < 0 {
+                            CodeError::CoerseInt(Type::U64, *value).err(*span)
+                        } else {
+                            Ok((self.builder.ins().iconst(types::I64, *value), Type::U64))
+                        }
+                    }
+                    _ => unreachable!("Can't coerce into type {into_type}"),
+                }
             }
             Expression::String(value) => {
                 let mut data_desc = DataDescription::new();
@@ -751,18 +811,18 @@ impl Generator<'_> {
                 Type::Bool,
             )),
             Expression::Binary(op, x, y) => {
-                let x_value = self.build_expression(x.as_ref())?;
-                let y_value = self.build_expression(y.as_ref())?;
+                let x_value = self.build_expression(x.as_ref(), try_into_type.clone())?;
+                let y_value = self.build_expression(y.as_ref(), try_into_type)?;
 
                 if x_value.1 != y_value.1 {
                     return CodeError::IncompatipleBinOpTypes(*op, x_value.1, y_value.1).err(*span);
                 }
 
                 let result = match x_value.1 {
-                    Type::Byte | Type::Int | Type::Long => {
+                    Type::I8 | Type::I32 | Type::I64 => {
                         self.build_int_bin_op(*op, x_value.0, y_value.0, x_value.1)
                     }
-                    Type::Float | Type::Double => {
+                    Type::F32 | Type::F64 => {
                         self.build_float_bin_op(*op, x_value.0, y_value.0, x_value.1)
                     }
                     Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
@@ -772,7 +832,7 @@ impl Generator<'_> {
                 Ok(result)
             }
             Expression::Unary(op, expr) => {
-                let value = self.build_expression(expr.as_ref())?;
+                let value = self.build_expression(expr.as_ref(), try_into_type)?;
                 if value.1 == Type::Bool && *op == UnOp::Not {
                     let result = self.builder.ins().bxor_imm(value.0, 1);
                     Ok((result, Type::Bool))
@@ -795,7 +855,7 @@ impl Generator<'_> {
             }
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
             Expression::FieldAccess(expr, name) => {
-                let expr_value = self.build_expression(expr)?;
+                let expr_value = self.build_expression(expr, None)?;
                 let field = match &expr_value.1 {
                     Type::Struct(struct_type) if struct_type.fields.contains_key(&name.0) => {
                         &struct_type.fields[&name.0]
@@ -805,10 +865,12 @@ impl Generator<'_> {
                     }
                 };
 
+                let field_crane_type = self
+                    .get_crane_type(&field.r#type)
+                    .expect("Field type must be valid.");
+
                 let struct_value = self.builder.ins().load(
-                    (&field.r#type)
-                        .try_into()
-                        .expect("Field type must be valid."),
+                    field_crane_type,
                     MemFlags::new(),
                     expr_value.0,
                     field.offset,
@@ -820,8 +882,16 @@ impl Generator<'_> {
                 let mut errors = Vec::new();
                 let mut arg_values = HashMap::with_capacity(struct_init.args.len());
 
+                let r#type = self.type_from_name(&struct_init.name.0);
+
                 for arg in &struct_init.args {
-                    match self.build_expression(&arg.1) {
+                    let maybe_type = r#type
+                        .as_ref()
+                        .and_then(|r#type| r#type.struct_type())
+                        .and_then(|struct_type| struct_type.fields.get(&arg.0.0).cloned())
+                        .map(|struct_field| struct_field.r#type);
+
+                    match self.build_expression(&arg.1, maybe_type) {
                         Ok(value) => {
                             if arg_values.insert(arg.0.0.clone(), value).is_some() {
                                 errors.push(
@@ -841,6 +911,7 @@ impl Generator<'_> {
                     );
                     return Err(errors);
                 };
+
                 let Type::Struct(struct_type) = &r#type else {
                     errors.push(CodeError::NotStructType(r#type).spanned(struct_init.name.1));
                     return Err(errors);
@@ -897,6 +968,11 @@ impl Generator<'_> {
         y: Value,
         r#type: Type,
     ) -> Option<(Value, Type)> {
+        if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte) && r#type.is_unsigned_int()
+        {
+            todo!("Comparision of unsigned integer types.")
+        };
+
         Some((
             match op {
                 BinOp::Add => self.builder.ins().iadd(x, y),
@@ -978,10 +1054,20 @@ impl Generator<'_> {
         let arg_values = other_args
             .iter()
             .map(|expr| {
-                let result = self.build_expression(expr);
+                let result = self.build_expression(expr, None);
                 if let Ok(value) = &result {
-                    const PRINT_ARG_TYPES: [Type; 5] =
-                        [Type::Byte, Type::Int, Type::Long, Type::Bool, Type::String];
+                    const PRINT_ARG_TYPES: [Type; 10] = [
+                        Type::U8,
+                        Type::I8,
+                        Type::U16,
+                        Type::I16,
+                        Type::U32,
+                        Type::I32,
+                        Type::U64,
+                        Type::I64,
+                        Type::Bool,
+                        Type::String,
+                    ];
                     if !PRINT_ARG_TYPES.contains(&value.1) {
                         return CodeError::IntrisicArgumentType(
                             "print",
@@ -996,18 +1082,17 @@ impl Generator<'_> {
             .collect_all()
             .map_err(|errors| errors.into_iter().flatten().collect::<ManyErrors>())?;
 
-        let format_string_value = self.build_expression(&format_string_arg)?;
+        let format_string_value = self.build_expression(&format_string_arg, None)?;
         debug_assert_eq!(format_string_value.1, Type::String);
 
         // Because printf is a variadic function we have to change it's signature on the fly
         // See: adjust_call_for_c_variadic() in rustc_codegen_cranelift
         let mut params = Vec::with_capacity(arg_values.len() + 1);
         params.push(AbiParam::new(self.isa.pointer_type()));
-        params.extend(
-            arg_values
-                .iter()
-                .map(|(_, t)| AbiParam::try_from(t).expect("Type must be valid @print parameter.")),
-        );
+        params.extend(arg_values.iter().map(|(_, t)| {
+            self.get_extern_abi_param(t)
+                .expect("Type must be valid @print parameter.")
+        }));
 
         let printf_ref = self
             .module
@@ -1024,7 +1109,7 @@ impl Generator<'_> {
 
         let value = self.builder.func.dfg.inst_results(result)[0];
         // TODO: Type::I32
-        Ok((value, Type::Int))
+        Ok((value, Type::I32))
     }
 
     fn push_scope(&mut self) {
@@ -1077,7 +1162,7 @@ impl Generator<'_> {
             let then_block = self.builder.create_block();
             self.builder.seal_block(condition_block);
             self.builder.switch_to_block(condition_block);
-            let condition_value = match self.build_expression(&conditional.condition) {
+            let condition_value = match self.build_expression(&conditional.condition, None) {
                 Ok(condition_value) if condition_value.1 == Type::Bool => condition_value,
                 Ok((_, r#type)) => {
                     errors.push(
@@ -1161,7 +1246,7 @@ impl Generator<'_> {
         self.builder.ins().jump(condition_block, []);
         self.builder.switch_to_block(condition_block);
 
-        let condition_value = self.build_expression(condition)?;
+        let condition_value = self.build_expression(condition, None)?;
         if condition_value.1 != Type::Bool {
             return CodeError::InvalidConditionType(condition_value.1.clone()).err(condition.1);
         }
@@ -1212,7 +1297,7 @@ impl Generator<'_> {
             return CodeError::IntrinsicArgumentCount("assert", 1, args.len()).err(*span);
         }
 
-        let condition = self.build_expression(&args[0])?;
+        let condition = self.build_expression(&args[0], None)?;
         if condition.1 != Type::Bool {
             return CodeError::IntrisicArgumentType("assert", &[Type::Bool], condition.1)
                 .err(args[0].1);
@@ -1253,8 +1338,8 @@ impl Generator<'_> {
             return CodeError::IntrinsicArgumentCount("exit", 1, args.len()).err(*span);
         }
 
-        let expr = self.build_expression(&args[0])?;
-        if expr.1 != Type::Int {
+        let expr = self.build_expression(&args[0], Some(Type::I32))?;
+        if expr.1 != Type::I32 {
             return CodeError::IntrisicArgumentType("exit", &[Type::Bool], expr.1).err(args[0].1);
         }
 
@@ -1300,7 +1385,14 @@ impl Generator<'_> {
                 errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
             param_types.push(r#type.clone());
-            fn_params.push((name.0.clone(), r#type, ArgumentPurpose::Normal));
+            let purpose = if let Type::Struct(struct_type) = &r#type
+                && *is_extern
+            {
+                ArgumentPurpose::StructArgument(struct_type.size_pad_8())
+            } else {
+                ArgumentPurpose::Normal
+            };
+            fn_params.push((name.0.clone(), r#type, purpose));
         }
 
         if !errors.is_empty() {
@@ -1314,8 +1406,12 @@ impl Generator<'_> {
             None => Type::Void,
         };
 
+        if return_type.size() > 8 {
+            todo!("Return values larger than 8 bytes.")
+        }
+
         let returns = match &return_type {
-            Type::Void => Vec::new(),
+            Type::Void | Type::Never => Vec::new(),
             Type::Struct(_) => {
                 fn_params.push((
                     "@return_addr".to_owned(),
@@ -1325,7 +1421,10 @@ impl Generator<'_> {
                 Vec::new()
             }
             return_type => {
-                vec![AbiParam::try_from(return_type).expect("Return type must be valid.")]
+                vec![
+                    self.get_extern_abi_param(return_type)
+                        .expect("Return type must be valid."),
+                ]
             }
         };
 
@@ -1345,8 +1444,12 @@ impl Generator<'_> {
             params: fn_params
                 .iter()
                 .map(|(_, r#type, purpose)| {
-                    let mut abi_param: AbiParam =
-                        r#type.try_into().expect("Param type must be valid.");
+                    let mut abi_param: AbiParam = if *is_extern {
+                        self.get_extern_abi_param(r#type)
+                    } else {
+                        self.get_abi_param(r#type)
+                    }
+                    .expect("Param type must be valid.");
                     abi_param.purpose = *purpose;
                     abi_param
                 })
@@ -1406,11 +1509,17 @@ impl Generator<'_> {
                     .new_var(param_name.clone(), (param_value, param_type.clone()))
                     .expect("Function parameters should never redefine variables");
 
-                let var_type = param_type
-                    .try_into()
-                    .expect("Parameter type should be valid");
+                let var_type = if *is_extern {
+                    fn_generator.get_extern_abi_param(param_type)
+                } else {
+                    fn_generator.get_abi_param(param_type)
+                }
+                .expect("Parameter type should be valid");
 
-                fn_generator.builder.declare_var(var, var_type);
+                dbg!(var_type.value_type);
+                dbg!(param_type);
+
+                fn_generator.builder.declare_var(var, var_type.value_type);
                 fn_generator.builder.def_var(var, param_value);
 
                 if *purpose == ArgumentPurpose::StructReturn {
@@ -1452,11 +1561,16 @@ impl Generator<'_> {
 
     fn type_from_name(&self, type_name: &str) -> Option<Type> {
         Some(match type_name {
-            "byte" => Type::Byte,
-            "int" => Type::Int,
-            "long" => Type::Long,
-            "float" => Type::Float,
-            "double" => Type::Double,
+            "i8" => Type::I8,
+            "i16" => Type::I16,
+            "i32" => Type::I32,
+            "i64" => Type::I64,
+            "u8" => Type::U8,
+            "u16" => Type::U16,
+            "u32" => Type::U32,
+            "u64" => Type::U64,
+            "f32" => Type::F32,
+            "f64" => Type::F64,
             "bool" => Type::Bool,
             "string" => Type::String,
             "void" => Type::Void,
@@ -1492,25 +1606,31 @@ impl Generator<'_> {
             .iter()
             .zip(func_type.params.iter())
             .map(|(expr, param_type)| {
-                let value = self.build_expression(expr)?;
+                let value = self.build_expression(expr, Some(param_type.clone()))?;
                 if value.1 != *param_type {
                     return CodeError::FunctionCallArgumentType(
                         name.0.clone(),
                         param_type.clone(),
                         value.1,
                     )
-                    .err(*span);
+                    .err(expr.1);
                 }
+
                 Ok(value.0)
             })
             .collect::<Result<Vec<Value>, ManyErrors>>()?;
 
         if let Type::Struct(struct_type) = &*func_type.return_type {
-            let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            if func_type.is_extern {
+                todo!("Extern return structs.");
+            }
+            let stack_slot_data = StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 struct_type.size(),
-                struct_type.align_shift(), // TODO: calculate this correctly
-            ));
+                struct_type.align_shift(),
+            );
+            dbg!(&stack_slot_data);
+            let stack_slot = self.builder.create_sized_stack_slot(stack_slot_data);
 
             let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
             arg_values.push(struct_addr);
@@ -1586,6 +1706,51 @@ impl Generator<'_> {
         }
         self.new_types.insert(decl.name.0.clone(), struct_type);
         Ok(())
+    }
+
+    fn get_extern_abi_param(&self, r#type: &Type) -> Option<AbiParam> {
+        let mut purpose = ArgumentPurpose::Normal;
+        let crane_type = match r#type {
+            Type::I8 | Type::U8 => types::I8,
+            Type::I16 | Type::U16 => types::I16,
+            Type::I32 | Type::U32 => types::I32,
+            Type::I64 | Type::U64 => types::I64,
+            Type::F32 => types::F32,
+            Type::F64 => types::F64,
+            Type::String => self.isa.pointer_type(),
+            Type::Bool => types::I8,
+            Type::Struct(struct_type) => {
+                // StructArgument must have a size that's a multiple of 8 byte
+                purpose = ArgumentPurpose::StructArgument(struct_type.size_pad_8());
+                match struct_type.size() {
+                    0..=8 => types::I64,
+                    9..=16 if self.isa.default_call_conv() == CallConv::SystemV => types::I128, // TODO: test this
+                    _ => self.isa.pointer_type(),
+                }
+            }
+            _ => return None,
+        };
+
+        Some(AbiParam::special(crane_type, purpose))
+    }
+
+    fn get_abi_param(&self, r#type: &Type) -> Option<AbiParam> {
+        self.get_crane_type(r#type).map(AbiParam::new)
+    }
+
+    fn get_crane_type(&self, r#type: &Type) -> Option<types::Type> {
+        Some(match r#type {
+            Type::I8 | Type::U8 => types::I8,
+            Type::I16 | Type::U16 => types::I16,
+            Type::I32 | Type::U32 => types::I32,
+            Type::I64 | Type::U64 => types::I64,
+            Type::F32 => types::F32,
+            Type::F64 => types::F64,
+            Type::String => self.isa.pointer_type(),
+            Type::Bool => types::I8,
+            Type::Struct(_) => self.isa.pointer_type(),
+            _ => return None,
+        })
     }
 }
 

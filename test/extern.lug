@@ -1,4 +1,4 @@
-extern fn abs(number: int) : int;
+extern fn abs(number: i32) : i32;
 
 @println("%d", abs(-3));
 

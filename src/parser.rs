@@ -69,7 +69,7 @@ type TypeName = String;
 pub enum Expression {
     Identifier(String),
     Float(f64),
-    Integer(i64),
+    Integer(i64), // TODO: allow u64
     String(String),
     Bool(bool),
 

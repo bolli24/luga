@@ -1,6 +1,6 @@
 struct iVec {
-    x: int;
-    y: int;
+    x: i32;
+    y: i32;
 }
 
 fn printVec(vec: iVec) {

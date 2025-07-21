@@ -7,7 +7,7 @@ use logos::{Lexer, Logos, Skip};
 #[logos(error = LexingError)]
 #[logos(extras = (usize, bool))]
 pub enum Token<'a> {
-    #[regex("[a-zA-Z]+")]
+    #[regex("[a-zA-Z][a-zA-Z0-9_]*")]
     Id(&'a str),
     #[token("+", priority = 3)]
     Plus,

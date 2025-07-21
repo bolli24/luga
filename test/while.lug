@@ -1,4 +1,4 @@
-fn fibonacci(n: int) : int {
+fn fibonacci(n: i32) : i32 {
     if (n <= 1) {
         return 0;
     }

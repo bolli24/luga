@@ -1,4 +1,4 @@
-fn fibonacci(number: int) : int {
+fn fibonacci(number: i32) : i32 {
     if (number < 2) {
         return number;
     } else {
@@ -6,7 +6,7 @@ fn fibonacci(number: int) : int {
     }
 }
 
-fn less(number: int) : bool {
+fn less(number: i32) : bool {
     if (number < 2) {
         @print("Yes!");
         return true;
