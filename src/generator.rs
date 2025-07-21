@@ -63,6 +63,8 @@ pub enum CodeError {
 
     #[error("Unknown type '{}'.", .0)]
     UnknownType(String),
+    #[error("Type '{}' already declared.", .0)]
+    TypeRedeclaration(String),
 
     #[error("Duplicate function parameter '{}'", .0)]
     FunctionParamDuplicate(String),
@@ -84,8 +86,6 @@ pub enum CodeError {
 
     #[error("Must declare function in top level scope.")]
     StructDeclNotTopLevel,
-    #[error("Struct '{}' already declared.", .0)]
-    StrutRedeclaration(String),
     #[error("Struct field '{}' already declared.", .0)]
     StructDuplicateField(String),
     #[error("Type '{}' has no field named '{}'.", .0, .1)]
@@ -1469,8 +1469,8 @@ impl Generator<'_> {
             errors.push(CodeError::StructDeclNotTopLevel.spanned(*span));
         }
 
-        if self.new_types.contains_key(&decl.name.0) {
-            errors.push(CodeError::StrutRedeclaration(decl.name.0.clone()).spanned(decl.name.1));
+        if self.type_from_name(&decl.name.0).is_some() {
+            errors.push(CodeError::TypeRedeclaration(decl.name.0.clone()).spanned(decl.name.1));
         }
 
         let mut fields = IndexMap::new();
