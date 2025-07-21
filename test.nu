@@ -25,6 +25,10 @@ def main [folder?: string] {
     
     for file in $files {
         print $"Running: ($file)"
-        cargo run run $file
+        try {
+            cargo run run $file
+        } catch {
+            print $"Command failed for: ($file)"
+        }
     }
 }

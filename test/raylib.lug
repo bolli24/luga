@@ -1,0 +1,30 @@
+extern fn InitWindow(width: int, height: int, title: string);
+extern fn CloseWindow();
+extern fn SetTargetFPS(fps: int);
+extern fn WindowShouldClose() : bool;
+extern fn BeginDrawing();
+extern fn EndDrawing();
+extern fn ClearBackground(color: int);
+extern fn DrawText(text: string, x: int, y: int, size: int, color: int);
+extern fn DrawFPS(x: int, y: int);
+
+let screenWidth = 800;
+let screenHeight = 600;
+
+InitWindow(screenWidth, screenHeight, "luga x raylib");
+
+SetTargetFPS(60);
+
+while (!WindowShouldClose()) {
+    BeginDrawing();
+
+    ClearBackground(0);
+
+    DrawText("Hello from luga.", 190, 200, 50, 3520188927);
+    DrawFPS(0, 0);
+
+    EndDrawing();
+}
+
+
+CloseWindow();

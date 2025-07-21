@@ -74,6 +74,7 @@ pub enum Expression {
     Bool(bool),
 
     Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
+    Unary(UnOp, Box<Spanned<Expression>>),
 
     Intrinsic(Intrinsic, Vec<Spanned<Expression>>),
     FunctionCall(Spanned<String>, Vec<Spanned<Expression>>),
@@ -81,7 +82,7 @@ pub enum Expression {
     StructInit(StructInit),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     Add,
     Sub,
@@ -106,6 +107,19 @@ impl Display for BinOp {
             Self::Gt => write!(f, ">"),
             Self::Lte => write!(f, "<="),
             Self::Gte => write!(f, ">="),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Not,
+}
+
+impl Display for UnOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Not => write!(f, "!"),
         }
     }
 }
@@ -174,6 +188,10 @@ where
         Token::ArrowRight => BinOp::Gte,
     };
 
+    let unary_op = select! {
+        Token::Bang => UnOp::Not,
+    };
+
     let mut expression = Recursive::declare();
 
     let args = expression
@@ -220,10 +238,16 @@ where
         |expr, field, extra| Spanned(Expression::FieldAccess(Box::new(expr), field), extra.span()),
     );
 
-    let factor = field_access.clone().foldl_with(
+    let unary = unary_op
+        .repeated()
+        .foldr_with(field_access, |op, expr, extras| {
+            Spanned(Expression::Unary(op, Box::new(expr)), extras.span())
+        });
+
+    let factor = unary.clone().foldl_with(
         bin_op
             .filter(|op| matches!(op, BinOp::Mul | BinOp::Div))
-            .then(field_access.clone())
+            .then(unary.clone())
             .repeated(),
         |a, (op, b), extra| {
             Spanned(

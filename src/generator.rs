@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use crate::{
     parser::{
         BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
-        Statement, StructDecl,
+        Statement, StructDecl, UnOp,
     },
     util::ResultCollectAll,
 };
@@ -34,6 +34,8 @@ pub enum CodeError {
     IncompatipleBinOpTypes(BinOp, Type, Type),
     #[error("Invalid type '{}' for binary operator '{}'", .1 ,.0)]
     InvalidBinOpType(BinOp, Type),
+    #[error("Invalid type '{}' for unary operator '{}'", .1 ,.0)]
+    InvalidUnOpType(UnOp, Type),
 
     #[error("Intrisic '@{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
     IntrinsicTooFewArguments(&'static str, usize, usize),
@@ -123,6 +125,7 @@ pub enum GeneratorErrors {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
+    Byte,
     Int,
     Long,
     Float,
@@ -139,6 +142,7 @@ pub enum Type {
 impl Type {
     fn size(&self) -> u32 {
         match self {
+            Self::Byte => 1,
             Self::Int => 4,
             Self::Long => 8,
             Self::Float => 4,
@@ -154,6 +158,7 @@ impl Type {
 
     fn align_shift(&self) -> u8 {
         match self {
+            Self::Byte => 0,
             Self::Int => 2,
             Self::Long => 3,
             Self::Float => 2,
@@ -217,6 +222,7 @@ impl TryFrom<&Type> for types::Type {
     type Error = ();
     fn try_from(val: &Type) -> Result<Self, Self::Error> {
         Ok(match val {
+            Type::Byte => types::I8,
             Type::Int => types::I32,
             Type::Long => types::I64,
             Type::Float => types::F32,
@@ -240,6 +246,7 @@ impl TryFrom<&Type> for AbiParam {
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Byte => write!(f, "byte"),
             Self::Int => write!(f, "int"),
             Self::Long => write!(f, "long"),
             Self::Float => write!(f, "float"),
@@ -752,7 +759,7 @@ impl Generator<'_> {
                 }
 
                 let result = match x_value.1 {
-                    Type::Int | Type::Long => {
+                    Type::Byte | Type::Int | Type::Long => {
                         self.build_int_bin_op(*op, x_value.0, y_value.0, x_value.1)
                     }
                     Type::Float | Type::Double => {
@@ -763,6 +770,15 @@ impl Generator<'_> {
                 }
                 .ok_or_else(|| CodeError::InvalidBinOpType(*op, y_value.1).spanned(*span))?;
                 Ok(result)
+            }
+            Expression::Unary(op, expr) => {
+                let value = self.build_expression(expr.as_ref())?;
+                if value.1 == Type::Bool && *op == UnOp::Not {
+                    let result = self.builder.ins().bxor_imm(value.0, 1);
+                    Ok((result, Type::Bool))
+                } else {
+                    CodeError::InvalidUnOpType(*op, value.1).err(*span)
+                }
             }
             Expression::Intrinsic(intrinsic, args) => match intrinsic {
                 Intrinsic::Print => self.build_printf(span, args, false),
@@ -964,7 +980,8 @@ impl Generator<'_> {
             .map(|expr| {
                 let result = self.build_expression(expr);
                 if let Ok(value) = &result {
-                    const PRINT_ARG_TYPES: [Type; 3] = [Type::Int, Type::Double, Type::String];
+                    const PRINT_ARG_TYPES: [Type; 5] =
+                        [Type::Byte, Type::Int, Type::Long, Type::Bool, Type::String];
                     if !PRINT_ARG_TYPES.contains(&value.1) {
                         return CodeError::IntrisicArgumentType(
                             "print",
@@ -1435,6 +1452,7 @@ impl Generator<'_> {
 
     fn type_from_name(&self, type_name: &str) -> Option<Type> {
         Some(match type_name {
+            "byte" => Type::Byte,
             "int" => Type::Int,
             "long" => Type::Long,
             "float" => Type::Float,

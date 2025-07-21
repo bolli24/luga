@@ -40,8 +40,16 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum CliCommand {
-    Build { path: PathBuf },
-    Run { path: PathBuf },
+    Build {
+        #[arg(short, long, default_value_t = String::new())]
+        linker_args: String,
+        path: PathBuf,
+    },
+    Run {
+        #[arg(short, long, default_value_t = String::new())]
+        linker_args: String,
+        path: PathBuf,
+    },
     Test,
     Clean,
 }
@@ -62,8 +70,8 @@ fn main() -> ExitCode {
     let cli = <Cli as clap::Parser>::parse();
 
     let result = match &cli.command {
-        CliCommand::Build { path } => build_files(&cli, path).map(|_| ()),
-        CliCommand::Run { path } => run_file(&cli, path),
+        CliCommand::Build { path, linker_args } => build_files(&cli, path, linker_args).map(|_| ()),
+        CliCommand::Run { path, linker_args } => run_file(&cli, path, linker_args),
         CliCommand::Test => todo!(),
         CliCommand::Clean => clean(),
     };
@@ -76,7 +84,7 @@ fn main() -> ExitCode {
 
 const OUTPUT_DIR: &str = "output";
 
-fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
+fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, ()> {
     if path.is_dir() {
         todo!("Build directories");
     }
@@ -90,18 +98,18 @@ fn build_files(cli: &Cli, path: &Path) -> Result<PathBuf, ()> {
 
     create_dir_all(&output_dir).expect("Unable to create output directory.");
 
-    build_file(path, &output_dir, cli.verbose, cli.release).map_err(|err| {
+    build_file(path, &output_dir, cli.verbose, cli.release, linker_args).map_err(|err| {
         eprintln!("Error building executable.");
         eprintln!("{err}");
     })
 }
 
-fn run_file(cli: &Cli, path: &Path) -> Result<(), ()> {
+fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), ()> {
     assert!(!path.is_dir(), "Can't run more than one file.");
 
     assert!(path.is_file(), "Invalid input path.");
 
-    let result = build_files(cli, path);
+    let result = build_files(cli, path, linker_args);
     if let Ok(exe_path) = &result {
         println!("Running executable '{}'", exe_path.display());
         let exe_name = exe_path.file_name().expect("Executable path must be valid");
@@ -139,6 +147,7 @@ fn build_file(
     output_dir: &Path,
     verbose: bool,
     release: bool,
+    linker_args: &str,
 ) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
@@ -156,7 +165,7 @@ fn build_file(
         .spanned()
         .filter_map(|(tok, span)| match tok {
             Ok(tok) => Some((tok, span.into())),
-            _ => None,
+            _ => None, // FIXME: Handle lexer errors.
         });
 
     let token_stream =
@@ -245,12 +254,18 @@ fn build_file(
     #[cfg(not(target_os = "windows"))]
     let exe_file = output_file.with_extension("");
 
-    let status = Command::new("gcc")
-        .arg("-o")
-        .arg(&exe_file)
-        .arg(&object_file)
-        .status()
-        .unwrap();
+    let mut command = Command::new("gcc");
+    command.arg("-o").arg(&exe_file).arg(&object_file);
+
+    if !linker_args.is_empty() {
+        command.args(linker_args.split(' ')); // TODO: handle path with spaces etc
+    }
+
+    if verbose {
+        println!("{command:?}");
+    }
+
+    let status = command.status().unwrap();
 
     if !status.success() {
         return Err(BuildError::Linker(file_path.into()));

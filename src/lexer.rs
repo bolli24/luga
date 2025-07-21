@@ -17,6 +17,8 @@ pub enum Token<'a> {
     Star,
     #[token("/")]
     Slash,
+    #[token("!")]
+    Bang,
 
     #[token("=")]
     Equal,
@@ -140,6 +142,7 @@ impl Display for Token<'_> {
             Self::Minus => write!(f, "-"),
             Self::Star => write!(f, "*"),
             Self::Slash => write!(f, "/"),
+            Self::Bang => write!(f, "!"),
             Self::Equal => write!(f, "="),
             Self::EqualEqual => write!(f, "=="),
             Self::Lt => write!(f, "<"),
@@ -253,12 +256,13 @@ mod tests {
 
     #[test]
     fn test_basic_tokens() {
-        let mut lex = Token::lexer("+ - * / = ; , @ ( ) [ ] { }");
+        let mut lex = Token::lexer("+ - * / ! = ; , @ ( ) [ ] { }");
         let expected_tokens = vec![
             Token::Plus,
             Token::Minus,
             Token::Star,
             Token::Slash,
+            Token::Bang,
             Token::Equal,
             Token::Semicolon,
             Token::Comma,
