@@ -139,21 +139,32 @@ pub enum Type {
 impl Type {
     fn size(&self) -> u32 {
         match self {
-            Type::Int => 4,
-            Type::Long => 8,
-            Type::Float => 4,
-            Type::Double => 8,
-            Type::Void => 0,
-            Type::Never => 0,
-            Type::String => 8, // TODO: platform pointer size
-            Type::Bool => 1,
-            Type::Fn(_) => 0,
-            Type::Struct(struct_type) => struct_type.size(),
+            Self::Int => 4,
+            Self::Long => 8,
+            Self::Float => 4,
+            Self::Double => 8,
+            Self::Void => 0,
+            Self::Never => 0,
+            Self::String => 8, // TODO: platform pointer size
+            Self::Bool => 1,
+            Self::Fn(_) => 0,
+            Self::Struct(struct_type) => struct_type.size(),
         }
     }
 
-    fn alignment(&self) -> u32 {
-        8
+    fn align_shift(&self) -> u8 {
+        match self {
+            Self::Int => 2,
+            Self::Long => 3,
+            Self::Float => 2,
+            Self::Double => 3,
+            Self::Void => 0,
+            Self::Never => 0,
+            Self::String => 3,
+            Self::Bool => 0,
+            Self::Fn(_) => 0,
+            Self::Struct(struct_type) => struct_type.align_shift(),
+        }
     }
 }
 
@@ -173,7 +184,26 @@ pub struct StructType {
 
 impl StructType {
     fn size(&self) -> u32 {
-        self.fields.values().map(|field| field.r#type.size()).sum()
+        let mut offset = 0;
+        for field in self.fields.values() {
+            let align = 1 << field.r#type.align_shift();
+            let padding = (align - (offset % align)) % align;
+            offset += padding;
+            offset += field.r#type.size();
+        }
+
+        // Final padding so total size is a multiple of the struct's alignment
+        let struct_align = 1 << self.align_shift();
+        let padding = (struct_align - (offset % struct_align)) % struct_align;
+        offset + padding
+    }
+
+    fn align_shift(&self) -> u8 {
+        self.fields
+            .values()
+            .map(|f| f.r#type.align_shift())
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -187,8 +217,10 @@ impl TryFrom<&Type> for types::Type {
     type Error = ();
     fn try_from(val: &Type) -> Result<Self, Self::Error> {
         Ok(match val {
-            Type::Int => types::I64,
-            Type::Float => types::F64,
+            Type::Int => types::I32,
+            Type::Long => types::I64,
+            Type::Float => types::F32,
+            Type::Double => types::F64,
             Type::String => types::I64, // TODO: platform ptr size
             Type::Bool => types::I8,
             Type::Struct(_) => types::I64, // TODO: platform ptr size
@@ -587,8 +619,8 @@ impl Generator<'_> {
         return_dest: Value,
     ) {
         // Align current offset to field's alignment requirement
-        let field_alignment = struct_field.r#type.alignment();
-        *current_offset = Self::align_to(*current_offset, field_alignment);
+        let field_align_shift = struct_field.r#type.align_shift();
+        *current_offset = Self::align_to(*current_offset, field_align_shift);
 
         match &struct_field.r#type {
             Type::Struct(struct_type) => {
@@ -618,8 +650,8 @@ impl Generator<'_> {
     }
 
     // Helper function for alignment
-    fn align_to(offset: i32, alignment: u32) -> i32 {
-        let align = alignment as i32;
+    fn align_to(offset: i32, align_shift: u8) -> i32 {
+        let align = 1 << align_shift;
         (offset + align - 1) & !(align - 1)
     }
 
@@ -720,14 +752,16 @@ impl Generator<'_> {
                 }
 
                 let result = match x_value.1 {
-                    Type::Int | Type::Long => self.build_int_bin_op(*op, x_value.0, y_value.0),
+                    Type::Int | Type::Long => {
+                        self.build_int_bin_op(*op, x_value.0, y_value.0, x_value.1)
+                    }
                     Type::Float | Type::Double => {
-                        self.build_float_bin_op(*op, x_value.0, y_value.0)
+                        self.build_float_bin_op(*op, x_value.0, y_value.0, x_value.1)
                     }
                     Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
                     _ => None,
                 }
-                .ok_or_else(|| CodeError::InvalidBinOpType(*op, x_value.1).spanned(*span))?;
+                .ok_or_else(|| CodeError::InvalidBinOpType(*op, y_value.1).spanned(*span))?;
                 Ok(result)
             }
             Expression::Intrinsic(intrinsic, args) => match intrinsic {
@@ -840,7 +874,13 @@ impl Generator<'_> {
     }
 
     #[must_use]
-    fn build_int_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
+    fn build_int_bin_op(
+        &mut self,
+        op: BinOp,
+        x: Value,
+        y: Value,
+        r#type: Type,
+    ) -> Option<(Value, Type)> {
         Some((
             match op {
                 BinOp::Add => self.builder.ins().iadd(x, y),
@@ -857,14 +897,20 @@ impl Generator<'_> {
                     .icmp(IntCC::SignedGreaterThanOrEqual, x, y),
             },
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Type::Int,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => r#type,
                 BinOp::Equal | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => Type::Bool,
             },
         ))
     }
 
     #[must_use]
-    fn build_float_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
+    fn build_float_bin_op(
+        &mut self,
+        op: BinOp,
+        x: Value,
+        y: Value,
+        r#type: Type,
+    ) -> Option<(Value, Type)> {
         Some((
             match op {
                 BinOp::Add => self.builder.ins().fadd(x, y),
@@ -878,7 +924,7 @@ impl Generator<'_> {
                 BinOp::Gte => self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, x, y),
             },
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Type::Int,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => r#type,
                 BinOp::Equal | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => Type::Bool,
             },
         ))
@@ -1445,7 +1491,7 @@ impl Generator<'_> {
             let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 struct_type.size(),
-                3, // TODO: calculate this correctly
+                struct_type.align_shift(), // TODO: calculate this correctly
             ));
 
             let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
