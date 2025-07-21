@@ -124,7 +124,9 @@ pub enum GeneratorErrors {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Int,
+    Long,
     Float,
+    Double,
     Void,
     Never,
     String,
@@ -137,8 +139,10 @@ pub enum Type {
 impl Type {
     fn size(&self) -> u32 {
         match self {
-            Type::Int => 8,
-            Type::Float => 8,
+            Type::Int => 4,
+            Type::Long => 8,
+            Type::Float => 4,
+            Type::Double => 8,
             Type::Void => 0,
             Type::Never => 0,
             Type::String => 8, // TODO: platform pointer size
@@ -204,8 +208,10 @@ impl TryFrom<&Type> for AbiParam {
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Int => write!(f, "integer"),
+            Self::Int => write!(f, "int"),
+            Self::Long => write!(f, "long"),
             Self::Float => write!(f, "float"),
+            Self::Double => write!(f, "double"),
             Self::Void => write!(f, "void"),
             Self::Never => write!(f, "never"),
             Self::String => write!(f, "string"),
@@ -624,8 +630,7 @@ impl Generator<'_> {
                 // self.builder.ins().return_(&[]);
                 return CodeError::InvalidReturnType(Type::Int, value.1).err(expr.1);
             }
-            let cast = self.builder.ins().ireduce(types::I32, value.0);
-            self.builder.ins().return_(&[cast]);
+            self.builder.ins().return_(&[value.0]);
         } else {
             if *self.current_func_type.return_type != value.1 {
                 return CodeError::InvalidReturnType(
@@ -669,9 +674,11 @@ impl Generator<'_> {
     ) -> Result<(Value, Type), ManyErrors> {
         let Spanned(expression, span) = expression;
         match expression {
-            Expression::Float(value) => Ok((self.builder.ins().f64const(*value), Type::Float)),
+            Expression::Float(value) => {
+                Ok((self.builder.ins().f32const(*value as f32), Type::Float))
+            }
             Expression::Integer(value) => {
-                Ok((self.builder.ins().iconst(types::I64, *value), Type::Int))
+                Ok((self.builder.ins().iconst(types::I32, *value), Type::Int))
             }
             Expression::String(value) => {
                 let mut data_desc = DataDescription::new();
@@ -713,8 +720,10 @@ impl Generator<'_> {
                 }
 
                 let result = match x_value.1 {
-                    Type::Int => self.build_int_bin_op(*op, x_value.0, y_value.0),
-                    Type::Float => self.build_float_bin_op(*op, x_value.0, y_value.0),
+                    Type::Int | Type::Long => self.build_int_bin_op(*op, x_value.0, y_value.0),
+                    Type::Float | Type::Double => {
+                        self.build_float_bin_op(*op, x_value.0, y_value.0)
+                    }
                     Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
                     _ => None,
                 }
@@ -909,7 +918,7 @@ impl Generator<'_> {
             .map(|expr| {
                 let result = self.build_expression(expr);
                 if let Ok(value) = &result {
-                    const PRINT_ARG_TYPES: [Type; 2] = [Type::Int, Type::String];
+                    const PRINT_ARG_TYPES: [Type; 3] = [Type::Int, Type::Double, Type::String];
                     if !PRINT_ARG_TYPES.contains(&value.1) {
                         return CodeError::IntrisicArgumentType(
                             "print",
@@ -1190,8 +1199,7 @@ impl Generator<'_> {
             .module
             .declare_func_in_func(self.exit_id, self.builder.func);
 
-        let cast = self.builder.ins().ireduce(types::I32, expr.0);
-        self.builder.ins().call(exit_ref, &[cast]);
+        self.builder.ins().call(exit_ref, &[expr.0]);
         Ok((Value::from_u32(u32::MAX - 1), Type::Never))
     }
 
@@ -1382,7 +1390,9 @@ impl Generator<'_> {
     fn type_from_name(&self, type_name: &str) -> Option<Type> {
         Some(match type_name {
             "int" => Type::Int,
+            "long" => Type::Long,
             "float" => Type::Float,
+            "double" => Type::Double,
             "bool" => Type::Bool,
             "string" => Type::String,
             "void" => Type::Void,
