@@ -129,8 +129,8 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 8] = [
-    "let", "return", "if", "else", "true", "false", "fn", "struct",
+const KEY_WORDS: [&str; 9] = [
+    "let", "return", "if", "else", "true", "false", "fn", "struct", "extern",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -290,6 +290,20 @@ where
     .collect()
     .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
+    let extern_function_decl = just(Token::Id("extern"))
+        .ignore_then(just(Token::Id("fn")))
+        .ignore_then(identifier)
+        .then(decl_params.clone())
+        .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
+        .then_ignore(just(Token::Semicolon))
+        .map(|((name, params), return_type)| FunctionDecl {
+            name: name.to_owned(),
+            r#extern: true,
+            params,
+            body: Vec::new(),
+            return_type,
+        });
+
     let function_decl = just(Token::Id("fn"))
         .ignore_then(identifier)
         .then(decl_params)
@@ -301,7 +315,8 @@ where
             params,
             body,
             return_type,
-        });
+        })
+        .or(extern_function_decl);
 
     let struct_decl = just(Token::Id("struct"))
         .ignore_then(identifier_spanned)

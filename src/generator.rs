@@ -158,6 +158,7 @@ pub struct FuncType {
     name: String,
     params: Vec<Type>,
     return_type: Box<Type>,
+    is_extern: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +221,8 @@ impl Display for FuncType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "fn {} ({}) : {}",
+            "{}fn {} ({}) : {}",
+            if self.is_extern { "extern " } else { "" },
             self.name,
             self.params
                 .iter()
@@ -352,6 +354,7 @@ pub fn generate(
             name: "main".to_owned(),
             params: Vec::new(),
             return_type: Type::Int.into(), // TODO: I32
+            is_extern: false,
         },
         return_dest: None,
         new_types: HashMap::new(),
@@ -1195,14 +1198,14 @@ impl Generator<'_> {
     fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
         let &FunctionDecl {
             name,
-            r#extern,
+            r#extern: is_extern,
             params,
             body,
             return_type,
         } = &decl;
 
-        if *r#extern {
-            todo!("Extern functions")
+        if *is_extern {
+            assert!(body.is_empty());
         }
 
         let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = Vec::new();
@@ -1226,11 +1229,7 @@ impl Generator<'_> {
                 errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
             param_types.push(r#type.clone());
-            fn_params.push((
-                name.0.clone(),
-                r#type.try_into().expect("Param type must be valid."),
-                ArgumentPurpose::Normal,
-            ));
+            fn_params.push((name.0.clone(), r#type, ArgumentPurpose::Normal));
         }
 
         if !errors.is_empty() {
@@ -1263,6 +1262,7 @@ impl Generator<'_> {
             name: name.to_owned(),
             params: param_types,
             return_type: return_type.into(),
+            is_extern: *is_extern,
         };
 
         if self.verbose {
@@ -1283,9 +1283,15 @@ impl Generator<'_> {
             returns,
         };
 
+        let linkage = if *is_extern {
+            Linkage::Import
+        } else {
+            Linkage::Local
+        };
+
         let func_id = self
             .module
-            .declare_function(name, Linkage::Local, &signature)
+            .declare_function(name, linkage, &signature)
             .expect("Function must be declarable.");
 
         self.current_scope
@@ -1303,68 +1309,72 @@ impl Generator<'_> {
         fn_builder.switch_to_block(entry_block);
         fn_builder.seal_block(entry_block);
 
-        let mut fn_generator = Generator {
-            isa: self.isa.clone(),
-            fn_context: Context::new(), // This won't be used for the function itself
-            fn_builder_context: FunctionBuilderContext::new(), // This won't be used either
-            builder: fn_builder,
-            module: self.module,
-            strings: self.strings, // Share string counter
-            printf_id: self.printf_id,
-            exit_id: self.exit_id,
-            returned: false,
-            current_scope: self.current_scope.function_scope(),
-            var_count: 0,
-            verbose: self.verbose,
-            current_func_type: func_type.clone(),
-            new_types: self.new_types.clone(),
-            return_dest: None,
-        };
+        if !*is_extern {
+            let mut fn_generator = Generator {
+                isa: self.isa.clone(),
+                fn_context: Context::new(), // This won't be used for the function itself
+                fn_builder_context: FunctionBuilderContext::new(), // This won't be used either
+                builder: fn_builder,
+                module: self.module,
+                strings: self.strings, // Share string counter
+                printf_id: self.printf_id,
+                exit_id: self.exit_id,
+                returned: false,
+                current_scope: self.current_scope.function_scope(),
+                var_count: 0,
+                verbose: self.verbose,
+                current_func_type: func_type.clone(),
+                new_types: self.new_types.clone(),
+                return_dest: None,
+            };
 
-        for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
-            let param_value = fn_generator.builder.block_params(entry_block)[i];
+            for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
+                let param_value = fn_generator.builder.block_params(entry_block)[i];
 
-            let var = fn_generator
-                .new_var(param_name.clone(), (param_value, param_type.clone()))
-                .expect("Function parameters should never redefine variables");
+                let var = fn_generator
+                    .new_var(param_name.clone(), (param_value, param_type.clone()))
+                    .expect("Function parameters should never redefine variables");
 
-            let var_type = param_type
-                .try_into()
-                .expect("Parameter type should be valid");
+                let var_type = param_type
+                    .try_into()
+                    .expect("Parameter type should be valid");
 
-            fn_generator.builder.declare_var(var, var_type);
-            fn_generator.builder.def_var(var, param_value);
+                fn_generator.builder.declare_var(var, var_type);
+                fn_generator.builder.def_var(var, param_value);
 
-            if *purpose == ArgumentPurpose::StructReturn {
-                debug_assert!(fn_generator.return_dest.is_none());
-                fn_generator.return_dest = Some(var);
+                if *purpose == ArgumentPurpose::StructReturn {
+                    debug_assert!(fn_generator.return_dest.is_none());
+                    fn_generator.return_dest = Some(var);
+                }
+            }
+
+            match fn_generator.build_statements(body) {
+                Err(mut new_errors) => {
+                    errors.append(&mut new_errors);
+                }
+                Ok(false) if *func_type.return_type == Type::Void => {
+                    fn_generator.builder.ins().return_(&[]);
+                }
+                Ok(false) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
+                Ok(true) => {}
+            }
+
+            self.strings = fn_generator.strings;
+
+            if self.verbose {
+                println!("{}", fn_generator.builder.func.display());
             }
         }
-
-        match fn_generator.build_statements(body) {
-            Err(mut new_errors) => {
-                errors.append(&mut new_errors);
-            }
-            Ok(false) if *func_type.return_type == Type::Void => {
-                fn_generator.builder.ins().return_(&[]);
-            }
-            Ok(false) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
-            Ok(true) => {}
-        }
-
-        self.strings = fn_generator.strings;
 
         if !errors.is_empty() {
             return Err(errors);
         }
 
-        if self.verbose {
-            println!("{}", fn_generator.builder.func.display());
+        if !*is_extern {
+            self.module
+                .define_function(func_id, &mut fn_context)
+                .unwrap();
         }
-
-        self.module
-            .define_function(func_id, &mut fn_context)
-            .unwrap();
 
         Ok(())
     }

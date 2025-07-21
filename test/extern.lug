@@ -1,0 +1,5 @@
+extern fn labs(number: int) : int;
+
+@println("%d", labs(-3));
+
+@assert(labs(-3) == 3);
