@@ -1516,9 +1516,6 @@ impl Generator<'_> {
                 }
                 .expect("Parameter type should be valid");
 
-                dbg!(var_type.value_type);
-                dbg!(param_type);
-
                 fn_generator.builder.declare_var(var, var_type.value_type);
                 fn_generator.builder.def_var(var, param_value);
 
@@ -1629,7 +1626,6 @@ impl Generator<'_> {
                 struct_type.size(),
                 struct_type.align_shift(),
             );
-            dbg!(&stack_slot_data);
             let stack_slot = self.builder.create_sized_stack_slot(stack_slot_data);
 
             let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
