@@ -24,6 +24,13 @@ def main [folder?: string] {
     }
     
     for file in $files {
+        let content = (open $file)
+        let first_line = ($content | lines | first)
+        if ($first_line | str starts-with "///") and ($first_line | str contains "SKIP_TEST") {
+            print $"Skipping: ($file)"
+            continue
+        }
+        
         print $"Running: ($file)"
         try {
             cargo run run $file

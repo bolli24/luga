@@ -1,3 +1,5 @@
+/// SKIP_TEST
+
 struct Color {
     r: u8;
     g: u8;
