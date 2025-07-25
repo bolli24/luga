@@ -583,7 +583,7 @@ impl Generator<'_> {
             Statement::Binding(name, expr) => {
                 let value = self.build_expression(expr, None)?;
 
-                let Ok(var) = self.new_var(name.clone(), value.clone()) else {
+                if self.current_scope.vars_name.contains_key(name) {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
 
@@ -591,8 +591,9 @@ impl Generator<'_> {
                     return CodeError::BindingType(value.1).err(expr.1);
                 };
 
-                self.builder.declare_var(var, var_type);
+                let var = self.builder.declare_var(var_type);
                 self.builder.def_var(var, value.0);
+                self.new_var(name.to_owned(), var, value);
             }
             Statement::Assignment(name, expr) => {
                 if let Some((var, var_type)) = self.current_scope.get_var(name).cloned() {
@@ -1128,11 +1129,11 @@ impl Generator<'_> {
         }
     }
 
-    fn new_var(&mut self, name: String, value: (Value, Type)) -> Result<Variable, ()> {
-        let var = Variable::new(self.var_count);
-        self.current_scope.insert(name, var, value)?;
+    fn new_var(&mut self, name: String, var: Variable, value: (Value, Type)) {
+        self.current_scope
+            .insert(name, var, value)
+            .expect("Variable must not exist.");
         self.var_count += 1;
-        Ok(var)
     }
 
     // TODO: if expression
@@ -1505,10 +1506,6 @@ impl Generator<'_> {
             for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
                 let param_value = fn_generator.builder.block_params(entry_block)[i];
 
-                let var = fn_generator
-                    .new_var(param_name.clone(), (param_value, param_type.clone()))
-                    .expect("Function parameters should never redefine variables");
-
                 let var_type = if *is_extern {
                     fn_generator.get_extern_abi_param(param_type)
                 } else {
@@ -1516,8 +1513,9 @@ impl Generator<'_> {
                 }
                 .expect("Parameter type should be valid");
 
-                fn_generator.builder.declare_var(var, var_type.value_type);
+                let var = fn_generator.builder.declare_var(var_type.value_type);
                 fn_generator.builder.def_var(var, param_value);
+                fn_generator.new_var(param_name.clone(), var, (param_value, param_type.clone()));
 
                 if *purpose == ArgumentPurpose::StructReturn {
                     debug_assert!(fn_generator.return_dest.is_none());
