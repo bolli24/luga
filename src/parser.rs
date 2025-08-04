@@ -197,6 +197,7 @@ where
     let args = expression
         .clone()
         .separated_by(just(Token::Comma))
+        .allow_trailing()
         .collect::<Vec<_>>()
         .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
@@ -422,7 +423,6 @@ where
         });
 
     expression.define(choice((intrinsic, binary)).labelled("expression"));
-
     let binding = just(Token::Id("let"))
         .ignore_then(identifier)
         .then_ignore(just(Token::Equal))

@@ -1,0 +1,3 @@
+extern fn hello_rust();
+
+hello_rust();
