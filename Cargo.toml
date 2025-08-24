@@ -9,7 +9,7 @@ ariadne = "0.5"
 logos = "0.15"
 thiserror = "2.0"
 
-cranelift = { version = "0.122", features = [
+cranelift = { version = "0.123", features = [
     "core",
     "frontend",
     "module",
