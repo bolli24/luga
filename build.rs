@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../luga_runtime/src");
+    println!("cargo:rerun-if-changed=./runtime/src");
 
     // Get the target directory
     let target_dir = env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
