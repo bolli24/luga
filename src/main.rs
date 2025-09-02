@@ -85,6 +85,11 @@ fn main() -> ExitCode {
 const OUTPUT_DIR: &str = "output";
 
 fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, ()> {
+    let runtime_lib = extract_runtime_lib().map_err(|err| {
+        eprintln!("ERROR: Could not extract runtime library.");
+        eprintln!("{err}");
+    })?;
+
     if path.is_dir() {
         todo!("Build directories");
     }
@@ -98,8 +103,16 @@ fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, ()>
 
     create_dir_all(&output_dir).expect("Unable to create output directory.");
 
-    build_file(path, &output_dir, cli.verbose, cli.release, linker_args).map_err(|err| {
-        eprintln!("Error building executable.");
+    build_file(
+        path,
+        &output_dir,
+        cli.verbose,
+        cli.release,
+        linker_args,
+        &runtime_lib,
+    )
+    .map_err(|err| {
+        eprintln!("ERROR: Could not build executable.");
         eprintln!("{err}");
     })
 }
@@ -148,6 +161,7 @@ fn build_file(
     verbose: bool,
     release: bool,
     linker_args: &str,
+    runtime_lib: &Path,
 ) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
@@ -261,6 +275,8 @@ fn build_file(
         command.args(linker_args.split(' ')); // TODO: handle path with spaces etc
     }
 
+    command.arg(runtime_lib);
+
     if verbose {
         println!("{command:?}");
     }
@@ -284,9 +300,25 @@ fn clean() -> Result<(), ()> {
 
     if output_dir.exists() {
         remove_dir_all(&output_dir)
-            .map_err(|err| eprintln!("Error cleaning build directory: {err}"))?;
+            .map_err(|err| eprintln!("ERROR: Unable to clean build directory: {err}"))?;
     }
 
     println!("Cleaned build directory '{}'.", output_dir.display());
     Ok(())
+}
+
+const RUNTIME_LIB: &[u8] = include_bytes!(env!("RUNTIME_LIB_PATH"));
+
+fn extract_runtime_lib() -> std::io::Result<std::path::PathBuf> {
+    use std::fs;
+    use std::io::Write;
+
+    let temp_dir = std::env::temp_dir();
+    let lib_name = env!("RUNTIME_LIB_NAME");
+    let lib_path = temp_dir.join(lib_name);
+
+    let mut file = fs::File::create(&lib_path)?;
+    file.write_all(RUNTIME_LIB)?;
+
+    Ok(lib_path)
 }
