@@ -58,7 +58,7 @@ pub enum Token<'a> {
     #[token("}")]
     BraceClose,
 
-    #[regex(r"\/\/.*[\r\n|\r|\n]", |_| Skip)]
+    #[regex(r"\/\/.*?(?:\r\n|\r|\n)", |_| Skip)]
     Comment,
 
     #[regex(r"[-+]?\d+\.\d+", |lex| lex.slice(), priority = 2)]
