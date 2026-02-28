@@ -693,13 +693,15 @@ impl Generator<'_> {
         let value =
             self.build_expression(expr, Some(*self.current_func_type.return_type.clone()))?;
         if self.current_func_type.name == "main" {
-            if value.1 != Type::I32 {
+            if value.1 != Type::Never && value.1 != Type::I32 {
                 // self.builder.ins().return_(&[]);
                 return CodeError::InvalidReturnType(Type::I32, value.1).err(expr.1);
             }
-            self.builder.ins().return_(&[value.0]);
+            if value.1 != Type::Never {
+                self.builder.ins().return_(&[value.0]);
+            }
         } else {
-            if *self.current_func_type.return_type != value.1 {
+            if value.1 != Type::Never && *self.current_func_type.return_type != value.1 {
                 return CodeError::InvalidReturnType(
                     (*self.current_func_type.return_type).clone(),
                     value.1.clone(),
@@ -707,8 +709,11 @@ impl Generator<'_> {
                 .err(expr.1);
             }
             match value.1 {
-                Type::Never => panic!("Trying to return from unreachable code."),
-                Type::Void => self.builder.ins().return_(&[]),
+                // Diverging expression already terminated the block — nothing to emit.
+                Type::Never => {}
+                Type::Void => {
+                    self.builder.ins().return_(&[]);
+                }
                 Type::Struct(struct_type) => {
                     let return_dest = self
                         .return_dest
@@ -727,9 +732,11 @@ impl Generator<'_> {
                         );
                     }
 
-                    self.builder.ins().return_(&[])
+                    self.builder.ins().return_(&[]);
                 }
-                _ => self.builder.ins().return_(&[value.0]),
+                _ => {
+                    self.builder.ins().return_(&[value.0]);
+                }
             };
         }
         Ok(true)
@@ -925,7 +932,7 @@ impl Generator<'_> {
                 let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     struct_type.size(),
-                    3, // TODO: calculate this correctly
+                    struct_type.align_shift(),
                 ));
 
                 let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
@@ -1341,7 +1348,7 @@ impl Generator<'_> {
 
         let expr = self.build_expression(&args[0], Some(Type::I32))?;
         if expr.1 != Type::I32 {
-            return CodeError::IntrisicArgumentType("exit", &[Type::Bool], expr.1).err(args[0].1);
+            return CodeError::IntrisicArgumentType("exit", &[Type::I32], expr.1).err(args[0].1);
         }
 
         let exit_ref = self
@@ -1675,7 +1682,10 @@ impl Generator<'_> {
                 continue;
             };
 
-            let field_size = field_type.size();
+            let field_size = field_type.size() as i32;
+            let field_align = 1i32 << field_type.align_shift();
+            let padding = (field_align - (current_offset % field_align)) % field_align;
+            current_offset += padding;
             fields.insert(
                 name.0.clone(),
                 StructField {
@@ -1683,7 +1693,7 @@ impl Generator<'_> {
                     offset: current_offset,
                 },
             );
-            current_offset += field_size as i32;
+            current_offset += field_size;
         }
 
         if !errors.is_empty() {
