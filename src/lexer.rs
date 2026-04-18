@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use logos::{Lexer, Logos, Skip};
+use logos::{Logos, Skip};
 
 #[derive(Logos, Debug, Clone, PartialEq, Eq)]
 #[logos(skip r"[ \t\r\n\f]+")]
@@ -29,9 +29,9 @@ pub enum Token<'a> {
     #[token(">")]
     Gt,
     #[token("<=")]
-    ArrowLeft,
-    #[token("=>")]
-    ArrowRight,
+    LtEq,
+    #[token(">=")]
+    GtEq,
 
     #[token(";")]
     Semicolon,
@@ -58,7 +58,7 @@ pub enum Token<'a> {
     #[token("}")]
     BraceClose,
 
-    #[regex(r"\/\/.*?(?:\r\n|\r|\n)", |_| Skip)]
+    #[regex(r"//[^\r\n]*", |_| Skip, allow_greedy = true)]
     Comment,
 
     #[regex(r"[-+]?\d+\.\d+", |lex| lex.slice(), priority = 2)]
@@ -67,56 +67,47 @@ pub enum Token<'a> {
     #[regex(r"[-+]?\d+", |lex| lex.slice(), priority = 2)]
     Integer(&'a str),
 
-    #[regex(r#"\""#, string)]
+    #[regex(r#""(?:[^"\\\n]|\\.)*""#, |lex| {
+        let s = lex.slice();
+        Ok::<String, LexingError>(process_escapes(&s[1..s.len() - 1]))
+    })]
+    #[regex(r#""(?:[^"\\\n]|\\.)*"#, |_| Err(LexingError::UnterminatedString))]
     Quoted(String),
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LexingError {
     #[default]
+    #[error("Unexpected character")]
     UnexpectedCharacter,
+    #[error("Unterminated string literal")]
     UnterminatedString,
 }
 
-fn string<'a>(lex: &mut Lexer<'a, Token<'a>>) -> Result<String, LexingError> {
-    let mut iter = lex.remainder().chars();
-    let mut string = String::new();
-
-    while let Some(next_char) = iter.next() {
-        if next_char == '"' {
-            lex.bump(lex.remainder().len() - iter.as_str().len());
-            return Ok(string);
+fn process_escapes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
         }
-
-        if next_char == '\\' {
-            match iter.next() {
-                Some('n') => string.push('\n'),
-                Some('t') => string.push('\t'),
-                Some('r') => string.push('\r'),
-                Some('\\') => string.push('\\'),
-                Some('"') => string.push('"'),
-                Some('\'') => string.push('\''),
-                Some('0') => string.push('\0'),
-                Some(c) => {
-                    string.push('\\');
-                    string.push(c);
-                }
-                None => {
-                    // Backslash at end of string - this might be an error
-                    string.push('\\');
-                    break;
-                }
+        match chars.next() {
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some('r') => result.push('\r'),
+            Some('\\') => result.push('\\'),
+            Some('"') => result.push('"'),
+            Some('\'') => result.push('\''),
+            Some('0') => result.push('\0'),
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
             }
-        } else if next_char == '\n' {
-            break;
-        } else {
-            string.push(next_char);
+            None => result.push('\\'),
         }
     }
-
-    // If we reach here, we hit end of input without finding closing quote
-    lex.bump(string.len());
-    Err(LexingError::UnterminatedString)
+    result
 }
 
 impl Display for Token<'_> {
@@ -147,8 +138,8 @@ impl Display for Token<'_> {
             Self::EqualEqual => write!(f, "=="),
             Self::Lt => write!(f, "<"),
             Self::Gt => write!(f, ">"),
-            Self::ArrowLeft => write!(f, "<="),
-            Self::ArrowRight => write!(f, ">="),
+            Self::LtEq => write!(f, "<="),
+            Self::GtEq => write!(f, ">="),
         }
     }
 }

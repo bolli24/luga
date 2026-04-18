@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::lexer::Token;
+use crate::lexer::{LexingError, Token};
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::prelude::*;
 use chumsky::{Parser, input::Stream};
@@ -175,15 +175,34 @@ fn build_file(
         }
     }
 
-    let token_iter = Token::lexer(src.as_str())
-        .spanned()
-        .filter_map(|(tok, span)| match tok {
-            Ok(tok) => Some((tok, span.into())),
-            _ => None, // FIXME: Handle lexer errors.
-        });
+    let mut tokens: Vec<(Token, SimpleSpan)> = Vec::new();
+    let mut lex_errors: Vec<(LexingError, std::ops::Range<usize>)> = Vec::new();
+    for (tok, span) in Token::lexer(src.as_str()).spanned() {
+        match tok {
+            Ok(tok) => tokens.push((tok, span.into())),
+            Err(err) => lex_errors.push((err, span)),
+        }
+    }
+
+    if !lex_errors.is_empty() {
+        let src_for_reports = Source::from(src.as_str());
+        for (err, span) in &lex_errors {
+            Report::build(ReportKind::Error, (&file_name, span.clone()))
+                .with_message(err.to_string())
+                .with_label(
+                    Label::new((&file_name, span.clone()))
+                        .with_message(err.to_string())
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint((&file_name, src_for_reports.clone()))
+                .unwrap();
+        }
+        return Err(BuildError::Lexer(PathBuf::from(file_path)));
+    }
 
     let token_stream =
-        Stream::from_iter(token_iter).map((0..src.len()).into(), |(t, s): (_, _)| (t, s));
+        Stream::from_iter(tokens.into_iter()).map((0..src.len()).into(), |(t, s): (_, _)| (t, s));
 
     if verbose {
         println!();

@@ -184,8 +184,8 @@ where
         Token::EqualEqual => BinOp::Equal,
         Token::Lt => BinOp::Lt,
         Token::Gt => BinOp::Gt,
-        Token::ArrowLeft => BinOp::Lte,
-        Token::ArrowRight => BinOp::Gte,
+        Token::LtEq => BinOp::Lte,
+        Token::GtEq => BinOp::Gte,
     };
 
     let unary_op = select! {
