@@ -9,16 +9,12 @@ use logos::Logos;
 use parser::{Spanned, luga_parser};
 use thiserror::Error;
 
-use std::fs::{create_dir_all, remove_dir_all};
-use std::path::Path;
-use std::process::ExitCode;
-use std::{
-    env,
-    fs::{self, File},
-    io::Write,
-    path::PathBuf,
-    process::Command,
-};
+use std::fs::{self, File, create_dir_all, remove_dir_all};
+use std::io::Write;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::{env, io};
 
 pub use chumsky::span::SimpleSpan;
 
@@ -50,7 +46,10 @@ enum CliCommand {
         linker_args: String,
         path: PathBuf,
     },
-    Test,
+    Test {
+        #[arg(default_value = "test")]
+        path: PathBuf,
+    },
     Clean,
 }
 
@@ -64,6 +63,8 @@ enum BuildError {
     Linker(PathBuf),
     #[error("Error generating IR for file {}", .0.display())]
     Generator(PathBuf),
+    #[error("I/O error for file {}: {}", .0.display(), .1)]
+    Io(PathBuf, io::Error),
 }
 
 fn main() -> ExitCode {
@@ -72,7 +73,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         CliCommand::Build { path, linker_args } => build_files(&cli, path, linker_args).map(|_| ()),
         CliCommand::Run { path, linker_args } => run_file(&cli, path, linker_args),
-        CliCommand::Test => todo!(),
+        CliCommand::Test { path } => test_files(&cli, path),
         CliCommand::Clean => clean(),
     };
 
@@ -84,6 +85,27 @@ fn main() -> ExitCode {
 
 const OUTPUT_DIR: &str = "output";
 
+fn report_error(file_name: &str, src: Source<&str>, span: Range<usize>, msg: &str) {
+    Report::build(ReportKind::Error, (file_name, span.clone()))
+        .with_message(msg)
+        .with_label(
+            Label::new((file_name, span))
+                .with_message(msg)
+                .with_color(Color::Red),
+        )
+        .finish()
+        .eprint((file_name, src))
+        .unwrap();
+}
+
+fn output_dir(release: bool) -> io::Result<PathBuf> {
+    let dir = env::current_dir()?
+        .join(OUTPUT_DIR)
+        .join(if release { "release" } else { "debug" });
+    create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, ()> {
     let runtime_lib = extract_runtime_lib().map_err(|err| {
         eprintln!("ERROR: Could not extract runtime library.");
@@ -94,14 +116,14 @@ fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, ()>
         todo!("Build directories");
     }
 
-    assert!(path.is_file(), "Invalid input path.");
+    if !path.is_file() {
+        eprintln!("ERROR: '{}' is not a file.", path.display());
+        return Err(());
+    }
 
-    let output_dir = env::current_dir()
-        .expect("Current working directory is invalid.")
-        .join("output")
-        .join(if cli.release { "release" } else { "debug" });
-
-    create_dir_all(&output_dir).expect("Unable to create output directory.");
+    let output_dir = output_dir(cli.release).map_err(|err| {
+        eprintln!("ERROR: Unable to create output directory: {err}");
+    })?;
 
     build_file(
         path,
@@ -117,42 +139,186 @@ fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, ()>
     })
 }
 
-fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), ()> {
-    assert!(!path.is_dir(), "Can't run more than one file.");
+struct TestDirective {
+    skip: bool,
+    expected_exit_code: i32,
+}
 
-    assert!(path.is_file(), "Invalid input path.");
+fn parse_test_directive(line: &str) -> Result<TestDirective, &'static str> {
+    let mut directive = TestDirective {
+        skip: false,
+        expected_exit_code: 0,
+    };
 
-    let result = build_files(cli, path, linker_args);
-    if let Ok(exe_path) = &result {
-        println!("Running executable '{}'", exe_path.display());
-        let exe_name = exe_path.file_name().expect("Executable path must be valid");
-        let exit_status = Command::new(exe_path)
-            .status()
-            .expect("Unable to spawn command.");
-        if let Some(exit_code) = exit_status.code()
-            && exit_code != 0
-        {
-            eprintln!(
-                "Executable '{}' exited with code '{}'",
-                exe_name.display(),
-                exit_code
-            );
+    let Some(rest) = line.strip_prefix("///") else {
+        return Ok(directive);
+    };
+
+    for token in rest.split_whitespace() {
+        if token == "SKIP_TEST" {
+            directive.skip = true;
+        } else if let Some(value) = token.strip_prefix("EXIT_CODE=") {
+            directive.expected_exit_code =
+                value.parse().map_err(|_| "invalid EXIT_CODE directive")?;
         }
-        #[cfg(target_family = "unix")]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(signal) = exit_status.signal() {
-                eprintln!(
-                    "Executable '{}' exited with signal '{}",
-                    exe_name.display(),
-                    signal
-                );
+    }
+
+    Ok(directive)
+}
+
+fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
+    let files: Vec<PathBuf> = if path.is_file() {
+        vec![path.to_path_buf()]
+    } else if path.is_dir() {
+        let mut entries: Vec<PathBuf> = walkdir::WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "luga"))
+            .collect();
+        entries.sort();
+        entries
+    } else {
+        eprintln!("ERROR: '{}' is not a file or directory.", path.display());
+        return Err(());
+    };
+
+    let mut passed = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    let mut build_failed = 0u32;
+
+    for file in &files {
+        let display = file.display();
+        if cli.verbose {
+            println!("{display} ...");
+        } else {
+            print!("{display} ... ");
+            let _ = io::stdout().flush();
+        }
+
+        let content = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(err) => {
+                println!("BUILD FAIL (unable to read: {err})");
+                build_failed += 1;
+                continue;
+            }
+        };
+
+        let first_line = content.lines().next().unwrap_or("");
+        let directive = match parse_test_directive(first_line) {
+            Ok(d) => d,
+            Err(msg) => {
+                println!("BUILD FAIL ({msg})");
+                build_failed += 1;
+                continue;
+            }
+        };
+
+        if directive.skip {
+            println!("SKIP");
+            skipped += 1;
+            continue;
+        }
+
+        let exe_path = match build_files(cli, file, "") {
+            Ok(p) => p,
+            Err(()) => {
+                println!("BUILD FAIL");
+                build_failed += 1;
+                continue;
+            }
+        };
+
+        let mut cmd = Command::new(&exe_path);
+        if !cli.verbose {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+        let status = match cmd.status() {
+            Ok(s) => s,
+            Err(err) => {
+                println!("FAIL (unable to execute: {err})");
+                failed += 1;
+                continue;
+            }
+        };
+        if cli.verbose {
+            println!();
+        }
+
+        let expected = directive.expected_exit_code;
+        match status.code() {
+            Some(code) if code == expected => {
+                println!("PASS");
+                passed += 1;
+            }
+            Some(code) => {
+                println!("FAIL (expected exit code {expected}, got {code})");
+                failed += 1;
+            }
+            None => {
+                println!("FAIL (terminated without exit code)");
+                failed += 1;
             }
         }
-        Ok(())
-    } else {
-        Err(())
     }
+
+    let total = passed + failed + skipped + build_failed;
+    println!();
+    println!(
+        "Test summary: {failed} failed / {passed} passed / {total} total | Skipped: {skipped} | Build failed: {build_failed}"
+    );
+
+    if failed > 0 || build_failed > 0 {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), ()> {
+    if path.is_dir() {
+        eprintln!("ERROR: Can't run more than one file.");
+        return Err(());
+    }
+    if !path.is_file() {
+        eprintln!("ERROR: '{}' is not a file.", path.display());
+        return Err(());
+    }
+
+    let exe_path = build_files(cli, path, linker_args)?;
+    println!("Running executable '{}'", exe_path.display());
+    let exe_name = exe_path.file_name().expect("Executable path must be valid");
+    let exit_status = Command::new(&exe_path).status().map_err(|err| {
+        eprintln!("ERROR: Unable to spawn executable: {err}");
+    })?;
+    if let Some(exit_code) = exit_status.code()
+        && exit_code != 0
+    {
+        eprintln!(
+            "Executable '{}' exited with code '{}'",
+            exe_name.display(),
+            exit_code
+        );
+    }
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = exit_status.signal() {
+            eprintln!(
+                "Executable '{}' exited with signal '{}'",
+                exe_name.display(),
+                signal
+            );
+        }
+    }
+    if !exit_status.success() {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn build_file(
@@ -166,17 +332,10 @@ fn build_file(
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
     let file_name = base_name.to_string_lossy().to_string();
-    let src = fs::read_to_string(file_path).expect("Failed to read file");
-    let lexer = Token::lexer(src.as_str());
-
-    if verbose {
-        for token in lexer {
-            println!("{token:?}");
-        }
-    }
+    let src = fs::read_to_string(file_path).map_err(|err| BuildError::Io(file_path.into(), err))?;
 
     let mut tokens: Vec<(Token, SimpleSpan)> = Vec::new();
-    let mut lex_errors: Vec<(LexingError, std::ops::Range<usize>)> = Vec::new();
+    let mut lex_errors: Vec<(LexingError, Range<usize>)> = Vec::new();
     for (tok, span) in Token::lexer(src.as_str()).spanned() {
         match tok {
             Ok(tok) => tokens.push((tok, span.into())),
@@ -184,21 +343,24 @@ fn build_file(
         }
     }
 
-    if !lex_errors.is_empty() {
-        let src_for_reports = Source::from(src.as_str());
-        for (err, span) in &lex_errors {
-            Report::build(ReportKind::Error, (&file_name, span.clone()))
-                .with_message(err.to_string())
-                .with_label(
-                    Label::new((&file_name, span.clone()))
-                        .with_message(err.to_string())
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, src_for_reports.clone()))
-                .unwrap();
+    if verbose {
+        for (tok, _) in &tokens {
+            println!("{tok:?}");
         }
-        return Err(BuildError::Lexer(PathBuf::from(file_path)));
+    }
+
+    let src_report = Source::from(src.as_str());
+
+    if !lex_errors.is_empty() {
+        for (err, span) in &lex_errors {
+            report_error(
+                &file_name,
+                src_report.clone(),
+                span.clone(),
+                &err.to_string(),
+            );
+        }
+        return Err(BuildError::Lexer(file_path.into()));
     }
 
     let token_stream =
@@ -219,23 +381,18 @@ fn build_file(
     }
 
     if result.has_errors() {
-        let src = Source::from(src.as_str());
         for error in result.errors() {
-            Report::build(ReportKind::Error, (&file_name, error.span().into_range()))
-                .with_message(error.to_string())
-                .with_label(
-                    Label::new((&file_name, error.span().into_range()))
-                        .with_message(error.reason())
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, src.clone()))
-                .unwrap();
+            report_error(
+                &file_name,
+                src_report.clone(),
+                error.span().into_range(),
+                &error.to_string(),
+            );
         }
     }
 
     let Some(program) = result.into_output() else {
-        return Err(BuildError::Lexer(PathBuf::from(file_path)));
+        return Err(BuildError::Parser(file_path.into()));
     };
 
     if verbose {
@@ -246,18 +403,13 @@ fn build_file(
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::CodeErrors(errors) => {
-                let src = Source::from(src.as_str());
                 for Spanned(error, span) in errors {
-                    Report::build(ReportKind::Error, (&file_name, span.into_range()))
-                        .with_message(error.to_string())
-                        .with_label(
-                            Label::new((&file_name, span.into_range()))
-                                .with_message(error.to_string())
-                                .with_color(Color::Red),
-                        )
-                        .finish()
-                        .eprint((&file_name, src.clone()))
-                        .unwrap();
+                    report_error(
+                        &file_name,
+                        src_report.clone(),
+                        span.into_range(),
+                        &error.to_string(),
+                    );
                 }
                 return Err(BuildError::Generator(file_path.into()));
             }
@@ -271,11 +423,15 @@ fn build_file(
         },
     };
 
-    let bytes = product.emit().unwrap();
+    let bytes = product
+        .emit()
+        .map_err(|_| BuildError::Generator(file_path.into()))?;
 
     let object_file = output_file.with_extension("o");
-    let mut f = File::create(&object_file).unwrap();
-    f.write_all(&bytes).unwrap();
+    let mut f =
+        File::create(&object_file).map_err(|err| BuildError::Io(object_file.clone(), err))?;
+    f.write_all(&bytes)
+        .map_err(|err| BuildError::Io(object_file.clone(), err))?;
 
     if verbose {
         println!("Wrote object to '{}'.", object_file.display());
@@ -300,13 +456,17 @@ fn build_file(
         println!("{command:?}");
     }
 
-    let status = command.status().unwrap();
+    let status = command
+        .status()
+        .map_err(|_| BuildError::Linker(file_path.into()))?;
 
     if !status.success() {
         return Err(BuildError::Linker(file_path.into()));
     }
 
-    println!("Saved executable to '{}'", exe_file.display());
+    if verbose {
+        println!("Saved executable to '{}'", exe_file.display());
+    }
 
     Ok(exe_file)
 }
@@ -328,15 +488,12 @@ fn clean() -> Result<(), ()> {
 
 const RUNTIME_LIB: &[u8] = include_bytes!(env!("RUNTIME_LIB_PATH"));
 
-fn extract_runtime_lib() -> std::io::Result<std::path::PathBuf> {
-    use std::fs;
-    use std::io::Write;
-
-    let temp_dir = std::env::temp_dir();
+fn extract_runtime_lib() -> io::Result<PathBuf> {
+    let temp_dir = env::temp_dir();
     let lib_name = env!("RUNTIME_LIB_NAME");
     let lib_path = temp_dir.join(lib_name);
 
-    let mut file = fs::File::create(&lib_path)?;
+    let mut file = File::create(&lib_path)?;
     file.write_all(RUNTIME_LIB)?;
 
     Ok(lib_path)

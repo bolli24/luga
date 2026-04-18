@@ -504,7 +504,7 @@ impl Scope {
         func_type: FuncType,
     ) -> Option<()> {
         if self.parent.is_some() {
-            None
+            None 
         } else {
             self.functions.insert(name, (func_id, func_type));
             Some(())

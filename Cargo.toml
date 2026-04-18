@@ -22,3 +22,4 @@ cranelift = { version = "0.130", features = [
 clap = { version = "4.5", features = ["derive"] }
 
 indexmap = "2.10"
+walkdir = "2.5"
