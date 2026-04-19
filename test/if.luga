@@ -1,37 +1,38 @@
+fn main() {
+    let a = 5;
+    let b = 2;
+    let c = a + b * 3;   // c = 5 + 6 = 11
+    let d = c - a;       // d = 11 - 5 = 6
+    let e = d / b;       // e = 6 / 2 = 3
 
-let a = 5;
-let b = 2;
-let c = a + b * 3;   // c = 5 + 6 = 11
-let d = c - a;       // d = 11 - 5 = 6
-let e = d / b;       // e = 6 / 2 = 3
+    if (c == 11) {
+        a = a * 2;       // a = 10
+        @print("Level 1: a = %d\n", a);
 
-if (c == 11) {
-    a = a * 2;       // a = 10
-    @print("Level 1: a = %d\n", a);
+        if (d == 6) {
+            b = b + a;   // b = 2 + 10 = 12
+            @print("Level 2: b = %d\n", b);
 
-    if (d == 6) {
-        b = b + a;   // b = 2 + 10 = 12
-        @print("Level 2: b = %d\n", b);
-
-        if (e == 3) {
-            c = c + b;   // c = 11 + 12 = 23
-            @print("Level 3: c = %d\n", c);
+            if (e == 3) {
+                c = c + b;   // c = 11 + 12 = 23
+                @print("Level 3: c = %d\n", c);
+            } else {
+                c = c - b;
+                @print("Level 3 Else: c = %d\n", c);
+            }
+        } else if (true) {
+            d = d * 2;
+            @print("Level 2 Else: d = %d\n", d);
         } else {
-            c = c - b;
-            @print("Level 3 Else: c = %d\n", c);
+            @print("never");
         }
-    } else if (true) {
-        d = d * 2;
-        @print("Level 2 Else: d = %d\n", d);
     } else {
-        @print("never");
-    }
-} else {
-    a = 0;
-    @print("Outer Else: a reset to %d\n", a);
+        a = 0;
+        @print("Outer Else: a reset to %d\n", a);
 
-    if (b == 2) {
-        b = b * 5;
-        @print("Else Nested: b = %d\n", b);
+        if (b == 2) {
+            b = b * 5;
+            @print("Else Nested: b = %d\n", b);
+        }
     }
 }

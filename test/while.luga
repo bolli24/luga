@@ -18,5 +18,7 @@ fn fibonacci(n: i32) : i32 {
     return b;
 }
 
-@print("%d", fibonacci(10));
-@assert(fibonacci(10) == 55);
+fn main() {
+    @print("%d", fibonacci(10));
+    @assert(fibonacci(10) == 55);
+}

@@ -1,5 +1,7 @@
 extern fn abs(number: i32) : i32;
 
-@println("%d", abs(-3));
+fn main() {
+    @println("%d", abs(-3));
 
-@assert(abs(-3) == 3);
+    @assert(abs(-3) == 3);
+}

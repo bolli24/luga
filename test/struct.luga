@@ -11,18 +11,6 @@ fn add(a: iVec, b: iVec) : iVec {
     return iVec {x: a.x + b.x, y: a.y + b.y};
 }
 
-let a = iVec {x: 2, y: -2};
-let b = iVec {x: -2, y: -2};
-
-printVec(iVec {x: 0, y: -4});
-
-let c = add(a, b);
-
-printVec(c);
-
-@assert(0 == c.x);
-@assert(-4 == c.y);
-
 // struct declared inside a function scope
 fn sumComponents() : i32 {
     struct Pair {
@@ -33,4 +21,18 @@ fn sumComponents() : i32 {
     return p.a + p.b;
 }
 
-@assert(sumComponents() == 42);
+fn main() {
+    let a = iVec {x: 2, y: -2};
+    let b = iVec {x: -2, y: -2};
+
+    printVec(iVec {x: 0, y: -4});
+
+    let c = add(a, b);
+
+    printVec(c);
+
+    @assert(0 == c.x);
+    @assert(-4 == c.y);
+
+    @assert(sumComponents() == 42);
+}

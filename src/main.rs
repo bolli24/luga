@@ -375,8 +375,8 @@ fn build_file(
     if let Some(program) = result.output()
         && verbose
     {
-        for statement in &program.statements {
-            println!("{statement:?}");
+        for item in &program.items {
+            println!("{item:?}");
         }
     }
 
@@ -418,6 +418,10 @@ fn build_file(
                     // TODO: make this printing nice
                     eprintln!("{error}");
                 }
+                return Err(BuildError::Generator(file_path.into()));
+            }
+            GeneratorErrors::MissingMain => {
+                eprintln!("error: program has no `fn main()` entry point");
                 return Err(BuildError::Generator(file_path.into()));
             }
         },

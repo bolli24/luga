@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use chumsky::span::{SimpleSpan, Span};
 use cranelift::{
-    codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError, verify_function},
+    codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::{isa::CallConv, *},
@@ -13,7 +13,7 @@ use crate::parser::EnumDecl;
 use crate::{
     parser::{
         BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
-        Statement, StructDecl, UnOp,
+        Statement, StructDecl, TopLevelItem, UnOp,
     },
     util::ResultCollectAll,
 };
@@ -105,6 +105,11 @@ pub enum CodeError {
 
     #[error("Enum variant '{}' already declared.", .0)]
     EnumDuplicateVariant(String),
+
+    #[error("`fn main` must have no parameters.")]
+    MainHasParams,
+    #[error("`fn main` must return `i32`, but `{}` was declared.", .0)]
+    MainInvalidReturnType(Type),
     #[error("Type '{}' cannot be used as a value.", .0)]
     TypeUsedAsValue(String),
     #[error("Enum '{}' has no variant named '{}'.", .0, .1)]
@@ -130,6 +135,7 @@ impl CodeError {
 pub enum GeneratorErrors {
     CodeErrors(ManyErrors),
     VerifierErrors(Vec<VerifierError>),
+    MissingMain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,8 +391,6 @@ pub fn generate(
             ObjectBuilder::new(isa.clone(), translation_unit_name, libcall_names).unwrap();
         ObjectModule::new(builder)
     };
-    let mut main_context = Context::new();
-
     let mut data_desc = DataDescription::new();
     let string_data = b"%d\n\0";
     data_desc.define(string_data.to_vec().into_boxed_slice());
@@ -397,26 +401,6 @@ pub fn generate(
     module
         .define_data(string_data_id, &data_desc)
         .expect("Failed to define string data");
-
-    let main_signature = Signature {
-        call_conv: isa.default_call_conv(),
-        params: vec![],
-        // Since we're linking to libc, we can return the exit code from main.
-        returns: vec![AbiParam::new(types::I32)],
-    };
-
-    let main_id = module
-        .declare_function("main", Linkage::Export, &main_signature)
-        .unwrap();
-
-    let mut main_fn_context = FunctionBuilderContext::new();
-
-    let mut main_builder = FunctionBuilder::new(&mut main_context.func, &mut main_fn_context);
-    main_builder.func.signature = main_signature;
-
-    let main_block = main_builder.create_block();
-    main_builder.switch_to_block(main_block);
-    main_builder.seal_block(main_block);
 
     let printf_signature = Signature {
         call_conv: isa.default_call_conv(),
@@ -438,40 +422,17 @@ pub fn generate(
         .declare_function("exit", Linkage::Import, &exit_signature)
         .unwrap();
 
-    let generator = Generator {
-        isa: isa.clone(),
-        fn_context: Context::new(),
-        fn_builder_context: FunctionBuilderContext::new(),
-        builder: main_builder,
+    let state = GeneratorState {
+        isa,
         module: &mut module,
         strings: 0,
         printf_id,
         exit_id,
-        returned: false,
-        current_scope: Scope::new(),
-        var_count: 0,
         verbose,
-        current_func_type: FuncType {
-            name: "main".to_owned(),
-            params: Vec::new(),
-            return_type: Type::I32.into(), // TODO: I32
-            is_extern: false,
-        },
-        return_dest: None,
+        current_scope: Scope::new(),
     };
 
-    generator.build(program)?;
-
-    if verbose {
-        println!("{}", main_context.func.display());
-    }
-
-    let flags = settings::Flags::new(settings::builder());
-    if let Err(errs) = verify_function(&main_context.func, &flags) {
-        return Err(GeneratorErrors::VerifierErrors(errs.0));
-    }
-
-    module.define_function(main_id, &mut main_context).unwrap();
+    state.build(program)?;
 
     Ok(module.finish())
 }
@@ -559,37 +520,79 @@ impl Scope {
     }
 }
 
-struct Generator<'a> {
+struct GeneratorState<'a> {
     isa: std::sync::Arc<dyn isa::TargetIsa>,
-    fn_context: Context,
-    fn_builder_context: FunctionBuilderContext,
-    builder: FunctionBuilder<'a>,
     module: &'a mut ObjectModule,
     strings: usize,
     printf_id: FuncId,
     exit_id: FuncId,
-    returned: bool,
-    current_scope: Scope,
-    var_count: usize,
     verbose: bool,
+    current_scope: Scope,
+}
+
+struct FnGenerator<'a, 'ctx> {
+    state: &'ctx mut GeneratorState<'a>,
+    builder: FunctionBuilder<'ctx>,
+    var_count: usize,
     current_func_type: FuncType,
     return_dest: Option<Variable>,
 }
 
-impl Generator<'_> {
+impl GeneratorState<'_> {
     fn build(mut self, program: Program) -> Result<(), GeneratorErrors> {
-        match self.build_statements(&program.statements) {
-            Ok(returned) => {
-                if !returned {
-                    let zero = self.builder.ins().iconst(types::I32, 0);
-                    self.builder.ins().return_(&[zero]);
-                }
-                Ok(())
-            }
-            Err(errors) => Err(GeneratorErrors::CodeErrors(errors)),
-        }
-    }
+        let mut errors = Vec::new();
+        let mut found_main = false;
 
+        // Pass 1: declare all types and function signatures so forward calls resolve.
+        for item in &program.items {
+            match &item.0 {
+                TopLevelItem::FunctionDecl(decl) => {
+                    if decl.name == "main" && !decl.r#extern {
+                        found_main = true;
+                    }
+                    if let Err(mut e) = self.pre_declare_fn(decl, &item.1, true) {
+                        errors.append(&mut e);
+                    }
+                }
+                TopLevelItem::StructDecl(decl) => {
+                    if let Err(mut e) = self.build_struct_decl(decl) {
+                        errors.append(&mut e);
+                    }
+                }
+                TopLevelItem::EnumDecl(decl) => {
+                    if let Err(mut e) = self.build_enum_decl(decl) {
+                        errors.append(&mut e);
+                    }
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(GeneratorErrors::CodeErrors(errors));
+        }
+
+        if !found_main {
+            return Err(GeneratorErrors::MissingMain);
+        }
+
+        // Pass 2: build all function bodies now that every signature is in scope.
+        for item in &program.items {
+            if let TopLevelItem::FunctionDecl(decl) = &item.0 {
+                if let Err(mut e) = self.build_fn_body(decl, &item.1, true) {
+                    errors.append(&mut e);
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(GeneratorErrors::CodeErrors(errors));
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_statements(&mut self, statements: &[Spanned<Statement>]) -> Result<bool, ManyErrors> {
         let mut errors = Vec::new();
         let mut iter = statements.iter().peekable();
@@ -629,11 +632,11 @@ impl Generator<'_> {
             Statement::Binding(name, expr) => {
                 let value = self.build_expression(expr, None)?;
 
-                if self.current_scope.symbols.contains_key(name) {
+                if self.state.current_scope.symbols.contains_key(name) {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
 
-                let Some(var_type) = self.get_crane_type(&value.1) else {
+                let Some(var_type) = self.state.get_crane_type(&value.1) else {
                     return CodeError::BindingType(value.1).err(expr.1);
                 };
 
@@ -641,7 +644,7 @@ impl Generator<'_> {
                 self.builder.def_var(var, value.0);
                 self.new_var(name.to_owned(), var, value);
             }
-            Statement::Assignment(name, expr) => match self.current_scope.get_symbol(name) {
+            Statement::Assignment(name, expr) => match self.state.current_scope.get_symbol(name) {
                 LookupResult::Found(Symbol::Variable(var, var_type)) => {
                     let (var, var_type) = (*var, var_type.clone());
                     let value = self.build_expression(expr, Some(var_type.clone()))?;
@@ -665,11 +668,11 @@ impl Generator<'_> {
                 self.builder.ins().jump(new_block, []);
                 self.builder.switch_to_block(new_block);
                 self.builder.seal_block(new_block);
-                self.push_scope();
+                self.state.push_scope();
 
                 let result = self.build_statements(statements);
 
-                if self.pop_scope().is_none() {
+                if self.state.pop_scope().is_none() {
                     unreachable!("Must always be able to pop scope after leaving block.");
                 }
 
@@ -685,13 +688,13 @@ impl Generator<'_> {
             }
             Statement::While(r#while) => return self.build_while(r#while),
             Statement::FunctionDecl(decl) => {
-                return self.build_fn_decl(decl, &statement.1).map(|_| false);
+                return self.state.build_fn_decl(decl, &statement.1).map(|_| false);
             }
             Statement::StructDecl(decl) => {
-                return self.build_struct_decl(decl).map(|_| false);
+                return self.state.build_struct_decl(decl).map(|_| false);
             }
             Statement::EnumDecl(decl) => {
-                return self.build_enum_decl(decl).map(|_| false);
+                return self.state.build_enum_decl(decl).map(|_| false);
             }
         }
 
@@ -719,6 +722,7 @@ impl Generator<'_> {
             _ => {
                 // Copy primitive field
                 let crane_type = self
+                    .state
                     .get_crane_type(&struct_field.r#type)
                     .expect("Field type must be valid");
                 let value = self.builder.ins().load(
@@ -847,18 +851,21 @@ impl Generator<'_> {
                 string_data.push(0);
                 data_desc.define(string_data.into_boxed_slice());
 
-                let string_id = self.strings;
-                self.strings += 1;
+                let string_id = self.state.strings;
+                self.state.strings += 1;
                 let string_data_id = self
+                    .state
                     .module
                     .declare_data(&format!("string_{string_id}"), Linkage::Local, true, false)
                     .expect("Failed to declare string data");
 
-                self.module
+                self.state
+                    .module
                     .define_data(string_data_id, &data_desc)
                     .expect("Failed to define string data");
 
                 let format_string_ref = self
+                    .state
                     .module
                     .declare_data_in_func(string_data_id, self.builder.func);
                 let value = self
@@ -923,7 +930,7 @@ impl Generator<'_> {
                 Intrinsic::Exit => self.build_exit(span, args),
                 Intrinsic::EnumToInt => self.build_enum_to_int(span, args),
             },
-            Expression::Identifier(name) => match self.current_scope.get_symbol(name) {
+            Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
                 LookupResult::Found(Symbol::Variable(var, var_type)) => {
                     Ok((self.builder.use_var(*var), var_type.clone()))
                 }
@@ -937,7 +944,7 @@ impl Generator<'_> {
             Expression::FieldAccess(expr, field_name) => {
                 // Enum variant access
                 if let Expression::Identifier(type_name) = &expr.0 {
-                    if let Some(Type::Enum(enum_type)) = self.type_from_name(type_name) {
+                    if let Some(Type::Enum(enum_type)) = self.state.type_from_name(type_name) {
                         let Some(idx) = enum_type.variants.get_index_of(&field_name.0) else {
                             return CodeError::UnknownVariant(
                                 enum_type.name.clone(),
@@ -962,6 +969,7 @@ impl Generator<'_> {
                 };
 
                 let field_crane_type = self
+                    .state
                     .get_crane_type(&field.r#type)
                     .expect("Field type must be valid.");
 
@@ -978,7 +986,7 @@ impl Generator<'_> {
                 let mut errors = Vec::new();
                 let mut arg_values = HashMap::with_capacity(struct_init.args.len());
 
-                let r#type = self.type_from_name(&struct_init.name.0);
+                let r#type = self.state.type_from_name(&struct_init.name.0);
 
                 for arg in &struct_init.args {
                     let maybe_type = r#type
@@ -1000,7 +1008,7 @@ impl Generator<'_> {
                     }
                 }
 
-                let Some(r#type) = self.type_from_name(&struct_init.name.0) else {
+                let Some(r#type) = self.state.type_from_name(&struct_init.name.0) else {
                     errors.push(
                         CodeError::UnknownType(struct_init.name.0.clone())
                             .spanned(struct_init.name.1),
@@ -1197,15 +1205,17 @@ impl Generator<'_> {
         // Because printf is a variadic function we have to change it's signature on the fly
         // See: adjust_call_for_c_variadic() in rustc_codegen_cranelift
         let mut params = Vec::with_capacity(arg_values.len() + 1);
-        params.push(AbiParam::new(self.isa.pointer_type()));
+        params.push(AbiParam::new(self.state.isa.pointer_type()));
         params.extend(arg_values.iter().map(|(_, t)| {
-            self.get_extern_abi_param(t)
+            self.state
+                .get_extern_abi_param(t)
                 .expect("Type must be valid @print parameter.")
         }));
 
         let printf_ref = self
+            .state
             .module
-            .declare_func_in_func(self.printf_id, self.builder.func);
+            .declare_func_in_func(self.state.printf_id, self.builder.func);
 
         let sig_ref = self.builder.func.dfg.ext_funcs[printf_ref].signature;
         self.builder.func.dfg.signatures[sig_ref].params = params;
@@ -1221,24 +1231,9 @@ impl Generator<'_> {
         Ok((value, Type::I32))
     }
 
-    fn push_scope(&mut self) {
-        let old_scope = std::mem::replace(&mut self.current_scope, Scope::new());
-        self.current_scope.parent = Some(Box::new(old_scope));
-    }
-
-    fn pop_scope(&mut self) -> Option<Scope> {
-        if let Some(mut parent) = self.current_scope.parent.take() {
-            std::mem::swap(&mut self.current_scope, &mut *parent);
-            let child = parent;
-            Some(*child)
-        } else {
-            // No parent to pop to — already at root
-            None
-        }
-    }
-
     fn new_var(&mut self, name: String, var: Variable, value: (Value, Type)) {
-        self.current_scope
+        self.state
+            .current_scope
             .insert_symbol(name, Symbol::Variable(var, value.1))
             .expect("Variable must not exist.");
         self.var_count += 1;
@@ -1382,11 +1377,11 @@ impl Generator<'_> {
         &mut self,
         body: &[Spanned<Statement>],
     ) -> Result<(Value, Type), ManyErrors> {
-        self.push_scope();
+        self.state.push_scope();
 
         let result = self.build_statements(body);
 
-        let Some(_) = self.pop_scope() else {
+        let Some(_) = self.state.pop_scope() else {
             unreachable!("Must always be able to pop scope after leaving block.");
         };
 
@@ -1416,8 +1411,9 @@ impl Generator<'_> {
 
         // TODO: use abort instead of exit
         let exit_ref = self
+            .state
             .module
-            .declare_func_in_func(self.exit_id, self.builder.func);
+            .declare_func_in_func(self.state.exit_id, self.builder.func);
 
         let exit_block = self.builder.create_block();
         let continue_block = self.builder.create_block();
@@ -1453,8 +1449,9 @@ impl Generator<'_> {
         }
 
         let exit_ref = self
+            .state
             .module
-            .declare_func_in_func(self.exit_id, self.builder.func);
+            .declare_func_in_func(self.state.exit_id, self.builder.func);
 
         self.builder.ins().call(exit_ref, &[expr.0]);
         Ok((Value::from_u32(u32::MAX - 1), Type::Never))
@@ -1476,19 +1473,44 @@ impl Generator<'_> {
 
         Ok((expr.0, Type::I32))
     }
+}
 
-    fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
-        let &FunctionDecl {
+impl GeneratorState<'_> {
+    fn push_scope(&mut self) {
+        let old_scope = std::mem::replace(&mut self.current_scope, Scope::new());
+        self.current_scope.parent = Some(Box::new(old_scope));
+    }
+
+    fn pop_scope(&mut self) -> Option<Scope> {
+        if let Some(mut parent) = self.current_scope.parent.take() {
+            std::mem::swap(&mut self.current_scope, &mut *parent);
+            Some(*parent)
+        } else {
+            None
+        }
+    }
+
+    // Declare a function's signature in the module and insert it into scope.
+    // Does not build the body — call build_fn_body separately for that.
+    fn pre_declare_fn(
+        &mut self,
+        decl: &FunctionDecl,
+        span: &SimpleSpan,
+        is_top_level: bool,
+    ) -> Result<(), ManyErrors> {
+        let FunctionDecl {
             name,
             r#extern: is_extern,
             params,
             body,
             return_type,
-        } = &decl;
+        } = decl;
 
         if *is_extern {
             assert!(body.is_empty());
         }
+
+        let is_main = is_top_level && !*is_extern && name == "main";
 
         let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = Vec::new();
         let mut errors = Vec::new();
@@ -1496,6 +1518,10 @@ impl Generator<'_> {
 
         if let LookupResult::Found(_) = self.current_scope.get_symbol(name) {
             errors.push(CodeError::NameAlreadyDefined(name.to_owned()).spanned(*span));
+        }
+
+        if is_main && !params.is_empty() {
+            errors.push(CodeError::MainHasParams.spanned(*span));
         }
 
         for Param { name, type_name } in params {
@@ -1525,12 +1551,30 @@ impl Generator<'_> {
             return Err(errors);
         }
 
-        let return_type = match return_type {
+        let declared_return_type = match return_type {
             Some(type_name) => self
                 .type_from_name(&type_name.0)
                 .ok_or(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1))?,
             None => Type::Void,
         };
+
+        // fn main must return i32 (or have no return annotation, implying i32 with return 0).
+        let (return_type, _main_implicit_zero) = if is_main {
+            match &declared_return_type {
+                Type::Void => (Type::I32, true),
+                Type::I32 => (Type::I32, false),
+                other => {
+                    errors.push(CodeError::MainInvalidReturnType(other.clone()).spanned(*span));
+                    (Type::I32, false)
+                }
+            }
+        } else {
+            (declared_return_type, false)
+        };
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
 
         if return_type.size() > 8 {
             todo!("Return values larger than 8 bytes.")
@@ -1585,6 +1629,8 @@ impl Generator<'_> {
 
         let linkage = if *is_extern {
             Linkage::Import
+        } else if is_main {
+            Linkage::Export
         } else {
             Linkage::Local
         };
@@ -1601,6 +1647,82 @@ impl Generator<'_> {
             )
             .expect("Must not overwrite symbol");
 
+        Ok(())
+    }
+
+    // Build a function's body. The function must already be pre-declared in scope via pre_declare_fn.
+    fn build_fn_body(
+        &mut self,
+        decl: &FunctionDecl,
+        span: &SimpleSpan,
+        is_top_level: bool,
+    ) -> Result<(), ManyErrors> {
+        if decl.r#extern {
+            return Ok(());
+        }
+
+        let FunctionDecl {
+            name,
+            params,
+            body,
+            return_type,
+            ..
+        } = decl;
+        let is_main = is_top_level && name == "main";
+        let main_implicit_zero = is_main && return_type.is_none();
+
+        let (func_id, func_type) = self
+            .current_scope
+            .get_function(name)
+            .map(|(id, ft)| (id, ft.clone()))
+            .expect("Function must be pre-declared before building its body");
+
+        // Reconstruct fn_params from decl names + func_type resolved types.
+        let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = params
+            .iter()
+            .zip(func_type.params.iter())
+            .map(|(param, param_type)| {
+                // is_extern is always false here, so purpose is always Normal
+                (
+                    param.name.0.clone(),
+                    param_type.clone(),
+                    ArgumentPurpose::Normal,
+                )
+            })
+            .collect();
+
+        // Add implicit @return_addr parameter for struct return values.
+        if let Type::Struct(_) = &*func_type.return_type {
+            fn_params.push((
+                "@return_addr".to_owned(),
+                (*func_type.return_type).clone(),
+                ArgumentPurpose::StructReturn,
+            ));
+        }
+
+        // Reconstruct the signature (must match what was declared in pre_declare_fn).
+        let returns = match &*func_type.return_type {
+            Type::Void | Type::Never | Type::Struct(_) => Vec::new(),
+            return_type => vec![
+                self.get_extern_abi_param(return_type)
+                    .expect("Return type must be valid."),
+            ],
+        };
+        let signature = Signature {
+            call_conv: self.isa.default_call_conv(),
+            params: fn_params
+                .iter()
+                .map(|(_, r#type, purpose)| {
+                    let mut abi_param: AbiParam = self
+                        .get_abi_param(r#type)
+                        .expect("Param type must be valid.");
+                    abi_param.purpose = *purpose;
+                    abi_param
+                })
+                .collect(),
+            returns,
+        };
+
         let mut fn_context = Context::new();
         let mut fn_builder_context = FunctionBuilderContext::new();
         let mut fn_builder = FunctionBuilder::new(&mut fn_context.func, &mut fn_builder_context);
@@ -1612,79 +1734,82 @@ impl Generator<'_> {
         fn_builder.switch_to_block(entry_block);
         fn_builder.seal_block(entry_block);
 
-        if !*is_extern {
-            let mut fn_generator = Generator {
-                isa: self.isa.clone(),
-                fn_context: Context::new(), // This won't be used for the function itself
-                fn_builder_context: FunctionBuilderContext::new(), // This won't be used either
-                builder: fn_builder,
-                module: self.module,
-                strings: self.strings, // Share string counter
-                printf_id: self.printf_id,
-                exit_id: self.exit_id,
-                returned: false,
-                current_scope: std::mem::replace(&mut self.current_scope, Scope::new())
-                    .function_scope(),
-                var_count: 0,
-                verbose: self.verbose,
-                current_func_type: func_type.clone(),
-                return_dest: None,
-            };
+        let mut errors = Vec::new();
 
-            for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
-                let param_value = fn_generator.builder.block_params(entry_block)[i];
+        // Move current scope into a child function scope.
+        let outer_scope = std::mem::replace(&mut self.current_scope, Scope::new());
+        self.current_scope = outer_scope.function_scope();
 
-                let var_type = if *is_extern {
-                    fn_generator.get_extern_abi_param(param_type)
-                } else {
-                    fn_generator.get_abi_param(param_type)
-                }
+        let mut fn_generator = FnGenerator {
+            state: self,
+            builder: fn_builder,
+            var_count: 0,
+            current_func_type: func_type.clone(),
+            return_dest: None,
+        };
+
+        for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
+            let param_value = fn_generator.builder.block_params(entry_block)[i];
+
+            let var_type = fn_generator
+                .state
+                .get_abi_param(param_type)
                 .expect("Parameter type should be valid");
 
-                let var = fn_generator.builder.declare_var(var_type.value_type);
-                fn_generator.builder.def_var(var, param_value);
-                fn_generator.new_var(param_name.clone(), var, (param_value, param_type.clone()));
+            let var = fn_generator.builder.declare_var(var_type.value_type);
+            fn_generator.builder.def_var(var, param_value);
+            fn_generator.new_var(param_name.clone(), var, (param_value, param_type.clone()));
 
-                if *purpose == ArgumentPurpose::StructReturn {
-                    debug_assert!(fn_generator.return_dest.is_none());
-                    fn_generator.return_dest = Some(var);
-                }
-            }
-
-            match fn_generator.build_statements(body) {
-                Err(mut new_errors) => {
-                    errors.append(&mut new_errors);
-                }
-                Ok(false) if *func_type.return_type == Type::Void => {
-                    fn_generator.builder.ins().return_(&[]);
-                }
-                Ok(false) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
-                Ok(true) => {}
-            }
-
-            self.strings = fn_generator.strings;
-            self.current_scope = *fn_generator
-                .current_scope
-                .parent
-                .take()
-                .expect("fn scope must have parent");
-
-            if self.verbose {
-                println!("{}", fn_generator.builder.func.display());
+            if *purpose == ArgumentPurpose::StructReturn {
+                debug_assert!(fn_generator.return_dest.is_none());
+                fn_generator.return_dest = Some(var);
             }
         }
+
+        match fn_generator.build_statements(body) {
+            Err(mut new_errors) => {
+                errors.append(&mut new_errors);
+            }
+            Ok(false) if *func_type.return_type == Type::Void => {
+                fn_generator.builder.ins().return_(&[]);
+            }
+            Ok(false) if main_implicit_zero => {
+                let zero = fn_generator.builder.ins().iconst(types::I32, 0);
+                fn_generator.builder.ins().return_(&[zero]);
+            }
+            Ok(false) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
+            Ok(true) => {}
+        }
+
+        if fn_generator.state.verbose {
+            println!("{}", fn_generator.builder.func.display());
+        }
+
+        // fn_generator dropped here, releasing the &mut self borrow.
+        drop(fn_generator);
+
+        // Restore the outer scope from the function scope's parent.
+        self.current_scope = *self
+            .current_scope
+            .parent
+            .take()
+            .expect("fn scope must have parent");
 
         if !errors.is_empty() {
             return Err(errors);
         }
 
-        if !*is_extern {
-            self.module
-                .define_function(func_id, &mut fn_context)
-                .unwrap();
-        }
+        self.module
+            .define_function(func_id, &mut fn_context)
+            .unwrap();
 
         Ok(())
+    }
+
+    // Used for nested function declarations inside function bodies (single-pass is fine there).
+    fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
+        self.pre_declare_fn(decl, span, false)?;
+        self.build_fn_body(decl, span, false)
     }
 
     fn type_from_name(&self, type_name: &str) -> Option<Type> {
@@ -1705,7 +1830,9 @@ impl Generator<'_> {
             name => return self.current_scope.get_type(name).cloned(),
         })
     }
+}
 
+impl FnGenerator<'_, '_> {
     fn build_fn_call(
         &mut self,
         name: &Spanned<String>,
@@ -1713,6 +1840,7 @@ impl Generator<'_> {
         span: &SimpleSpan,
     ) -> Result<(Value, Type), ManyErrors> {
         let Some((func_id, func_type)) = self
+            .state
             .current_scope
             .get_function(&name.0)
             .map(|(id, ft)| (id, ft.clone()))
@@ -1762,7 +1890,10 @@ impl Generator<'_> {
             arg_values.push(struct_addr);
         }
 
-        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+        let func_ref = self
+            .state
+            .module
+            .declare_func_in_func(func_id, self.builder.func);
         let inst = self.builder.ins().call(func_ref, &arg_values);
         match self.builder.inst_results(inst) {
             // Struct return
@@ -1778,7 +1909,9 @@ impl Generator<'_> {
             _ => panic!("Invalid number of return values. Must be 0 or 1."),
         }
     }
+}
 
+impl GeneratorState<'_> {
     fn build_struct_decl(&mut self, decl: &StructDecl) -> Result<(), ManyErrors> {
         let mut errors = Vec::new();
 

@@ -1,3 +1,12 @@
+fn main() {
+    hallo("Hello world.", 10);
+    halloAlso();
+
+    @assert(applyTwice(3) == 12);
+    @assert(applyTwice(0) == 0);
+    @assert(applyTwice(1) == 4);
+}
+
 fn hallo(test: string, number: i32) {
     @print("%s ", test);
     @println("%d", number);
@@ -7,9 +16,6 @@ fn halloAlso() {
    @println("Hello from me too.");
 }
 
-hallo("Hello world.", 10);
-halloAlso();
-
 // nested function: inner is only visible inside outer
 fn applyTwice(x: i32) : i32 {
     fn double(n: i32) : i32 {
@@ -17,7 +23,3 @@ fn applyTwice(x: i32) : i32 {
     }
     return double(double(x));
 }
-
-@assert(applyTwice(3) == 12);
-@assert(applyTwice(0) == 0);
-@assert(applyTwice(1) == 4);

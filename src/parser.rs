@@ -5,7 +5,14 @@ use chumsky::{input::ValueInput, prelude::*};
 
 #[derive(Clone, Debug)]
 pub struct Program {
-    pub statements: Vec<Spanned<Statement>>,
+    pub items: Vec<Spanned<TopLevelItem>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TopLevelItem {
+    FunctionDecl(FunctionDecl),
+    StructDecl(StructDecl),
+    EnumDecl(EnumDecl),
 }
 
 #[derive(Debug, Clone)]
@@ -154,8 +161,8 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 10] = [
-    "let", "return", "if", "else", "true", "false", "fn", "struct", "enum", "extern",
+const KEY_WORDS: [&str; 11] = [
+    "let", "return", "if", "else", "while", "true", "false", "fn", "struct", "enum", "extern",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -341,33 +348,33 @@ where
     .collect()
     .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
-    let extern_function_decl = just(Token::Id("extern"))
-        .ignore_then(just(Token::Id("fn")))
-        .ignore_then(identifier)
-        .then(decl_params.clone())
-        .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
-        .then_ignore(just(Token::Semicolon))
-        .map(|((name, params), return_type)| FunctionDecl {
-            name: name.to_owned(),
-            r#extern: true,
-            params,
-            body: Vec::new(),
-            return_type,
-        });
-
-    let function_decl = just(Token::Id("fn"))
-        .ignore_then(identifier)
-        .then(decl_params)
-        .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
-        .then(block.clone())
-        .map(|(((name, params), return_type), body)| FunctionDecl {
-            name: name.to_owned(),
-            r#extern: false,
-            params,
-            body,
-            return_type,
-        })
-        .or(extern_function_decl);
+    let function_decl = choice((
+        just(Token::Id("fn"))
+            .ignore_then(identifier)
+            .then(decl_params.clone())
+            .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
+            .then(block.clone())
+            .map(|(((name, params), return_type), body)| FunctionDecl {
+                name: name.to_owned(),
+                r#extern: false,
+                params,
+                body,
+                return_type,
+            }),
+        just(Token::Id("extern"))
+            .ignore_then(just(Token::Id("fn")))
+            .ignore_then(identifier)
+            .then(decl_params)
+            .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
+            .then_ignore(just(Token::Semicolon))
+            .map(|((name, params), return_type)| FunctionDecl {
+                name: name.to_owned(),
+                r#extern: true,
+                params,
+                body: Vec::new(),
+                return_type,
+            }),
+    ));
 
     let struct_decl = just(Token::Id("struct"))
         .ignore_then(identifier_spanned)
@@ -380,12 +387,7 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
         )
-        .map_with(|(name, fields), extra| {
-            Spanned(
-                Statement::StructDecl(StructDecl { name, fields }),
-                extra.span(),
-            )
-        });
+        .map(|(name, fields)| StructDecl { name, fields });
 
     let enum_decl = just(Token::Id("enum"))
         .ignore_then(identifier_spanned)
@@ -396,12 +398,7 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
         )
-        .map_with(|(name, variants), extra| {
-            Spanned(
-                Statement::EnumDecl(EnumDecl { name, variants }),
-                extra.span(),
-            )
-        });
+        .map(|(name, variants)| EnumDecl { name, variants });
 
     let else_block = just(Token::Id("else")).ignore_then(block.clone());
 
@@ -487,13 +484,26 @@ where
             while_statement,
             block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())),
             function_decl
+                .clone()
                 .map_with(|decl, extra| Spanned(Statement::FunctionDecl(decl), extra.span())),
-            struct_decl,
-            enum_decl,
+            struct_decl
+                .clone()
+                .map_with(|decl, extra| Spanned(Statement::StructDecl(decl), extra.span())),
+            enum_decl
+                .clone()
+                .map_with(|decl, extra| Spanned(Statement::EnumDecl(decl), extra.span())),
         ))),
     );
 
-    let program = statement.repeated().collect::<Vec<_>>();
+    let top_level_item = choice((
+        function_decl
+            .map_with(|decl, extra| Spanned(TopLevelItem::FunctionDecl(decl), extra.span())),
+        struct_decl.map_with(|decl, extra| Spanned(TopLevelItem::StructDecl(decl), extra.span())),
+        enum_decl.map_with(|decl, extra| Spanned(TopLevelItem::EnumDecl(decl), extra.span())),
+    ));
 
-    program.map(|statements| Program { statements })
+    top_level_item
+        .repeated()
+        .collect::<Vec<_>>()
+        .map(|items| Program { items })
 }

@@ -1,7 +1,9 @@
 /// EXIT_CODE=100
 
-@assert(69 == 20 * 3 + 9);
+fn main() {
+    @assert(69 == 20 * 3 + 9);
 
-@assert(true);
+    @assert(true);
 
-@exit(100);
+    @exit(100);
+}

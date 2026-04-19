@@ -1,3 +1,5 @@
 extern fn hello_rust();
 
-hello_rust();
+fn main() {
+    hello_rust();
+}
