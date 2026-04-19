@@ -22,3 +22,15 @@ printVec(c);
 
 @assert(0 == c.x);
 @assert(-4 == c.y);
+
+// struct declared inside a function scope
+fn sumComponents() : i32 {
+    struct Pair {
+        a: i32;
+        b: i32;
+    }
+    let p = Pair {a: 10, b: 32};
+    return p.a + p.b;
+}
+
+@assert(sumComponents() == 42);

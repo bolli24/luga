@@ -19,6 +19,8 @@ pub enum Token<'a> {
     Slash,
     #[token("!")]
     Bang,
+    #[token("!=")]
+    BangEqual,
 
     #[token("=")]
     Equal,
@@ -134,6 +136,7 @@ impl Display for Token<'_> {
             Self::Star => write!(f, "*"),
             Self::Slash => write!(f, "/"),
             Self::Bang => write!(f, "!"),
+            Self::BangEqual => write!(f, "!="),
             Self::Equal => write!(f, "="),
             Self::EqualEqual => write!(f, "=="),
             Self::Lt => write!(f, "<"),

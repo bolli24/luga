@@ -1,0 +1,65 @@
+enum Direction {
+    Up, Down, Left, Right,
+}
+
+enum Color {
+    Red, Green, Blue,
+}
+
+// index values are 0-based in declaration order
+let up    = Direction.Up;
+let down  = Direction.Down;
+let left  = Direction.Left;
+let right = Direction.Right;
+
+@assert(@enumToInt(up)    == 0);
+@assert(@enumToInt(down)  == 1);
+@assert(@enumToInt(left)  == 2);
+@assert(@enumToInt(right) == 3);
+
+@assert(up    == Direction.Up);
+@assert(down  == Direction.Down);
+@assert(left  == Direction.Left);
+@assert(right == Direction.Right);
+
+@assert(up != down);
+@assert(left != right);
+@assert(up != right);
+@assert(!(up != up));
+
+// assignment and reassignment
+let dir = Direction.Left;
+@assert(dir == Direction.Left);
+dir = Direction.Right;
+@assert(dir == Direction.Right);
+
+// passing enum to a function
+fn isRed(c: Color) : bool {
+    return c == Color.Red;
+}
+
+@assert(isRed(Color.Red));
+@assert(!isRed(Color.Green));
+@assert(!isRed(Color.Blue));
+
+// enum in a conditional
+fn dirName(d: Direction) : string {
+    if (d == Direction.Up)   { return "up"; }
+    if (d == Direction.Down) { return "down"; }
+    if (d == Direction.Left) { return "left"; }
+    return "right";
+}
+
+@println("dirName(Up):    %s", dirName(Direction.Up));
+@println("dirName(Right): %s", dirName(Direction.Right));
+
+// enum declared inside a function scope
+fn classifyColor(c: Color) : i32 {
+    enum Warmth { Cool, Warm, }
+    let w = Warmth.Warm;
+    if (c == Color.Blue) { w = Warmth.Cool; }
+    return @enumToInt(w);
+}
+
+@assert(classifyColor(Color.Red)  == 1);
+@assert(classifyColor(Color.Blue) == 0);

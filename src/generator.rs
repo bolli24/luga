@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-};
+use std::{collections::HashMap, fmt::Display};
 
 use chumsky::span::{SimpleSpan, Span};
 use cranelift::{
@@ -10,8 +7,9 @@ use cranelift::{
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::{isa::CallConv, *},
 };
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
+use crate::parser::EnumDecl;
 use crate::{
     parser::{
         BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
@@ -45,6 +43,8 @@ pub enum CodeError {
     IntrinsicArgumentCount(&'static str, usize, usize),
     #[error("Intrisic '@{}' invoked with wrong argument type. Expected one of '{}' but found '{}'.", .0, join(.1), .2)]
     IntrisicArgumentType(&'static str, &'static [Type], Type),
+    #[error("Intrinsic '@{}' expected an enum type but found '{}'.", .0, .1)]
+    IntrinsicExpectedEnum(&'static str, Type),
 
     #[error("Expected string literal.")]
     ExpectedStringLiteral,
@@ -57,6 +57,8 @@ pub enum CodeError {
     AssignmentIncompatibleTypes(Type, Type),
     #[error("Can't create variable of type '{}'.", .0)]
     BindingType(Type),
+    #[error("Can't capture variable '{0}' outside of function scope")]
+    Capture(String),
 
     #[error("Invalid type '{}' for condition. Must be 'bool'.", .0)]
     InvalidConditionType(Type),
@@ -74,6 +76,8 @@ pub enum CodeError {
     FunctionParamDuplicate(String),
     #[error("Function '{}' already declared.", .0)]
     FunctionRedeclaration(String),
+    #[error("Name '{}' already defined.", .0)]
+    NameAlreadyDefined(String),
     #[error("Call to unknown function '{}'.", .0)]
     UnknownFunction(String),
     #[error("Function '{}' called with wrong number of arguments. Expected {} but found {}.", .0, .1, .2)]
@@ -85,11 +89,7 @@ pub enum CodeError {
     UnreachableStatement,
     #[error("Function does not return on all code paths.")]
     MissingReturnStatement,
-    #[error("Must declare function in top level scope.")]
-    FunctionDeclNotTopLevel,
 
-    #[error("Must declare function in top level scope.")]
-    StructDeclNotTopLevel,
     #[error("Struct field '{}' already declared.", .0)]
     StructDuplicateField(String),
     #[error("Type '{}' has no field named '{}'.", .0, .1)]
@@ -102,6 +102,13 @@ pub enum CodeError {
     StructInitMissingArg(String),
     #[error("Invalid type for field initialization. Expected '{}' but found '{}'.", .0, .1)]
     StructInitInvalidType(Type, Type),
+
+    #[error("Enum variant '{}' already declared.", .0)]
+    EnumDuplicateVariant(String),
+    #[error("Type '{}' cannot be used as a value.", .0)]
+    TypeUsedAsValue(String),
+    #[error("Enum '{}' has no variant named '{}'.", .0, .1)]
+    UnknownVariant(String, String),
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -143,7 +150,7 @@ pub enum Type {
     Bool,
     Fn(FuncType),
     Struct(StructType),
-    // TODO: Named(String),
+    Enum(EnumType),
 }
 
 impl Type {
@@ -160,6 +167,7 @@ impl Type {
             Self::Bool => 1,
             Self::Fn(_) => 0,
             Self::Struct(struct_type) => struct_type.size(),
+            Self::Enum(_) => Self::U32.size(),
         }
     }
 
@@ -176,6 +184,7 @@ impl Type {
             Self::Bool => 0,
             Self::Fn(_) => 0,
             Self::Struct(struct_type) => struct_type.align_shift(),
+            Self::Enum(_) => Self::U32.align_shift(),
         }
     }
 
@@ -264,6 +273,12 @@ pub struct StructField {
     offset: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumType {
+    pub name: String,
+    pub variants: IndexSet<String>,
+}
+
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -283,6 +298,7 @@ impl Display for Type {
             Self::Bool => write!(f, "bool"),
             Self::Fn(func_type) => write!(f, "{func_type}"),
             Self::Struct(struct_type) => write!(f, "{struct_type}"),
+            Self::Enum(enum_type) => write!(f, "{enum_type}"),
         }
     }
 }
@@ -313,6 +329,21 @@ impl Display for StructType {
             self.fields
                 .iter()
                 .map(|field| { format!("{}@{}: {}", field.0, field.1.offset, field.1.r#type) })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+}
+
+impl Display for EnumType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "enum {} {{ {} }}",
+            self.name,
+            self.variants
+                .iter()
+                .map(|variant| variant.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
         )
@@ -427,7 +458,6 @@ pub fn generate(
             is_extern: false,
         },
         return_dest: None,
-        new_types: HashMap::new(),
     };
 
     generator.build(program)?;
@@ -449,65 +479,82 @@ pub fn generate(
 type ManyErrors = Vec<Spanned<CodeError>>;
 
 struct Scope {
-    vars_name: HashMap<String, (Variable, Type)>,
-    vars: HashSet<usize>,
+    symbols: HashMap<String, Symbol>,
     parent: Option<Box<Scope>>,
-    functions: HashMap<String, (FuncId, FuncType)>,
+    is_function_boundary: bool,
+}
+
+#[derive(Clone)]
+pub enum Symbol {
+    Variable(Variable, Type),
+    Function(FuncId, FuncType),
+    Type(Type),
+}
+
+pub enum LookupResult<'a> {
+    Found(&'a Symbol),
+    CaptureError,
+    NotFound,
 }
 
 impl Scope {
     pub fn new() -> Self {
         Self {
-            vars_name: HashMap::new(),
-            vars: HashSet::new(),
+            symbols: HashMap::new(),
             parent: None,
-            functions: HashMap::new(),
+            is_function_boundary: false,
         }
     }
 
-    pub fn function_scope(&self) -> Self {
-        let mut new_scope = Self::new();
-        new_scope.functions = self.functions.clone();
-        new_scope
+    pub fn function_scope(self) -> Self {
+        Self {
+            symbols: HashMap::new(),
+            parent: Some(Box::new(self)),
+            is_function_boundary: true,
+        }
     }
 
-    pub fn get_var(&self, name: &str) -> Option<&(Variable, Type)> {
-        self.vars_name
-            .get(name)
-            .or_else(|| self.parent.as_ref()?.get_var(name))
+    pub fn get_symbol(&self, name: &str) -> LookupResult<'_> {
+        self.get_symbol_inner(name, false)
     }
 
-    pub fn insert(&mut self, name: String, var: Variable, value: (Value, Type)) -> Result<(), ()> {
+    fn get_symbol_inner(&self, name: &str, crossed_boundary: bool) -> LookupResult<'_> {
+        match self.symbols.get(name) {
+            Some(Symbol::Variable(..)) if crossed_boundary => return LookupResult::CaptureError,
+            Some(s) => return LookupResult::Found(s),
+            None => {}
+        }
+        match self.parent.as_ref() {
+            None => LookupResult::NotFound,
+            Some(parent) => {
+                parent.get_symbol_inner(name, crossed_boundary || self.is_function_boundary)
+            }
+        }
+    }
+
+    pub fn insert_symbol(&mut self, name: String, symbol: Symbol) -> Result<(), ()> {
         use std::collections::hash_map::Entry;
 
-        match self.vars_name.entry(name) {
+        match self.symbols.entry(name) {
             Entry::Vacant(entry) => {
-                entry.insert((var, value.1));
-                self.vars.insert(var.index());
+                entry.insert(symbol);
                 Ok(())
             }
             Entry::Occupied(_) => Err(()),
         }
     }
 
-    pub fn get_func(&self, name: &str) -> Option<&(FuncId, FuncType)> {
-        self.functions
-            .get(name)
-            .or_else(|| self.parent.as_ref()?.get_func(name))
+    pub fn get_function(&self, name: &str) -> Option<(FuncId, &FuncType)> {
+        match self.get_symbol(name) {
+            LookupResult::Found(Symbol::Function(id, ft)) => Some((*id, ft)),
+            _ => None,
+        }
     }
 
-    #[must_use]
-    pub fn insert_func(
-        &mut self,
-        name: String,
-        func_id: FuncId,
-        func_type: FuncType,
-    ) -> Option<()> {
-        if self.parent.is_some() {
-            None 
-        } else {
-            self.functions.insert(name, (func_id, func_type));
-            Some(())
+    pub fn get_type(&self, name: &str) -> Option<&Type> {
+        match self.get_symbol(name) {
+            LookupResult::Found(Symbol::Type(t)) => Some(t),
+            _ => None,
         }
     }
 }
@@ -527,7 +574,6 @@ struct Generator<'a> {
     verbose: bool,
     current_func_type: FuncType,
     return_dest: Option<Variable>,
-    new_types: HashMap<String, StructType>,
 }
 
 impl Generator<'_> {
@@ -583,7 +629,7 @@ impl Generator<'_> {
             Statement::Binding(name, expr) => {
                 let value = self.build_expression(expr, None)?;
 
-                if self.current_scope.vars_name.contains_key(name) {
+                if self.current_scope.symbols.contains_key(name) {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
 
@@ -595,20 +641,25 @@ impl Generator<'_> {
                 self.builder.def_var(var, value.0);
                 self.new_var(name.to_owned(), var, value);
             }
-            Statement::Assignment(name, expr) => {
-                if let Some((var, var_type)) = self.current_scope.get_var(name).cloned() {
+            Statement::Assignment(name, expr) => match self.current_scope.get_symbol(name) {
+                LookupResult::Found(Symbol::Variable(var, var_type)) => {
+                    let (var, var_type) = (*var, var_type.clone());
                     let value = self.build_expression(expr, Some(var_type.clone()))?;
 
                     if value.1 != var_type {
-                        return CodeError::AssignmentIncompatibleTypes(var_type.clone(), value.1)
+                        return CodeError::AssignmentIncompatibleTypes(var_type, value.1)
                             .err(statement.1);
                     }
 
                     self.builder.def_var(var, value.0);
-                } else {
+                }
+                LookupResult::CaptureError => {
+                    return CodeError::Capture(name.clone()).err(statement.1);
+                }
+                _ => {
                     return CodeError::UnknownVariable(name.clone()).err(statement.1);
                 }
-            }
+            },
             Statement::Block(statements) => {
                 let new_block = self.builder.create_block();
                 self.builder.ins().jump(new_block, []);
@@ -637,7 +688,10 @@ impl Generator<'_> {
                 return self.build_fn_decl(decl, &statement.1).map(|_| false);
             }
             Statement::StructDecl(decl) => {
-                return self.build_struct_decl(decl, &statement.1).map(|_| false);
+                return self.build_struct_decl(decl).map(|_| false);
+            }
+            Statement::EnumDecl(decl) => {
+                return self.build_enum_decl(decl).map(|_| false);
             }
         }
 
@@ -834,6 +888,20 @@ impl Generator<'_> {
                         self.build_float_bin_op(*op, x_value.0, y_value.0, x_value.1)
                     }
                     Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
+                    Type::Enum(enum_type) if matches!(*op, BinOp::Equal | BinOp::NotEqual) => {
+                        let result = if enum_type.variants.len() <= 1 {
+                            let always = if *op == BinOp::Equal { 1 } else { 0 };
+                            self.builder.ins().iconst(types::I8, always)
+                        } else {
+                            let cc = if *op == BinOp::Equal {
+                                IntCC::Equal
+                            } else {
+                                IntCC::NotEqual
+                            };
+                            self.builder.ins().icmp(cc, x_value.0, y_value.0)
+                        };
+                        Some((result, Type::Bool))
+                    }
                     _ => None,
                 }
                 .ok_or_else(|| CodeError::InvalidBinOpType(*op, y_value.1).spanned(*span))?;
@@ -853,17 +921,37 @@ impl Generator<'_> {
                 Intrinsic::Println => self.build_printf(span, args, true),
                 Intrinsic::Assert => self.build_assert(span, args),
                 Intrinsic::Exit => self.build_exit(span, args),
+                Intrinsic::EnumToInt => self.build_enum_to_int(span, args),
             },
-            Expression::Identifier(name) => {
-                let Some((var, var_type)) = self.current_scope.get_var(name) else {
-                    return CodeError::UnknownVariable(name.to_owned()).err(*span);
-                };
-
-                Ok((self.builder.use_var(*var), var_type.clone()))
-            }
+            Expression::Identifier(name) => match self.current_scope.get_symbol(name) {
+                LookupResult::Found(Symbol::Variable(var, var_type)) => {
+                    Ok((self.builder.use_var(*var), var_type.clone()))
+                }
+                LookupResult::Found(Symbol::Function(..) | Symbol::Type(_)) => {
+                    CodeError::TypeUsedAsValue(name.clone()).err(*span)
+                }
+                LookupResult::CaptureError => CodeError::Capture(name.clone()).err(*span),
+                LookupResult::NotFound => CodeError::UnknownVariable(name.clone()).err(*span),
+            },
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
-            Expression::FieldAccess(expr, name) => {
+            Expression::FieldAccess(expr, field_name) => {
+                // Enum variant access
+                if let Expression::Identifier(type_name) = &expr.0 {
+                    if let Some(Type::Enum(enum_type)) = self.type_from_name(type_name) {
+                        let Some(idx) = enum_type.variants.get_index_of(&field_name.0) else {
+                            return CodeError::UnknownVariant(
+                                enum_type.name.clone(),
+                                field_name.0.clone(),
+                            )
+                            .err(field_name.1);
+                        };
+                        let val = self.builder.ins().iconst(types::I32, idx as i64);
+                        return Ok((val, Type::Enum(enum_type)));
+                    }
+                }
+
                 let expr_value = self.build_expression(expr, None)?;
+                let name = field_name;
                 let field = match &expr_value.1 {
                     Type::Struct(struct_type) if struct_type.fields.contains_key(&name.0) => {
                         &struct_type.fields[&name.0]
@@ -988,6 +1076,7 @@ impl Generator<'_> {
                 BinOp::Mul => self.builder.ins().imul(x, y),
                 BinOp::Div => self.builder.ins().sdiv(x, y),
                 BinOp::Equal => self.builder.ins().icmp(IntCC::Equal, x, y),
+                BinOp::NotEqual => self.builder.ins().icmp(IntCC::NotEqual, x, y),
                 BinOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, x, y),
                 BinOp::Gt => self.builder.ins().icmp(IntCC::SignedGreaterThan, x, y),
                 BinOp::Lte => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, x, y),
@@ -998,7 +1087,12 @@ impl Generator<'_> {
             },
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => r#type,
-                BinOp::Equal | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => Type::Bool,
+                BinOp::Equal
+                | BinOp::NotEqual
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Lte
+                | BinOp::Gte => Type::Bool,
             },
         ))
     }
@@ -1018,6 +1112,7 @@ impl Generator<'_> {
                 BinOp::Mul => self.builder.ins().fmul(x, y),
                 BinOp::Div => self.builder.ins().fdiv(x, y),
                 BinOp::Equal => self.builder.ins().fcmp(FloatCC::Equal, x, y),
+                BinOp::NotEqual => self.builder.ins().fcmp(FloatCC::NotEqual, x, y),
                 BinOp::Lt => self.builder.ins().fcmp(FloatCC::LessThan, x, y),
                 BinOp::Gt => self.builder.ins().fcmp(FloatCC::GreaterThan, x, y),
                 BinOp::Lte => self.builder.ins().fcmp(FloatCC::LessThanOrEqual, x, y),
@@ -1025,7 +1120,12 @@ impl Generator<'_> {
             },
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => r#type,
-                BinOp::Equal | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => Type::Bool,
+                BinOp::Equal
+                | BinOp::NotEqual
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Lte
+                | BinOp::Gte => Type::Bool,
             },
         ))
     }
@@ -1034,6 +1134,7 @@ impl Generator<'_> {
     fn build_bool_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
         Some(match op {
             BinOp::Equal => (self.builder.ins().icmp(IntCC::Equal, x, y), Type::Bool),
+            BinOp::NotEqual => (self.builder.ins().icmp(IntCC::NotEqual, x, y), Type::Bool),
             _ => return None,
         })
     }
@@ -1076,7 +1177,7 @@ impl Generator<'_> {
                         Type::Bool,
                         Type::String,
                     ];
-                    if !PRINT_ARG_TYPES.contains(&value.1) {
+                    if !PRINT_ARG_TYPES.contains(&value.1) && !matches!(value.1, Type::Enum(_)) {
                         return CodeError::IntrisicArgumentType(
                             "print",
                             &PRINT_ARG_TYPES,
@@ -1138,7 +1239,7 @@ impl Generator<'_> {
 
     fn new_var(&mut self, name: String, var: Variable, value: (Value, Type)) {
         self.current_scope
-            .insert(name, var, value)
+            .insert_symbol(name, Symbol::Variable(var, value.1))
             .expect("Variable must not exist.");
         self.var_count += 1;
     }
@@ -1359,6 +1460,23 @@ impl Generator<'_> {
         Ok((Value::from_u32(u32::MAX - 1), Type::Never))
     }
 
+    fn build_enum_to_int(
+        &mut self,
+        span: &SimpleSpan,
+        args: &[Spanned<Expression>],
+    ) -> Result<(Value, Type), ManyErrors> {
+        if args.len() != 1 {
+            return CodeError::IntrinsicArgumentCount("enumToInt", 1, args.len()).err(*span);
+        }
+
+        let expr = self.build_expression(&args[0], None)?;
+        if !matches!(expr.1, Type::Enum(_)) {
+            return CodeError::IntrinsicExpectedEnum("enumToInt", expr.1).err(args[0].1);
+        }
+
+        Ok((expr.0, Type::I32))
+    }
+
     fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
         let &FunctionDecl {
             name,
@@ -1376,8 +1494,8 @@ impl Generator<'_> {
         let mut errors = Vec::new();
         let mut param_types = Vec::new();
 
-        if self.current_scope.get_func(name).is_some() {
-            errors.push(CodeError::FunctionRedeclaration(name.to_owned()).spanned(*span));
+        if let LookupResult::Found(_) = self.current_scope.get_symbol(name) {
+            errors.push(CodeError::NameAlreadyDefined(name.to_owned()).spanned(*span));
         }
 
         for Param { name, type_name } in params {
@@ -1477,8 +1595,11 @@ impl Generator<'_> {
             .expect("Function must be declarable.");
 
         self.current_scope
-            .insert_func(name.to_owned(), func_id, func_type.clone())
-            .ok_or(CodeError::FunctionDeclNotTopLevel.spanned(*span))?;
+            .insert_symbol(
+                name.to_owned(),
+                Symbol::Function(func_id, func_type.clone()),
+            )
+            .expect("Must not overwrite symbol");
 
         let mut fn_context = Context::new();
         let mut fn_builder_context = FunctionBuilderContext::new();
@@ -1502,11 +1623,11 @@ impl Generator<'_> {
                 printf_id: self.printf_id,
                 exit_id: self.exit_id,
                 returned: false,
-                current_scope: self.current_scope.function_scope(),
+                current_scope: std::mem::replace(&mut self.current_scope, Scope::new())
+                    .function_scope(),
                 var_count: 0,
                 verbose: self.verbose,
                 current_func_type: func_type.clone(),
-                new_types: self.new_types.clone(),
                 return_dest: None,
             };
 
@@ -1542,6 +1663,11 @@ impl Generator<'_> {
             }
 
             self.strings = fn_generator.strings;
+            self.current_scope = *fn_generator
+                .current_scope
+                .parent
+                .take()
+                .expect("fn scope must have parent");
 
             if self.verbose {
                 println!("{}", fn_generator.builder.func.display());
@@ -1576,12 +1702,7 @@ impl Generator<'_> {
             "bool" => Type::Bool,
             "string" => Type::String,
             "void" => Type::Void,
-            name => {
-                return self
-                    .new_types
-                    .get(name)
-                    .map(|struct_type| Type::Struct(struct_type.clone()));
-            }
+            name => return self.current_scope.get_type(name).cloned(),
         })
     }
 
@@ -1591,7 +1712,11 @@ impl Generator<'_> {
         args: &[Spanned<Expression>],
         span: &SimpleSpan,
     ) -> Result<(Value, Type), ManyErrors> {
-        let Some((func_id, func_type)) = self.current_scope.get_func(&name.0).cloned() else {
+        let Some((func_id, func_type)) = self
+            .current_scope
+            .get_function(&name.0)
+            .map(|(id, ft)| (id, ft.clone()))
+        else {
             return CodeError::UnknownFunction(name.0.clone()).err(*span);
         };
 
@@ -1654,18 +1779,14 @@ impl Generator<'_> {
         }
     }
 
-    fn build_struct_decl(
-        &mut self,
-        decl: &StructDecl,
-        span: &SimpleSpan,
-    ) -> Result<(), ManyErrors> {
+    fn build_struct_decl(&mut self, decl: &StructDecl) -> Result<(), ManyErrors> {
         let mut errors = Vec::new();
-        if self.current_scope.parent.is_some() {
-            errors.push(CodeError::StructDeclNotTopLevel.spanned(*span));
-        }
 
-        if self.type_from_name(&decl.name.0).is_some() {
-            errors.push(CodeError::TypeRedeclaration(decl.name.0.clone()).spanned(decl.name.1));
+        if matches!(
+            self.current_scope.get_symbol(&decl.name.0),
+            LookupResult::Found(_)
+        ) {
+            errors.push(CodeError::NameAlreadyDefined(decl.name.0.clone()).spanned(decl.name.1));
         }
 
         let mut fields = IndexMap::new();
@@ -1708,7 +1829,48 @@ impl Generator<'_> {
         if self.verbose {
             println!("Defined struct: \n {struct_type:?}");
         }
-        self.new_types.insert(decl.name.0.clone(), struct_type);
+        self.current_scope
+            .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Struct(struct_type)))
+            .expect("Must not overwrite symbol");
+        Ok(())
+    }
+
+    fn build_enum_decl(&mut self, decl: &EnumDecl) -> Result<(), ManyErrors> {
+        let mut errors = Vec::new();
+
+        if matches!(
+            self.current_scope.get_symbol(&decl.name.0),
+            LookupResult::Found(_)
+        ) {
+            errors.push(CodeError::NameAlreadyDefined(decl.name.0.clone()).spanned(decl.name.1));
+        }
+
+        let mut variants = IndexSet::new();
+        for name in &decl.variants {
+            if variants.contains(&name.0) {
+                errors.push(CodeError::EnumDuplicateVariant(name.0.clone()).spanned(name.1));
+                continue;
+            }
+            variants.insert(name.0.clone());
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let enum_type = EnumType {
+            name: decl.name.0.clone(),
+            variants,
+        };
+
+        if self.verbose {
+            println!("Defined enum: \n {enum_type:?}");
+        }
+
+        self.current_scope
+            .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Enum(enum_type)))
+            .expect("Must not overwrite symbol");
+
         Ok(())
     }
 
@@ -1723,6 +1885,7 @@ impl Generator<'_> {
             Type::F64 => types::F64,
             Type::String => self.isa.pointer_type(),
             Type::Bool => types::I8,
+            Type::Enum(_) => types::I32,
             Type::Struct(struct_type) => {
                 // StructArgument must have a size that's a multiple of 8 byte
                 purpose = ArgumentPurpose::StructArgument(struct_type.size_pad_8());
@@ -1753,6 +1916,7 @@ impl Generator<'_> {
             Type::String => self.isa.pointer_type(),
             Type::Bool => types::I8,
             Type::Struct(_) => self.isa.pointer_type(),
+            Type::Enum(_) => types::I32,
             _ => return None,
         })
     }

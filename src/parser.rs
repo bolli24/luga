@@ -22,6 +22,7 @@ pub enum Statement {
     While(Conditional),
     FunctionDecl(FunctionDecl),
     StructDecl(StructDecl),
+    EnumDecl(EnumDecl),
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +59,12 @@ pub struct StructDecl {
 }
 
 #[derive(Clone, Debug)]
+pub struct EnumDecl {
+    pub name: Spanned<String>,
+    pub variants: Vec<Spanned<String>>,
+}
+
+#[derive(Clone, Debug)]
 pub struct StructInit {
     pub name: Spanned<String>,
     pub args: Vec<(Spanned<String>, Box<Spanned<Expression>>)>,
@@ -89,6 +96,7 @@ pub enum BinOp {
     Mul,
     Div,
     Equal,
+    NotEqual,
     Lt,
     Gt,
     Lte,
@@ -103,6 +111,7 @@ impl Display for BinOp {
             Self::Mul => write!(f, "*"),
             Self::Div => write!(f, "/"),
             Self::Equal => write!(f, "=="),
+            Self::NotEqual => write!(f, "!="),
             Self::Lt => write!(f, "<"),
             Self::Gt => write!(f, ">"),
             Self::Lte => write!(f, "<="),
@@ -130,6 +139,7 @@ pub enum Intrinsic {
     Println,
     Assert,
     Exit,
+    EnumToInt,
 }
 
 impl Intrinsic {
@@ -139,12 +149,13 @@ impl Intrinsic {
             Self::Println => "@println",
             Self::Assert => "@assert",
             Self::Exit => "@exit",
+            Self::EnumToInt => "@enumToInt",
         }
     }
 }
 
-const KEY_WORDS: [&str; 9] = [
-    "let", "return", "if", "else", "true", "false", "fn", "struct", "extern",
+const KEY_WORDS: [&str; 10] = [
+    "let", "return", "if", "else", "true", "false", "fn", "struct", "enum", "extern",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -182,6 +193,7 @@ where
         Token::Star => BinOp::Mul,
         Token::Slash => BinOp::Div,
         Token::EqualEqual => BinOp::Equal,
+        Token::BangEqual => BinOp::NotEqual,
         Token::Lt => BinOp::Lt,
         Token::Gt => BinOp::Gt,
         Token::LtEq => BinOp::Lte,
@@ -219,7 +231,21 @@ where
         )
         .map(|(name, args)| Expression::StructInit(StructInit { name, args }));
 
+    let intrinsic_expr = just(Token::At)
+        .ignore_then(identifier)
+        .try_map(|id, span| match id {
+            "print" => Ok(Intrinsic::Print),
+            "println" => Ok(Intrinsic::Println),
+            "assert" => Ok(Intrinsic::Assert),
+            "exit" => Ok(Intrinsic::Exit),
+            "enumToInt" => Ok(Intrinsic::EnumToInt),
+            _ => Err(Rich::custom(span, "Unknown intrinsic.")),
+        })
+        .then(args.clone())
+        .map(|(intrinsic, args)| Expression::Intrinsic(intrinsic, args));
+
     let atom = choice((
+        intrinsic_expr,
         function_call.map(|fc| fc.0),
         struct_init,
         identifier.map(|name| Expression::Identifier(name.to_owned())),
@@ -286,7 +312,7 @@ where
 
     let equality = comparision.clone().foldl_with(
         bin_op
-            .filter(|op| matches!(op, BinOp::Equal))
+            .filter(|op| matches!(op, BinOp::Equal | BinOp::NotEqual))
             .then(comparision.clone())
             .repeated(),
         |a, (op, b), extra| {
@@ -361,18 +387,20 @@ where
             )
         });
 
-    let intrinsic = just(Token::At)
-        .ignore_then(identifier)
-        .try_map(|id, span| match id {
-            "print" => Ok(Intrinsic::Print),
-            "println" => Ok(Intrinsic::Println),
-            "assert" => Ok(Intrinsic::Assert),
-            "exit" => Ok(Intrinsic::Exit),
-            _ => Err(Rich::custom(span, "Unknown intrinsic.")),
-        })
-        .then(args)
-        .map_with(|(intrinsic, args), extra| {
-            Spanned(Expression::Intrinsic(intrinsic, args), extra.span())
+    let enum_decl = just(Token::Id("enum"))
+        .ignore_then(identifier_spanned)
+        .then(
+            identifier_spanned
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
+        )
+        .map_with(|(name, variants), extra| {
+            Spanned(
+                Statement::EnumDecl(EnumDecl { name, variants }),
+                extra.span(),
+            )
         });
 
     let else_block = just(Token::Id("else")).ignore_then(block.clone());
@@ -422,7 +450,7 @@ where
             )
         });
 
-    expression.define(choice((intrinsic, binary)).labelled("expression"));
+    expression.define(binary.labelled("expression"));
     let binding = just(Token::Id("let"))
         .ignore_then(identifier)
         .then_ignore(just(Token::Equal))
@@ -461,6 +489,7 @@ where
             function_decl
                 .map_with(|decl, extra| Spanned(Statement::FunctionDecl(decl), extra.span())),
             struct_decl,
+            enum_decl,
         ))),
     );
 
