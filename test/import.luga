@@ -1,0 +1,16 @@
+import struct as s;
+import enum as e;
+
+fn main() {
+    let a = s.iVec{x: 2, y: 3};
+    let b = s.iVec{x: 4, y: -3};
+
+    let c = s.add(a, b);
+
+    s.printVec(a);
+    s.printVec(b);
+    s.printVec(c);
+
+    let dir = e.Direction.Down;
+    @println("%s", e.dirName(dir));
+}

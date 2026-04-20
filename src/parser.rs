@@ -3,6 +3,9 @@ use std::fmt::Display;
 use crate::lexer::Token;
 use chumsky::{input::ValueInput, prelude::*};
 
+#[derive(Debug, Clone)]
+pub struct Spanned<T: std::fmt::Debug + Clone>(pub T, pub SimpleSpan);
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub items: Vec<Spanned<TopLevelItem>>,
@@ -13,10 +16,8 @@ pub enum TopLevelItem {
     FunctionDecl(FunctionDecl),
     StructDecl(StructDecl),
     EnumDecl(EnumDecl),
+    Import(Vec<Spanned<String>>, Option<Spanned<String>>),
 }
-
-#[derive(Debug, Clone)]
-pub struct Spanned<T: std::fmt::Debug + Clone>(pub T, pub SimpleSpan);
 
 #[derive(Clone, Debug)]
 pub enum Statement {
@@ -73,7 +74,7 @@ pub struct EnumDecl {
 
 #[derive(Clone, Debug)]
 pub struct StructInit {
-    pub name: Spanned<String>,
+    pub path: Vec<Spanned<String>>,
     pub args: Vec<(Spanned<String>, Box<Spanned<Expression>>)>,
 }
 
@@ -91,7 +92,7 @@ pub enum Expression {
     Unary(UnOp, Box<Spanned<Expression>>),
 
     Intrinsic(Intrinsic, Vec<Spanned<Expression>>),
-    FunctionCall(Spanned<String>, Vec<Spanned<Expression>>),
+    FunctionCall(Box<Spanned<Expression>>, Vec<Spanned<Expression>>),
     FieldAccess(Box<Spanned<Expression>>, Spanned<String>),
     StructInit(StructInit),
 }
@@ -161,8 +162,9 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 11] = [
+const KEY_WORDS: [&str; 13] = [
     "let", "return", "if", "else", "while", "true", "false", "fn", "struct", "enum", "extern",
+    "import", "as",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -176,6 +178,11 @@ where
     .labelled("identifier");
 
     let identifier_spanned = identifier.map_with(|id, extra| Spanned(id.to_owned(), extra.span()));
+
+    // Like identifier_spanned but accepts any Token::Id, including keywords.
+    // Used for cases where names may collide with reserved words (import paths, struct init paths).
+    let any_ident_spanned = select! { Token::Id(name) => name }
+        .map_with(|id, extra| Spanned(id.to_owned(), extra.span()));
 
     let float = select! {Token::Float(n) => n}.try_map(|n, span| {
         n.parse::<f64>()
@@ -220,13 +227,10 @@ where
         .collect::<Vec<_>>()
         .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
-    let function_call = identifier_spanned
-        .then(args.clone())
-        .map_with(|(name, args), extra| {
-            Spanned(Expression::FunctionCall(name, args), extra.span())
-        });
-
-    let struct_init = identifier_spanned
+    let struct_init = any_ident_spanned
+        .separated_by(just(Token::Dot))
+        .at_least(1)
+        .collect::<Vec<_>>()
         .then(
             identifier_spanned
                 .then_ignore(just(Token::Colon))
@@ -236,7 +240,7 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
         )
-        .map(|(name, args)| Expression::StructInit(StructInit { name, args }));
+        .map(|(path, args)| Expression::StructInit(StructInit { path, args }));
 
     let intrinsic_expr = just(Token::At)
         .ignore_then(identifier)
@@ -253,7 +257,6 @@ where
 
     let atom = choice((
         intrinsic_expr,
-        function_call.map(|fc| fc.0),
         struct_init,
         identifier.map(|name| Expression::Identifier(name.to_owned())),
         float.map(Expression::Float),
@@ -267,9 +270,31 @@ where
     ))
     .map_with(|expr: Expression, extra| -> Spanned<Expression> { Spanned(expr, extra.span()) });
 
+    enum Postfix {
+        Field(Spanned<String>),
+        Call(Vec<Spanned<Expression>>),
+    }
+
+    let postfix = choice((
+        just(Token::Dot)
+            .ignore_then(identifier_spanned)
+            .map(Postfix::Field),
+        args.clone().map(Postfix::Call),
+    ));
+
     let field_access = atom.clone().foldl_with(
-        just(Token::Dot).ignore_then(identifier_spanned).repeated(),
-        |expr, field, extra| Spanned(Expression::FieldAccess(Box::new(expr), field), extra.span()),
+        postfix.repeated(),
+        |expr, op, extra| match op {
+            Postfix::Field(field) => {
+                Spanned(Expression::FieldAccess(Box::new(expr), field), extra.span())
+            }
+            Postfix::Call(call_args) => {
+                Spanned(
+                    Expression::FunctionCall(Box::new(expr), call_args),
+                    extra.span(),
+                )
+            }
+        },
     );
 
     let unary = unary_op
@@ -495,11 +520,28 @@ where
         ))),
     );
 
+    let import = just(Token::Id("import")).ignore_then(
+        any_ident_spanned
+            .separated_by(just(Token::Dot))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .then(
+                just(Token::Id("as"))
+                    .ignore_then(identifier_spanned)
+                    .or_not(),
+            )
+            .then_ignore(just(Token::Semicolon))
+            .map_with(|(path, rename), extra| {
+                Spanned(TopLevelItem::Import(path, rename), extra.span())
+            }),
+    );
+
     let top_level_item = choice((
         function_decl
             .map_with(|decl, extra| Spanned(TopLevelItem::FunctionDecl(decl), extra.span())),
         struct_decl.map_with(|decl, extra| Spanned(TopLevelItem::StructDecl(decl), extra.span())),
         enum_decl.map_with(|decl, extra| Spanned(TopLevelItem::EnumDecl(decl), extra.span())),
+        import,
     ));
 
     top_level_item

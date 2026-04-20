@@ -399,7 +399,7 @@ fn build_file(
         println!();
     }
 
-    let product = match generate(program, verbose, release) {
+    let product = match generate(program, file_path, verbose, release) {
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::CodeErrors(errors) => {

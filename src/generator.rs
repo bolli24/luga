@@ -1,6 +1,15 @@
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    fs,
+    path::{Path, PathBuf},
+};
 
-use chumsky::span::{SimpleSpan, Span};
+use chumsky::{
+    Parser,
+    input::{Input, Stream},
+    span::{SimpleSpan, Span},
+};
 use cranelift::{
     codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
@@ -8,12 +17,14 @@ use cranelift::{
     prelude::{isa::CallConv, *},
 };
 use indexmap::{IndexMap, IndexSet};
+use logos::Logos;
 
+use crate::lexer::Token;
 use crate::parser::EnumDecl;
 use crate::{
     parser::{
         BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
-        Statement, StructDecl, TopLevelItem, UnOp,
+        Statement, StructDecl, TopLevelItem, UnOp, luga_parser,
     },
     util::ResultCollectAll,
 };
@@ -105,6 +116,8 @@ pub enum CodeError {
 
     #[error("Enum variant '{}' already declared.", .0)]
     EnumDuplicateVariant(String),
+    #[error("Enum '{}' has no variant named '{}'.", .0, .1)]
+    UnknownVariant(String, String),
 
     #[error("`fn main` must have no parameters.")]
     MainHasParams,
@@ -112,8 +125,12 @@ pub enum CodeError {
     MainInvalidReturnType(Type),
     #[error("Type '{}' cannot be used as a value.", .0)]
     TypeUsedAsValue(String),
-    #[error("Enum '{}' has no variant named '{}'.", .0, .1)]
-    UnknownVariant(String, String),
+    #[error("Module '{}' cannot be used as a value.", .0)]
+    ModuleUsedAsValue(String),
+    #[error("Function '{}' cannot be used as a value.", .0)]
+    FunctionUsedAsValue(String),
+    #[error("Failed to import '{}': {}", .0, .1)]
+    ImportError(String, String),
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -358,6 +375,7 @@ impl Display for EnumType {
 
 pub fn generate(
     program: Program,
+    file_path: &Path,
     verbose: bool,
     release: bool,
 ) -> Result<ObjectProduct, GeneratorErrors> {
@@ -430,9 +448,11 @@ pub fn generate(
         exit_id,
         verbose,
         current_scope: Scope::new(),
+        dir: file_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        fn_name_prefix: String::new(),
     };
 
-    state.build(program)?;
+    state.build_module(program)?;
 
     Ok(module.finish())
 }
@@ -450,6 +470,7 @@ pub enum Symbol {
     Variable(Variable, Type),
     Function(FuncId, FuncType),
     Type(Type),
+    Module(HashMap<String, Symbol>),
 }
 
 pub enum LookupResult<'a> {
@@ -518,6 +539,17 @@ impl Scope {
             _ => None,
         }
     }
+
+    pub fn get_module(&self, name: &str) -> Option<&HashMap<String, Symbol>> {
+        match self.get_symbol(name) {
+            LookupResult::Found(Symbol::Module(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn get_module_symbol(&self, module_name: &str, symbol_name: &str) -> Option<&Symbol> {
+        self.get_module(module_name)?.get(symbol_name)
+    }
 }
 
 struct GeneratorState<'a> {
@@ -528,6 +560,8 @@ struct GeneratorState<'a> {
     exit_id: FuncId,
     verbose: bool,
     current_scope: Scope,
+    dir: PathBuf,
+    fn_name_prefix: String,
 }
 
 struct FnGenerator<'a, 'ctx> {
@@ -539,18 +573,40 @@ struct FnGenerator<'a, 'ctx> {
 }
 
 impl GeneratorState<'_> {
-    fn build(mut self, program: Program) -> Result<(), GeneratorErrors> {
+    fn build_module(
+        mut self,
+        program: Program,
+    ) -> Result<HashMap<String, Symbol>, GeneratorErrors> {
         let mut errors = Vec::new();
-        let mut found_main = false;
 
-        // Pass 1: declare all types and function signatures so forward calls resolve.
+        let found_main = self.pass1(&program, &mut errors, true);
+
+        if !errors.is_empty() {
+            return Err(GeneratorErrors::CodeErrors(errors));
+        }
+
+        if !found_main {
+            return Err(GeneratorErrors::MissingMain);
+        }
+
+        self.pass2(&program, &mut errors);
+
+        if !errors.is_empty() {
+            return Err(GeneratorErrors::CodeErrors(errors));
+        }
+
+        Ok(self.current_scope.symbols)
+    }
+
+    fn pass1(&mut self, program: &Program, errors: &mut ManyErrors, is_entry: bool) -> bool {
+        let mut found_main = false;
         for item in &program.items {
             match &item.0 {
                 TopLevelItem::FunctionDecl(decl) => {
-                    if decl.name == "main" && !decl.r#extern {
+                    if is_entry && decl.name == "main" && !decl.r#extern {
                         found_main = true;
                     }
-                    if let Err(mut e) = self.pre_declare_fn(decl, &item.1, true) {
+                    if let Err(mut e) = self.pre_declare_fn(decl, &item.1, is_entry) {
                         errors.append(&mut e);
                     }
                 }
@@ -564,18 +620,17 @@ impl GeneratorState<'_> {
                         errors.append(&mut e);
                     }
                 }
+                TopLevelItem::Import(path, rename) => {
+                    if let Err(mut e) = self.process_import(path, rename.as_ref(), item.1) {
+                        errors.append(&mut e);
+                    }
+                }
             }
         }
+        found_main
+    }
 
-        if !errors.is_empty() {
-            return Err(GeneratorErrors::CodeErrors(errors));
-        }
-
-        if !found_main {
-            return Err(GeneratorErrors::MissingMain);
-        }
-
-        // Pass 2: build all function bodies now that every signature is in scope.
+    fn pass2(&mut self, program: &Program, errors: &mut ManyErrors) {
         for item in &program.items {
             if let TopLevelItem::FunctionDecl(decl) = &item.0 {
                 if let Err(mut e) = self.build_fn_body(decl, &item.1, true) {
@@ -583,12 +638,100 @@ impl GeneratorState<'_> {
                 }
             }
         }
+    }
+
+    fn process_import(
+        &mut self,
+        path: &[Spanned<String>],
+        rename: Option<&Spanned<String>>,
+        import_span: SimpleSpan,
+    ) -> Result<(), ManyErrors> {
+        let module_name = rename
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| path.last().unwrap().0.clone());
+
+        let file_path: PathBuf = path
+            .iter()
+            .fold(self.dir.clone(), |acc, seg| acc.join(&seg.0))
+            .with_extension("luga");
+
+        let program = parse_file(&file_path, import_span)?;
+
+        let dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let symbols = self.compile_import(program, &dir, &module_name)?;
+
+        self.current_scope
+            .insert_symbol(module_name.clone(), Symbol::Module(symbols))
+            .map_err(|_| vec![CodeError::NameAlreadyDefined(module_name).spanned(import_span)])
+    }
+
+    fn compile_import(
+        &mut self,
+        program: Program,
+        dir: &Path,
+        module_alias: &str,
+    ) -> Result<HashMap<String, Symbol>, ManyErrors> {
+        let saved_scope = std::mem::replace(&mut self.current_scope, Scope::new());
+        let saved_dir = std::mem::replace(&mut self.dir, dir.to_path_buf());
+        let new_prefix = format!("{}{}__", self.fn_name_prefix, module_alias);
+        let saved_prefix = std::mem::replace(&mut self.fn_name_prefix, new_prefix);
+
+        let mut errors = Vec::new();
+
+        self.pass1(&program, &mut errors, false);
 
         if !errors.is_empty() {
-            return Err(GeneratorErrors::CodeErrors(errors));
+            self.current_scope = saved_scope;
+            self.dir = saved_dir;
+            self.fn_name_prefix = saved_prefix;
+            return Err(errors);
         }
 
-        Ok(())
+        self.pass2(&program, &mut errors);
+
+        let module_symbols = std::mem::replace(&mut self.current_scope, saved_scope).symbols;
+        self.dir = saved_dir;
+        self.fn_name_prefix = saved_prefix;
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        Ok(module_symbols)
+    }
+}
+
+fn parse_file(path: &Path, import_span: SimpleSpan) -> Result<Program, ManyErrors> {
+    let path_str = path.display().to_string();
+
+    let src = fs::read_to_string(path).map_err(|e| {
+        vec![CodeError::ImportError(path_str.clone(), e.to_string()).spanned(import_span)]
+    })?;
+
+    let mut tokens = Vec::new();
+    let mut has_lex_error = false;
+
+    for (tok, span) in Token::lexer(src.as_str()).spanned() {
+        match tok {
+            Ok(t) => tokens.push((t, SimpleSpan::from(span))),
+            Err(_) => has_lex_error = true,
+        }
+    }
+
+    if has_lex_error {
+        return Err(vec![
+            CodeError::ImportError(path_str, "lexing failed".to_string()).spanned(import_span),
+        ]);
+    }
+
+    let token_stream =
+        Stream::from_iter(tokens.into_iter()).map((0..src.len()).into(), |(t, s): (_, _)| (t, s));
+
+    match luga_parser().parse(token_stream).into_output() {
+        Some(program) => Ok(program),
+        None => Err(vec![
+            CodeError::ImportError(path_str, "parsing failed".to_string()).spanned(import_span),
+        ]),
     }
 }
 
@@ -937,24 +1080,44 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 LookupResult::Found(Symbol::Function(..) | Symbol::Type(_)) => {
                     CodeError::TypeUsedAsValue(name.clone()).err(*span)
                 }
+                LookupResult::Found(Symbol::Module(..)) => {
+                    CodeError::ModuleUsedAsValue(name.clone()).err(*span)
+                }
                 LookupResult::CaptureError => CodeError::Capture(name.clone()).err(*span),
                 LookupResult::NotFound => CodeError::UnknownVariable(name.clone()).err(*span),
             },
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
             Expression::FieldAccess(expr, field_name) => {
-                // Enum variant access
-                if let Expression::Identifier(type_name) = &expr.0 {
-                    if let Some(Type::Enum(enum_type)) = self.state.type_from_name(type_name) {
-                        let Some(idx) = enum_type.variants.get_index_of(&field_name.0) else {
-                            return CodeError::UnknownVariant(
-                                enum_type.name.clone(),
-                                field_name.0.clone(),
-                            )
-                            .err(field_name.1);
-                        };
-                        let val = self.builder.ins().iconst(types::I32, idx as i64);
-                        return Ok((val, Type::Enum(enum_type)));
-                    }
+                if let Some(symbol) = self.resolve_expr_as_symbol(expr) {
+                    return match symbol {
+                        Symbol::Module(_) => {
+                            CodeError::ModuleUsedAsValue(field_name.0.clone()).err(field_name.1)
+                        }
+                        Symbol::Type(Type::Enum(enum_type)) => {
+                            let enum_type = enum_type.clone();
+                            let Some(idx) = enum_type.variants.get_index_of(&field_name.0) else {
+                                return CodeError::UnknownVariant(
+                                    enum_type.name.clone(),
+                                    field_name.0.clone(),
+                                )
+                                .err(field_name.1);
+                            };
+                            let val = self.builder.ins().iconst(types::I32, idx as i64);
+                            return Ok((val, Type::Enum(enum_type)));
+                        }
+                        Symbol::Type(Type::Struct(struct_type)) => {
+                            CodeError::TypeUsedAsValue(struct_type.name.clone()).err(expr.1)
+                        }
+                        Symbol::Type(_) => {
+                            unreachable!("Only struct and enum types may be imported.")
+                        }
+                        Symbol::Variable(..) => {
+                            unreachable!("resolve_expr_as_symbol must not return variables.")
+                        }
+                        Symbol::Function(_, func_type) => {
+                            CodeError::FunctionUsedAsValue(func_type.name.clone()).err(expr.1)
+                        }
+                    };
                 }
 
                 let expr_value = self.build_expression(expr, None)?;
@@ -986,7 +1149,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 let mut errors = Vec::new();
                 let mut arg_values = HashMap::with_capacity(struct_init.args.len());
 
-                let r#type = self.state.type_from_name(&struct_init.name.0);
+                let path = &struct_init.path;
+                let path_span = combine_spans(path.first().unwrap().1, path.last().unwrap().1);
+                let r#type = self.state.type_from_path(path);
 
                 for arg in &struct_init.args {
                     let maybe_type = r#type
@@ -1008,16 +1173,18 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     }
                 }
 
-                let Some(r#type) = self.state.type_from_name(&struct_init.name.0) else {
-                    errors.push(
-                        CodeError::UnknownType(struct_init.name.0.clone())
-                            .spanned(struct_init.name.1),
-                    );
+                let Some(r#type) = self.state.type_from_path(path) else {
+                    let type_name = path
+                        .iter()
+                        .map(|s| s.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    errors.push(CodeError::UnknownType(type_name).spanned(path_span));
                     return Err(errors);
                 };
 
                 let Type::Struct(struct_type) = &r#type else {
-                    errors.push(CodeError::NotStructType(r#type).spanned(struct_init.name.1));
+                    errors.push(CodeError::NotStructType(r#type).spanned(path_span));
                     return Err(errors);
                 };
 
@@ -1061,6 +1228,22 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
                 Ok((struct_addr, r#type))
             }
+        }
+    }
+
+    fn resolve_expr_as_symbol(&self, expr: &Spanned<Expression>) -> Option<&Symbol> {
+        match &expr.0 {
+            Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
+                LookupResult::Found(
+                    sym @ (Symbol::Module(_) | Symbol::Type(_) | Symbol::Function(..)),
+                ) => Some(sym),
+                _ => None,
+            },
+            Expression::FieldAccess(base, field) => match self.resolve_expr_as_symbol(base)? {
+                Symbol::Module(map) => map.get(&field.0),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -1635,9 +1818,15 @@ impl GeneratorState<'_> {
             Linkage::Local
         };
 
+        let object_name = if *is_extern {
+            name.to_owned()
+        } else {
+            format!("{}{}", self.fn_name_prefix, name)
+        };
+
         let func_id = self
             .module
-            .declare_function(name, linkage, &signature)
+            .declare_function(&object_name, linkage, &signature)
             .expect("Function must be declarable.");
 
         self.current_scope
@@ -1812,6 +2001,27 @@ impl GeneratorState<'_> {
         self.build_fn_body(decl, span, false)
     }
 
+    fn type_from_path(&self, path: &[Spanned<String>]) -> Option<Type> {
+        if path.len() == 1 {
+            return self.type_from_name(&path[0].0);
+        }
+        let LookupResult::Found(Symbol::Module(map)) = self.current_scope.get_symbol(&path[0].0)
+        else {
+            return None;
+        };
+        let mut map = map;
+        for seg in &path[1..path.len() - 1] {
+            match map.get(&seg.0)? {
+                Symbol::Module(m) => map = m,
+                _ => return None,
+            }
+        }
+        match map.get(&path.last().unwrap().0)? {
+            Symbol::Type(t) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
     fn type_from_name(&self, type_name: &str) -> Option<Type> {
         Some(match type_name {
             "i8" => Type::I8,
@@ -1835,22 +2045,22 @@ impl GeneratorState<'_> {
 impl FnGenerator<'_, '_> {
     fn build_fn_call(
         &mut self,
-        name: &Spanned<String>,
+        callee: &Spanned<Expression>,
         args: &[Spanned<Expression>],
         span: &SimpleSpan,
     ) -> Result<(Value, Type), ManyErrors> {
-        let Some((func_id, func_type)) = self
-            .state
-            .current_scope
-            .get_function(&name.0)
-            .map(|(id, ft)| (id, ft.clone()))
-        else {
-            return CodeError::UnknownFunction(name.0.clone()).err(*span);
+        let callee_name = expr_callee_name(&callee.0);
+
+        let Some((func_id, func_type)) = (match self.resolve_expr_as_symbol(callee) {
+            Some(Symbol::Function(id, ft)) => Some((*id, ft.clone())),
+            _ => None,
+        }) else {
+            return CodeError::UnknownFunction(callee_name).err(*span);
         };
 
         if args.len() != func_type.params.len() {
             return CodeError::FunctionCallArgumentCount(
-                name.0.clone(),
+                callee_name,
                 func_type.params.len(),
                 args.len(),
             )
@@ -1864,7 +2074,7 @@ impl FnGenerator<'_, '_> {
                 let value = self.build_expression(expr, Some(param_type.clone()))?;
                 if value.1 != *param_type {
                     return CodeError::FunctionCallArgumentType(
-                        name.0.clone(),
+                        expr_callee_name(&callee.0),
                         param_type.clone(),
                         value.1,
                     )
@@ -2052,6 +2262,16 @@ impl GeneratorState<'_> {
             Type::Enum(_) => types::I32,
             _ => return None,
         })
+    }
+}
+
+fn expr_callee_name(expr: &Expression) -> String {
+    match expr {
+        Expression::Identifier(name) => name.clone(),
+        Expression::FieldAccess(base, field) => {
+            format!("{}.{}", expr_callee_name(&base.0), field.0)
+        }
+        _ => "<expression>".to_string(),
     }
 }
 
