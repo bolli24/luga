@@ -227,10 +227,19 @@ where
         .collect::<Vec<_>>()
         .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
-    let struct_init = any_ident_spanned
-        .separated_by(just(Token::Dot))
-        .at_least(1)
-        .collect::<Vec<_>>()
+    let struct_init = identifier_spanned
+        .then(
+            just(Token::Dot)
+                .ignore_then(any_ident_spanned)
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map(|(head, tail)| {
+            let mut path = Vec::with_capacity(tail.len() + 1);
+            path.push(head);
+            path.extend(tail);
+            path
+        })
         .then(
             identifier_spanned
                 .then_ignore(just(Token::Colon))
@@ -282,20 +291,17 @@ where
         args.clone().map(Postfix::Call),
     ));
 
-    let field_access = atom.clone().foldl_with(
-        postfix.repeated(),
-        |expr, op, extra| match op {
+    let field_access = atom
+        .clone()
+        .foldl_with(postfix.repeated(), |expr, op, extra| match op {
             Postfix::Field(field) => {
                 Spanned(Expression::FieldAccess(Box::new(expr), field), extra.span())
             }
-            Postfix::Call(call_args) => {
-                Spanned(
-                    Expression::FunctionCall(Box::new(expr), call_args),
-                    extra.span(),
-                )
-            }
-        },
-    );
+            Postfix::Call(call_args) => Spanned(
+                Expression::FunctionCall(Box::new(expr), call_args),
+                extra.span(),
+            ),
+        });
 
     let unary = unary_op
         .repeated()
@@ -521,10 +527,19 @@ where
     );
 
     let import = just(Token::Id("import")).ignore_then(
-        any_ident_spanned
-            .separated_by(just(Token::Dot))
-            .at_least(1)
-            .collect::<Vec<_>>()
+        identifier_spanned
+            .then(
+                just(Token::Dot)
+                    .ignore_then(any_ident_spanned)
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .map(|(head, tail)| {
+                let mut path = Vec::with_capacity(tail.len() + 1);
+                path.push(head);
+                path.extend(tail);
+                path
+            })
             .then(
                 just(Token::Id("as"))
                     .ignore_then(identifier_spanned)

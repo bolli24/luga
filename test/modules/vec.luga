@@ -1,0 +1,13 @@
+/// SKIP_TEST
+struct iVec {
+    x: i32;
+    y: i32;
+}
+
+fn printVec(vec: iVec) {
+    @println("(%d, %d)", vec.x, vec.y);
+}
+
+fn add(a: iVec, b: iVec) : iVec {
+    return iVec {x: a.x + b.x, y: a.y + b.y};
+}

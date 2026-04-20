@@ -1,0 +1,4 @@
+/// SKIP_TEST
+import circ_a as a;
+
+fn touch() : i32 { return 2; }

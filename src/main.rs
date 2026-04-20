@@ -1,26 +1,24 @@
 #![allow(dead_code)]
 
-use crate::lexer::{LexingError, Token};
-use ariadne::{Color, Label, Report, ReportKind, Source};
-use chumsky::prelude::*;
-use chumsky::{Parser, input::Stream};
+use ariadne::Source;
 use generator::{GeneratorErrors, generate};
-use logos::Logos;
-use parser::{Spanned, luga_parser};
+use parser::Spanned;
 use thiserror::Error;
 
 use std::fs::{self, File, create_dir_all, remove_dir_all};
 use std::io::Write;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, io};
+
+use crate::parsing::{ParseFailure, parse_path, report_error};
 
 pub use chumsky::span::SimpleSpan;
 
 mod generator;
 mod lexer;
 mod parser;
+mod parsing;
 mod util;
 
 #[derive(clap::Parser, Debug)]
@@ -84,19 +82,6 @@ fn main() -> ExitCode {
 }
 
 const OUTPUT_DIR: &str = "output";
-
-fn report_error(file_name: &str, src: Source<&str>, span: Range<usize>, msg: &str) {
-    Report::build(ReportKind::Error, (file_name, span.clone()))
-        .with_message(msg)
-        .with_label(
-            Label::new((file_name, span))
-                .with_message(msg)
-                .with_color(Color::Red),
-        )
-        .finish()
-        .eprint((file_name, src))
-        .unwrap();
-}
 
 fn output_dir(release: bool) -> io::Result<PathBuf> {
     let dir = env::current_dir()?
@@ -332,68 +317,14 @@ fn build_file(
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
     let file_name = base_name.to_string_lossy().to_string();
-    let src = fs::read_to_string(file_path).map_err(|err| BuildError::Io(file_path.into(), err))?;
 
-    let mut tokens: Vec<(Token, SimpleSpan)> = Vec::new();
-    let mut lex_errors: Vec<(LexingError, Range<usize>)> = Vec::new();
-    for (tok, span) in Token::lexer(src.as_str()).spanned() {
-        match tok {
-            Ok(tok) => tokens.push((tok, span.into())),
-            Err(err) => lex_errors.push((err, span)),
-        }
-    }
-
-    if verbose {
-        for (tok, _) in &tokens {
-            println!("{tok:?}");
-        }
-    }
+    let (program, src) = parse_path(file_path, verbose).map_err(|err| match err {
+        ParseFailure::Io(p, e) => BuildError::Io(p, e),
+        ParseFailure::Lex(p) => BuildError::Lexer(p),
+        ParseFailure::Parse(p) => BuildError::Parser(p),
+    })?;
 
     let src_report = Source::from(src.as_str());
-
-    if !lex_errors.is_empty() {
-        for (err, span) in &lex_errors {
-            report_error(
-                &file_name,
-                src_report.clone(),
-                span.clone(),
-                &err.to_string(),
-            );
-        }
-        return Err(BuildError::Lexer(file_path.into()));
-    }
-
-    let token_stream =
-        Stream::from_iter(tokens.into_iter()).map((0..src.len()).into(), |(t, s): (_, _)| (t, s));
-
-    if verbose {
-        println!();
-    }
-
-    let result = luga_parser().parse(token_stream);
-
-    if let Some(program) = result.output()
-        && verbose
-    {
-        for item in &program.items {
-            println!("{item:?}");
-        }
-    }
-
-    if result.has_errors() {
-        for error in result.errors() {
-            report_error(
-                &file_name,
-                src_report.clone(),
-                error.span().into_range(),
-                &error.to_string(),
-            );
-        }
-    }
-
-    let Some(program) = result.into_output() else {
-        return Err(BuildError::Parser(file_path.into()));
-    };
 
     if verbose {
         println!();

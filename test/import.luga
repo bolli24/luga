@@ -1,5 +1,5 @@
-import struct as s;
-import enum as e;
+import modules.vec as s;
+import modules.dir as e;
 
 fn main() {
     let a = s.iVec{x: 2, y: 3};

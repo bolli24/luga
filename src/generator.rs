@@ -1,15 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
-    fs,
     path::{Path, PathBuf},
 };
 
-use chumsky::{
-    Parser,
-    input::{Input, Stream},
-    span::{SimpleSpan, Span},
-};
+use chumsky::span::{SimpleSpan, Span};
 use cranelift::{
     codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
@@ -17,14 +12,13 @@ use cranelift::{
     prelude::{isa::CallConv, *},
 };
 use indexmap::{IndexMap, IndexSet};
-use logos::Logos;
 
-use crate::lexer::Token;
 use crate::parser::EnumDecl;
+use crate::parsing::parse_path;
 use crate::{
     parser::{
         BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
-        Statement, StructDecl, TopLevelItem, UnOp, luga_parser,
+        Statement, StructDecl, TopLevelItem, UnOp,
     },
     util::ResultCollectAll,
 };
@@ -131,6 +125,10 @@ pub enum CodeError {
     FunctionUsedAsValue(String),
     #[error("Failed to import '{}': {}", .0, .1)]
     ImportError(String, String),
+    #[error("Import not found: '{}'.", .0)]
+    ImportNotFound(String),
+    #[error("Circular import of '{}'.", .0)]
+    CircularImport(String),
 }
 
 impl From<Spanned<CodeError>> for ManyErrors {
@@ -274,7 +272,7 @@ impl StructType {
 
     fn size_pad_8(&self) -> u32 {
         let size = self.size();
-        if size % 8 == 0 {
+        if size.is_multiple_of(8) {
             size
         } else {
             size + (8 - size % 8)
@@ -450,6 +448,8 @@ pub fn generate(
         current_scope: Scope::new(),
         dir: file_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
         fn_name_prefix: String::new(),
+        compiling_imports: HashSet::new(),
+        compiled_imports: HashMap::new(),
     };
 
     state.build_module(program)?;
@@ -562,6 +562,8 @@ struct GeneratorState<'a> {
     current_scope: Scope,
     dir: PathBuf,
     fn_name_prefix: String,
+    compiling_imports: HashSet<PathBuf>,
+    compiled_imports: HashMap<PathBuf, HashMap<String, Symbol>>,
 }
 
 struct FnGenerator<'a, 'ctx> {
@@ -649,31 +651,60 @@ impl GeneratorState<'_> {
         let module_name = rename
             .map(|r| r.0.clone())
             .unwrap_or_else(|| path.last().unwrap().0.clone());
+        let module_name_span = rename
+            .map(|r| r.1)
+            .unwrap_or_else(|| path.last().unwrap().1);
 
-        let file_path: PathBuf = path
+        let joined_path: PathBuf = path
             .iter()
             .fold(self.dir.clone(), |acc, seg| acc.join(&seg.0))
             .with_extension("luga");
 
-        let program = parse_file(&file_path, import_span)?;
+        let path_str = joined_path.display().to_string();
+        let canonical = std::fs::canonicalize(&joined_path)
+            .map_err(|_| vec![CodeError::ImportNotFound(path_str.clone()).spanned(import_span)])?;
 
-        let dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let symbols = self.compile_import(program, &dir, &module_name)?;
+        if self.compiling_imports.contains(&canonical) {
+            return Err(vec![
+                CodeError::CircularImport(path_str).spanned(import_span),
+            ]);
+        }
+
+        let symbols = if let Some(cached) = self.compiled_imports.get(&canonical) {
+            cached.clone()
+        } else {
+            let (program, _src) = parse_path(&joined_path, self.verbose).map_err(|err| {
+                vec![
+                    CodeError::ImportError(path_str.clone(), err.short_reason())
+                        .spanned(import_span),
+                ]
+            })?;
+
+            let dir = joined_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+            self.compiling_imports.insert(canonical.clone());
+            let compiled = self.compile_import(program, &dir, &canonical);
+            self.compiling_imports.remove(&canonical);
+            let symbols = compiled?;
+            self.compiled_imports
+                .insert(canonical.clone(), symbols.clone());
+            symbols
+        };
 
         self.current_scope
             .insert_symbol(module_name.clone(), Symbol::Module(symbols))
-            .map_err(|_| vec![CodeError::NameAlreadyDefined(module_name).spanned(import_span)])
+            .map_err(|_| vec![CodeError::NameAlreadyDefined(module_name).spanned(module_name_span)])
     }
 
     fn compile_import(
         &mut self,
         program: Program,
         dir: &Path,
-        module_alias: &str,
+        canonical: &Path,
     ) -> Result<HashMap<String, Symbol>, ManyErrors> {
         let saved_scope = std::mem::replace(&mut self.current_scope, Scope::new());
         let saved_dir = std::mem::replace(&mut self.dir, dir.to_path_buf());
-        let new_prefix = format!("{}{}__", self.fn_name_prefix, module_alias);
+        let new_prefix = module_prefix(canonical, self.compiled_imports.len());
         let saved_prefix = std::mem::replace(&mut self.fn_name_prefix, new_prefix);
 
         let mut errors = Vec::new();
@@ -701,38 +732,12 @@ impl GeneratorState<'_> {
     }
 }
 
-fn parse_file(path: &Path, import_span: SimpleSpan) -> Result<Program, ManyErrors> {
-    let path_str = path.display().to_string();
-
-    let src = fs::read_to_string(path).map_err(|e| {
-        vec![CodeError::ImportError(path_str.clone(), e.to_string()).spanned(import_span)]
-    })?;
-
-    let mut tokens = Vec::new();
-    let mut has_lex_error = false;
-
-    for (tok, span) in Token::lexer(src.as_str()).spanned() {
-        match tok {
-            Ok(t) => tokens.push((t, SimpleSpan::from(span))),
-            Err(_) => has_lex_error = true,
-        }
-    }
-
-    if has_lex_error {
-        return Err(vec![
-            CodeError::ImportError(path_str, "lexing failed".to_string()).spanned(import_span),
-        ]);
-    }
-
-    let token_stream =
-        Stream::from_iter(tokens.into_iter()).map((0..src.len()).into(), |(t, s): (_, _)| (t, s));
-
-    match luga_parser().parse(token_stream).into_output() {
-        Some(program) => Ok(program),
-        None => Err(vec![
-            CodeError::ImportError(path_str, "parsing failed".to_string()).spanned(import_span),
-        ]),
-    }
+fn module_prefix(canonical_path: &Path, module_index: usize) -> String {
+    let stem = canonical_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{stem}{module_index}$")
 }
 
 impl<'a, 'ctx> FnGenerator<'a, 'ctx> {

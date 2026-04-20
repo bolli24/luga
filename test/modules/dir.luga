@@ -1,0 +1,11 @@
+/// SKIP_TEST
+enum Direction {
+    Up, Down, Left, Right,
+}
+
+fn dirName(d: Direction) : string {
+    if (d == Direction.Up)   { return "up"; }
+    if (d == Direction.Down) { return "down"; }
+    if (d == Direction.Left) { return "left"; }
+    return "right";
+}
