@@ -31,8 +31,8 @@ impl LanguageServer for Backend {
 
 #[tokio::main]
 async fn main() {
-    let log_file = File::create(std::env::temp_dir().join("luga-lsp.log"))
-        .expect("failed to create log file");
+    let log_file =
+        File::create(std::env::temp_dir().join("luga-lsp.log")).expect("failed to create log file");
 
     tracing_subscriber::fmt()
         .with_writer(log_file)

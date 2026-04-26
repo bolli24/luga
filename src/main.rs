@@ -5,6 +5,7 @@ use generator::{GeneratorErrors, generate};
 use parser::Spanned;
 use thiserror::Error;
 
+use colored::Colorize;
 use std::fs::{self, File, create_dir_all, remove_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -186,7 +187,7 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
         let content = match fs::read_to_string(file) {
             Ok(s) => s,
             Err(err) => {
-                println!("BUILD FAIL (unable to read: {err})");
+                println!("{} (unable to read: {err})", "BUILD FAIL".yellow());
                 build_failed += 1;
                 continue;
             }
@@ -196,14 +197,14 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
         let directive = match parse_test_directive(first_line) {
             Ok(d) => d,
             Err(msg) => {
-                println!("BUILD FAIL ({msg})");
+                println!("{} ({msg})", "BUILD FAIL".yellow());
                 build_failed += 1;
                 continue;
             }
         };
 
         if directive.skip {
-            println!("SKIP");
+            println!("{}", "SKIP".cyan());
             skipped += 1;
             continue;
         }
@@ -211,7 +212,7 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
         let exe_path = match build_files(cli, file, "") {
             Ok(p) => p,
             Err(()) => {
-                println!("BUILD FAIL");
+                println!("{}", "BUILD FAIL".yellow());
                 build_failed += 1;
                 continue;
             }
@@ -225,7 +226,7 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
         let status = match cmd.status() {
             Ok(s) => s,
             Err(err) => {
-                println!("FAIL (unable to execute: {err})");
+                println!("{} (unable to execute: {err})", "FAIL".red());
                 failed += 1;
                 continue;
             }
@@ -237,15 +238,18 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
         let expected = directive.expected_exit_code;
         match status.code() {
             Some(code) if code == expected => {
-                println!("PASS");
+                println!("{}", "PASS".green());
                 passed += 1;
             }
             Some(code) => {
-                println!("FAIL (expected exit code {expected}, got {code})");
+                println!(
+                    "{} (expected exit code {expected}, got {code})",
+                    "FAIL".red()
+                );
                 failed += 1;
             }
             None => {
-                println!("FAIL (terminated without exit code)");
+                println!("{} (terminated without exit code)", "FAIL".red());
                 failed += 1;
             }
         }
@@ -254,7 +258,11 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), ()> {
     let total = passed + failed + skipped + build_failed;
     println!();
     println!(
-        "Test summary: {failed} failed / {passed} passed / {total} total | Skipped: {skipped} | Build failed: {build_failed}"
+        "Test summary: {} / {} / {} total | Skipped: {skipped} | Build failed: {}",
+        format!("{failed} failed").red(),
+        format!("{passed} passed").green(),
+        total,
+        format!("{build_failed}").yellow(),
     );
 
     if failed > 0 || build_failed > 0 {

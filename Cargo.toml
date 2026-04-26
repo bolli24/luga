@@ -20,6 +20,8 @@ cranelift = { version = "0.130", features = [
 ] }
 
 clap = { version = "4.5", features = ["derive"] }
+colored = "3.1"
 
 indexmap = "2.10"
 walkdir = "2.5"
+
