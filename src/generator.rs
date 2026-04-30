@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -13,14 +14,13 @@ use cranelift::{
 };
 use indexmap::{IndexMap, IndexSet};
 
-use crate::parser::EnumDecl;
-use crate::parsing::parse_path;
+use crate::{lexer::LexingError, util::ResultCollectAll};
 use crate::{
     parser::{
-        BinOp, Conditional, Expression, FunctionDecl, If, Intrinsic, Param, Program, Spanned,
-        Statement, StructDecl, TopLevelItem, UnOp,
+        BinOp, Conditional, EnumDecl, Expression, FunctionDecl, If, Intrinsic, Param, Program,
+        Spanned, Statement, StructDecl, TopLevelItem, UnOp,
     },
-    util::ResultCollectAll,
+    parsing::parse_source,
 };
 
 const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
@@ -133,7 +133,7 @@ pub enum CodeError {
 
 impl From<Spanned<CodeError>> for ManyErrors {
     fn from(value: Spanned<CodeError>) -> Self {
-        vec![value]
+        vec![value.into()]
     }
 }
 
@@ -148,9 +148,35 @@ impl CodeError {
 }
 
 pub enum GeneratorErrors {
-    CodeErrors(ManyErrors),
+    ModuleErrors(Vec<ModuleErrors>),
     VerifierErrors(Vec<VerifierError>),
     MissingMain,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompileError {
+    Code(Spanned<CodeError>),
+    ModuleInner,
+    Lex(Spanned<LexingError>),
+    Parse(Spanned<String>),
+}
+
+impl CompileError {
+    const fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
+        Spanned(self, span)
+    }
+}
+
+impl From<Spanned<CodeError>> for CompileError {
+    fn from(val: Spanned<CodeError>) -> Self {
+        CompileError::Code(val)
+    }
+}
+
+pub struct ModuleErrors {
+    pub path: PathBuf,
+    pub src: String,
+    pub errors: Vec<CompileError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +400,7 @@ impl Display for EnumType {
 pub fn generate(
     program: Program,
     file_path: &Path,
+    src: &str,
     verbose: bool,
     release: bool,
 ) -> Result<ObjectProduct, GeneratorErrors> {
@@ -452,7 +479,23 @@ pub fn generate(
         compiled_imports: HashMap::new(),
     };
 
-    state.build_module(program)?;
+    let mut mod_errors = Vec::new();
+
+    match state.build_main_module(program, &mut mod_errors) {
+        Err(MainModuleError::MissingMain) => return Err(GeneratorErrors::MissingMain),
+        Err(MainModuleError::CodeErrors(errors)) => {
+            mod_errors.push(ModuleErrors {
+                path: file_path.to_path_buf(),
+                src: src.to_owned(),
+                errors: errors
+                    .into_iter()
+                    .map(|err| CompileError::Code(err))
+                    .collect(),
+            });
+            return Err(GeneratorErrors::ModuleErrors(mod_errors));
+        }
+        Ok(_) => {}
+    }
 
     Ok(module.finish())
 }
@@ -574,33 +617,44 @@ struct FnGenerator<'a, 'ctx> {
     return_dest: Option<Variable>,
 }
 
+pub enum MainModuleError {
+    MissingMain,
+    CodeErrors(ManyErrors),
+}
+
 impl GeneratorState<'_> {
-    fn build_module(
+    fn build_main_module(
         mut self,
         program: Program,
-    ) -> Result<HashMap<String, Symbol>, GeneratorErrors> {
-        let mut errors = Vec::new();
-
-        let found_main = self.pass1(&program, &mut errors, true);
-
-        if !errors.is_empty() {
-            return Err(GeneratorErrors::CodeErrors(errors));
-        }
+        mod_errors: &mut Vec<ModuleErrors>,
+    ) -> Result<HashMap<String, Symbol>, MainModuleError> {
+        let found_main = self
+            .pass1(&program, mod_errors, true)
+            .map_err(|errors| MainModuleError::CodeErrors(errors))?;
 
         if !found_main {
-            return Err(GeneratorErrors::MissingMain);
+            return Err(MainModuleError::MissingMain);
         }
+
+        let mut errors = Vec::new();
 
         self.pass2(&program, &mut errors);
 
         if !errors.is_empty() {
-            return Err(GeneratorErrors::CodeErrors(errors));
+            return Err(MainModuleError::CodeErrors(errors));
         }
 
         Ok(self.current_scope.symbols)
     }
 
-    fn pass1(&mut self, program: &Program, errors: &mut ManyErrors, is_entry: bool) -> bool {
+    fn pass1(
+        &mut self,
+        program: &Program,
+        mod_errors: &mut Vec<ModuleErrors>,
+        is_entry: bool,
+    ) -> Result<bool, ManyErrors> {
+        let mut errors = Vec::new();
+
         let mut found_main = false;
         for item in &program.items {
             match &item.0 {
@@ -623,13 +677,20 @@ impl GeneratorState<'_> {
                     }
                 }
                 TopLevelItem::Import(path, rename) => {
-                    if let Err(mut e) = self.process_import(path, rename.as_ref(), item.1) {
-                        errors.append(&mut e);
+                    if let Err(CompileError::Code(e)) =
+                        self.process_import(path, rename.as_ref(), item.1, mod_errors)
+                    {
+                        errors.push(e);
                     }
                 }
             }
         }
-        found_main
+
+        if !errors.is_empty() {
+            Err(errors)
+        } else {
+            Ok(found_main)
+        }
     }
 
     fn pass2(&mut self, program: &Program, errors: &mut ManyErrors) {
@@ -647,45 +708,63 @@ impl GeneratorState<'_> {
         path: &[Spanned<String>],
         rename: Option<&Spanned<String>>,
         import_span: SimpleSpan,
-    ) -> Result<(), ManyErrors> {
+        mod_errors: &mut Vec<ModuleErrors>,
+    ) -> Result<(), CompileError> {
         let module_name = rename
             .map(|r| r.0.clone())
             .unwrap_or_else(|| path.last().unwrap().0.clone());
         let module_name_span = rename
             .map(|r| r.1)
             .unwrap_or_else(|| path.last().unwrap().1);
-
         let joined_path: PathBuf = path
             .iter()
             .fold(self.dir.clone(), |acc, seg| acc.join(&seg.0))
             .with_extension("luga");
 
         let path_str = joined_path.display().to_string();
-        let canonical = std::fs::canonicalize(&joined_path)
-            .map_err(|_| vec![CodeError::ImportNotFound(path_str.clone()).spanned(import_span)])?;
+        let canonical = std::fs::canonicalize(&joined_path).map_err(|_| {
+            CompileError::Code(CodeError::ImportNotFound(path_str.clone()).spanned(import_span))
+        })?;
 
         if self.compiling_imports.contains(&canonical) {
-            return Err(vec![
-                CodeError::CircularImport(path_str).spanned(import_span),
-            ]);
+            return Err(CodeError::CircularImport(path_str)
+                .spanned(import_span)
+                .into());
         }
-
+        // Now we start compiling the module itself.
         let symbols = if let Some(cached) = self.compiled_imports.get(&canonical) {
             cached.clone()
         } else {
-            let (program, _src) = parse_path(&joined_path, self.verbose).map_err(|err| {
-                vec![
-                    CodeError::ImportError(path_str.clone(), err.short_reason())
-                        .spanned(import_span),
-                ]
+            let src = fs::read_to_string(&canonical).map_err(|err| {
+                CodeError::ImportError(path_str.clone(), err.to_string()).spanned(import_span)
             })?;
 
+            let program = match parse_source(&src, self.verbose) {
+                Ok(program) => program,
+                Err(failure) => {
+                    mod_errors.push(ModuleErrors {
+                        path: canonical,
+                        src: src.to_owned(),
+                        errors: failure.into(),
+                    });
+                    return Err(CompileError::ModuleInner);
+                }
+            };
             let dir = joined_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
             self.compiling_imports.insert(canonical.clone());
-            let compiled = self.compile_import(program, &dir, &canonical);
+            let symbols = match self.compile_import(program, &dir, &canonical, mod_errors) {
+                Ok(compiled) => compiled,
+                Err(errors) => {
+                    mod_errors.push(ModuleErrors {
+                        path: canonical,
+                        src: src.to_owned(),
+                        errors: errors.into_iter().map(CompileError::Code).collect(),
+                    });
+                    return Err(CompileError::ModuleInner);
+                }
+            };
             self.compiling_imports.remove(&canonical);
-            let symbols = compiled?;
             self.compiled_imports
                 .insert(canonical.clone(), symbols.clone());
             symbols
@@ -693,7 +772,11 @@ impl GeneratorState<'_> {
 
         self.current_scope
             .insert_symbol(module_name.clone(), Symbol::Module(symbols))
-            .map_err(|_| vec![CodeError::NameAlreadyDefined(module_name).spanned(module_name_span)])
+            .map_err(|_| {
+                CodeError::NameAlreadyDefined(module_name)
+                    .spanned(module_name_span)
+                    .into()
+            })
     }
 
     fn compile_import(
@@ -701,6 +784,7 @@ impl GeneratorState<'_> {
         program: Program,
         dir: &Path,
         canonical: &Path,
+        mod_errors: &mut Vec<ModuleErrors>,
     ) -> Result<HashMap<String, Symbol>, ManyErrors> {
         let saved_scope = std::mem::replace(&mut self.current_scope, Scope::new());
         let saved_dir = std::mem::replace(&mut self.dir, dir.to_path_buf());
@@ -709,9 +793,7 @@ impl GeneratorState<'_> {
 
         let mut errors = Vec::new();
 
-        self.pass1(&program, &mut errors, false);
-
-        if !errors.is_empty() {
+        if let Err(errors) = self.pass1(&program, mod_errors, false) {
             self.current_scope = saved_scope;
             self.dir = saved_dir;
             self.fn_name_prefix = saved_prefix;

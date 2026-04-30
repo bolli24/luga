@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
 use ariadne::Source;
-use generator::{GeneratorErrors, generate};
-use parser::Spanned;
+use luga::generator::{GeneratorErrors, generate};
 use thiserror::Error;
 
 use colored::Colorize;
@@ -12,17 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, io};
 
-use crate::parsing::{ParseFailure, parse_path, report_error};
+use luga::parsing::{ParseFailure, parse_source, report_compile_errors};
 
 pub use chumsky::span::SimpleSpan;
 
-mod generator;
-mod lexer;
-mod parser;
-mod parsing;
-mod util;
-
-#[derive(clap::Parser, Debug)]
+#[derive(clap::Parser)]
 struct Cli {
     #[arg(short, long, default_value_t = false)]
     release: bool,
@@ -314,6 +307,16 @@ fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), ()> {
     Ok(())
 }
 
+/* fn check_file(file_path: &Path, verbose: bool) -> Result<(), Vec<Spanned<CodeError>>> {
+    let (program, src) = parse_path(file_path, verbose).map_err(|err| match err {
+        ParseFailure::Io(p, e) => BuildError::Io(p, e),
+        ParseFailure::Lex(p) => BuildError::Lexer(p),
+        ParseFailure::Parse(p) => BuildError::Parser(p),
+    });
+
+    todo!();
+}*/
+
 fn build_file(
     file_path: &Path,
     output_dir: &Path,
@@ -326,30 +329,33 @@ fn build_file(
     let output_file = output_dir.join(base_name);
     let file_name = base_name.to_string_lossy().to_string();
 
-    let (program, src) = parse_path(file_path, verbose).map_err(|err| match err {
-        ParseFailure::Io(p, e) => BuildError::Io(p, e),
-        ParseFailure::Lex(p) => BuildError::Lexer(p),
-        ParseFailure::Parse(p) => BuildError::Parser(p),
-    })?;
+    let src = fs::read_to_string(file_path)
+        .map_err(|err| BuildError::Io(file_path.to_path_buf(), err))?;
 
-    let src_report = Source::from(src.as_str());
+    let program = parse_source(&src, verbose).map_err(|err| {
+        let src_report = Source::from(src.as_str());
+        err.report(&file_name, &src_report);
+        match err {
+            ParseFailure::Lex(_) => BuildError::Lexer(file_path.to_path_buf()),
+            ParseFailure::Parse(_) => BuildError::Parser(file_path.to_path_buf()),
+        }
+    })?;
 
     if verbose {
         println!();
     }
 
-    let product = match generate(program, file_path, verbose, release) {
+    let product = match generate(program, file_path, &src, verbose, release) {
         Ok(product) => product,
         Err(errors) => match errors {
-            GeneratorErrors::CodeErrors(errors) => {
-                for Spanned(error, span) in errors {
-                    report_error(
-                        &file_name,
-                        src_report.clone(),
-                        span.into_range(),
-                        &error.to_string(),
-                    );
+            GeneratorErrors::ModuleErrors(modules) => {
+                for module_errors in modules {
+                    let src_report = Source::from(module_errors.src.as_str());
+                    let module_file_name = module_errors.path.display().to_string();
+
+                    report_compile_errors(&module_file_name, &src_report, module_errors.errors);
                 }
+
                 return Err(BuildError::Generator(file_path.into()));
             }
             GeneratorErrors::VerifierErrors(verifier_errors) => {
