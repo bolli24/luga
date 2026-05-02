@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     fs,
+    hash::Hash,
     path::{Path, PathBuf},
 };
 
@@ -28,17 +29,17 @@ const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CodeError {
     #[error("Invalid type of return value. Exprected '{}' but found: '{}'", .0, .1)]
-    InvalidReturnType(Type, Type),
+    InvalidReturnType(String, String),
 
     #[error("{} isn't supported yet.", .0)]
     NoYetSupported(String),
 
     #[error("Incompatiple types for binary operator '{}': '{}' and '{}'", .0, .1, .2)]
-    IncompatipleBinOpTypes(BinOp, Type, Type),
+    IncompatipleBinOpTypes(BinOp, String, String),
     #[error("Invalid type '{}' for binary operator '{}'", .1 ,.0)]
-    InvalidBinOpType(BinOp, Type),
+    InvalidBinOpType(BinOp, String),
     #[error("Invalid type '{}' for unary operator '{}'", .1 ,.0)]
-    InvalidUnOpType(UnOp, Type),
+    InvalidUnOpType(UnOp, String),
 
     #[error("Intrisic '@{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
     IntrinsicTooFewArguments(&'static str, usize, usize),
@@ -47,9 +48,9 @@ pub enum CodeError {
     #[error("Intrisic '@{}' invoked wrong number of arguments. Expected exactly {} but found {}.", .0, .1, .2)]
     IntrinsicArgumentCount(&'static str, usize, usize),
     #[error("Intrisic '@{}' invoked with wrong argument type. Expected one of '{}' but found '{}'.", .0, join(.1), .2)]
-    IntrisicArgumentType(&'static str, &'static [Type], Type),
+    IntrisicArgumentType(&'static str, &'static [&'static str], String),
     #[error("Intrinsic '@{}' expected an enum type but found '{}'.", .0, .1)]
-    IntrinsicExpectedEnum(&'static str, Type),
+    IntrinsicExpectedEnum(&'static str, String),
 
     #[error("Expected string literal.")]
     ExpectedStringLiteral,
@@ -59,14 +60,14 @@ pub enum CodeError {
     #[error("Use of unknown variable '{}'.", .0)]
     UnknownVariable(String),
     #[error("Can't assign value of type '{}' to variable of type '{}'.", .1, .0)]
-    AssignmentIncompatibleTypes(Type, Type),
+    AssignmentIncompatibleTypes(String, String),
     #[error("Can't create variable of type '{}'.", .0)]
-    BindingType(Type),
+    BindingType(String),
     #[error("Can't capture variable '{0}' outside of function scope")]
     Capture(String),
 
     #[error("Invalid type '{}' for condition. Must be 'bool'.", .0)]
-    InvalidConditionType(Type),
+    InvalidConditionType(String),
     #[error("All branches of an if expression must have same type.")]
     IfExpressionType,
 
@@ -75,7 +76,7 @@ pub enum CodeError {
     #[error("Type '{}' already declared.", .0)]
     TypeRedeclaration(String),
     #[error("Can't coerse integer literal of value '{}' into integer type '{}'", .0, .0)]
-    CoerseInt(Type, i64),
+    CoerseInt(String, i64),
 
     #[error("Duplicate function parameter '{}'", .0)]
     FunctionParamDuplicate(String),
@@ -88,7 +89,7 @@ pub enum CodeError {
     #[error("Function '{}' called with wrong number of arguments. Expected {} but found {}.", .0, .1, .2)]
     FunctionCallArgumentCount(String, usize, usize),
     #[error("Function '{}' called with wrong argument type. Expected '{}' but found '{}'.", .0, .1, .2)]
-    FunctionCallArgumentType(String, Type, Type),
+    FunctionCallArgumentType(String, String, String),
 
     #[error("Unreachable statement.")]
     UnreachableStatement,
@@ -98,15 +99,15 @@ pub enum CodeError {
     #[error("Struct field '{}' already declared.", .0)]
     StructDuplicateField(String),
     #[error("Type '{}' has no field named '{}'.", .0, .1)]
-    UnknownField(Type, String),
+    UnknownField(String, String),
     #[error("Type '{}' is not a struct type.", .0)]
-    NotStructType(Type),
+    NotStructType(String),
     #[error("Duplicate initialization of field '{}'.", .0)]
     StructInitArgDuplicate(String),
     #[error("Missing initialization of field '{}'.", .0)]
     StructInitMissingArg(String),
     #[error("Invalid type for field initialization. Expected '{}' but found '{}'.", .0, .1)]
-    StructInitInvalidType(Type, Type),
+    StructInitInvalidType(String, String),
 
     #[error("Enum variant '{}' already declared.", .0)]
     EnumDuplicateVariant(String),
@@ -116,7 +117,7 @@ pub enum CodeError {
     #[error("`fn main` must have no parameters.")]
     MainHasParams,
     #[error("`fn main` must return `i32`, but `{}` was declared.", .0)]
-    MainInvalidReturnType(Type),
+    MainInvalidReturnType(String),
     #[error("Type '{}' cannot be used as a value.", .0)]
     TypeUsedAsValue(String),
     #[error("Module '{}' cannot be used as a value.", .0)]
@@ -179,6 +180,24 @@ pub struct ModuleErrors {
     pub errors: Vec<CompileError>,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleId(usize);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct TypeId {
+    local: usize,
+    module: ModuleId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QualifiedName(ModuleId, String);
+
+impl Display for QualifiedName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     I8,
@@ -196,53 +215,11 @@ pub enum Type {
     String,
     Bool,
     Fn(FuncType),
-    Struct(StructType),
-    Enum(EnumType),
+    Struct(TypeId),
+    Enum(TypeId),
 }
 
 impl Type {
-    fn size(&self) -> u32 {
-        match self {
-            Self::I8 | Self::U8 => 1,
-            Self::I16 | Self::U16 => 2,
-            Self::I32 | Self::U32 => 4,
-            Self::I64 | Self::U64 => 8,
-            Self::F32 => 4,
-            Self::F64 => 8,
-            Self::Void | Self::Never => 0,
-            Self::String => 8, // TODO: platform pointer size
-            Self::Bool => 1,
-            Self::Fn(_) => 0,
-            Self::Struct(struct_type) => struct_type.size(),
-            Self::Enum(_) => Self::U32.size(),
-        }
-    }
-
-    fn align_shift(&self) -> u8 {
-        match self {
-            Self::I8 | Self::U8 => 0,
-            Self::I16 | Self::U16 => 1,
-            Self::I32 | Self::U32 => 2,
-            Self::I64 | Self::U64 => 3,
-            Self::F32 => 2,
-            Self::F64 => 3,
-            Self::Void | Self::Never => 0,
-            Self::String => 3,
-            Self::Bool => 0,
-            Self::Fn(_) => 0,
-            Self::Struct(struct_type) => struct_type.align_shift(),
-            Self::Enum(_) => Self::U32.align_shift(),
-        }
-    }
-
-    fn struct_type(&self) -> Option<&StructType> {
-        if let Type::Struct(struct_type) = self {
-            Some(struct_type)
-        } else {
-            None
-        }
-    }
-
     fn is_int(&self) -> bool {
         matches!(
             self,
@@ -276,41 +253,60 @@ pub struct FuncType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructType {
-    name: String,
+    name: QualifiedName,
     fields: IndexMap<String, StructField>,
+    size: u32,
+    align_shift: u8,
 }
 
 impl StructType {
-    fn size(&self) -> u32 {
+    fn new(
+        name: QualifiedName,
+        fields: IndexMap<String, StructField>,
+        type_context: &TypeContext,
+    ) -> Self {
+        let align_shift = fields
+            .values()
+            .map(|f| type_context.align_shift(&f.r#type))
+            .max()
+            .unwrap_or(0);
+
+        let size = Self::compute_size(&fields, align_shift, type_context);
+
+        Self {
+            name,
+            fields,
+            size,
+            align_shift,
+        }
+    }
+
+    fn compute_size(
+        fields: &IndexMap<String, StructField>,
+        align_shift: u8,
+        type_context: &TypeContext,
+    ) -> u32 {
         let mut offset = 0;
-        for field in self.fields.values() {
-            let align = 1 << field.r#type.align_shift();
+        for field in fields.values() {
+            let align = 1 << type_context.align_shift(&field.r#type);
             let padding = (align - (offset % align)) % align;
             offset += padding;
-            offset += field.r#type.size();
+            offset += type_context.size(&field.r#type)
         }
 
         // Final padding so total size is a multiple of the struct's alignment
-        let struct_align = 1 << self.align_shift();
+        let struct_align = 1 << align_shift;
         let padding = (struct_align - (offset % struct_align)) % struct_align;
         offset + padding
     }
 
     fn size_pad_8(&self) -> u32 {
-        let size = self.size();
+        let size = self.size;
         if size.is_multiple_of(8) {
             size
         } else {
             size + (8 - size % 8)
         }
-    }
-
-    fn align_shift(&self) -> u8 {
-        self.fields
-            .values()
-            .map(|f| f.r#type.align_shift())
-            .max()
-            .unwrap_or(0)
     }
 }
 
@@ -322,8 +318,49 @@ pub struct StructField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumType {
-    pub name: String,
+    pub name: QualifiedName,
     pub variants: IndexSet<String>,
+}
+
+impl Type {
+    fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayType<'a> {
+        DisplayType { ty: self, types }
+    }
+}
+
+struct DisplayType<'a> {
+    ty: &'a Type,
+    types: &'a TypeContext,
+}
+
+impl std::fmt::Display for DisplayType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.ty {
+            Type::I8 => write!(f, "i8"),
+            Type::I16 => write!(f, "i16"),
+            Type::I32 => write!(f, "i32"),
+            Type::I64 => write!(f, "i64"),
+            Type::U8 => write!(f, "u8"),
+            Type::U16 => write!(f, "u16"),
+            Type::U32 => write!(f, "u32"),
+            Type::U64 => write!(f, "u64"),
+            Type::F32 => write!(f, "f32"),
+            Type::F64 => write!(f, "f64"),
+            Type::Void => write!(f, "void"),
+            Type::Never => write!(f, "never"),
+            Type::String => write!(f, "string"),
+            Type::Bool => write!(f, "bool"),
+
+            Type::Struct(id) | Type::Enum(id) => {
+                let name = self.types.type_name(*id);
+                write!(f, "{name}")
+            }
+
+            Type::Fn(func_type) => {
+                write!(f, "{}", func_type.display(self.types))
+            }
+        }
+    }
 }
 
 impl Display for Type {
@@ -344,9 +381,38 @@ impl Display for Type {
             Self::String => write!(f, "string"),
             Self::Bool => write!(f, "bool"),
             Self::Fn(func_type) => write!(f, "{func_type}"),
-            Self::Struct(struct_type) => write!(f, "{struct_type}"),
-            Self::Enum(enum_type) => write!(f, "{enum_type}"),
+            Self::Struct(id) => write!(f, "<struct {id:?}>"),
+            Self::Enum(id) => write!(f, "<enum {id:?}>"),
         }
+    }
+}
+
+impl FuncType {
+    fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayFuncType<'a> {
+        DisplayFuncType { func: self, types }
+    }
+}
+
+struct DisplayFuncType<'a> {
+    func: &'a FuncType,
+    types: &'a TypeContext,
+}
+
+impl Display for DisplayFuncType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}fn {} ({}) : {}",
+            if self.func.is_extern { "extern " } else { "" },
+            self.func.name,
+            self.func
+                .params
+                .iter()
+                .map(|param| param.display(self.types).to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.func.return_type.display(self.types)
+        )
     }
 }
 
@@ -367,6 +433,43 @@ impl Display for FuncType {
     }
 }
 
+impl StructType {
+    fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayStructType<'a> {
+        DisplayStructType {
+            struct_type: self,
+            types,
+        }
+    }
+}
+
+struct DisplayStructType<'a> {
+    struct_type: &'a StructType,
+    types: &'a TypeContext,
+}
+
+impl Display for DisplayStructType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "struct {} {{ {} }}",
+            self.struct_type.name,
+            self.struct_type
+                .fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "{}@{}: {}",
+                        field.0,
+                        field.1.offset,
+                        field.1.r#type.display(self.types)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+}
+
 impl Display for StructType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -376,6 +479,32 @@ impl Display for StructType {
             self.fields
                 .iter()
                 .map(|field| { format!("{}@{}: {}", field.0, field.1.offset, field.1.r#type) })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+}
+
+impl EnumType {
+    fn display<'a>(&'a self, _types: &'a TypeContext) -> DisplayEnumType<'a> {
+        DisplayEnumType { enum_type: self }
+    }
+}
+
+struct DisplayEnumType<'a> {
+    enum_type: &'a EnumType,
+}
+
+impl Display for DisplayEnumType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "enum {} {{ {} }}",
+            self.enum_type.name,
+            self.enum_type
+                .variants
+                .iter()
+                .map(|variant| variant.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
         )
@@ -394,6 +523,76 @@ impl Display for EnumType {
                 .collect::<Vec<_>>()
                 .join(", "),
         )
+    }
+}
+
+struct TypeContext {
+    pub structs: HashMap<TypeId, StructType>,
+    pub enums: HashMap<TypeId, EnumType>,
+    next_type_id: usize,
+}
+
+impl TypeContext {
+    fn new() -> Self {
+        Self {
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            next_type_id: 0,
+        }
+    }
+
+    fn alloc_type_id(&mut self, module: ModuleId) -> TypeId {
+        let id = TypeId {
+            local: self.next_type_id,
+            module,
+        };
+        self.next_type_id += 1;
+        id
+    }
+
+    fn type_name(&self, id: TypeId) -> String {
+        if let Some(struct_type) = self.structs.get(&id) {
+            return struct_type.name.to_string();
+        }
+        if let Some(enum_type) = self.enums.get(&id) {
+            return enum_type.name.to_string();
+        }
+        format!("<type {id:?}>")
+    }
+
+    fn layout(&self, r#type: &Type) -> (u32, u8) {
+        match r#type {
+            Type::I8 | Type::U8 => (1, 0),
+            Type::I16 | Type::U16 => (2, 1),
+            Type::I32 | Type::U32 => (4, 2),
+            Type::I64 | Type::U64 => (8, 3),
+            Type::F32 => (4, 2),
+            Type::F64 => (8, 3),
+            Type::Void | Type::Never => (0, 0),
+            Type::String => (8, 3), // TODO: platform pointer size
+            Type::Bool => (1, 0),
+            Type::Fn(_) => (0, 0),
+            Type::Struct(struct_id) => {
+                let struct_type = &self.structs[struct_id];
+                (struct_type.size, struct_type.align_shift)
+            }
+            Type::Enum(_) => self.layout(&Type::U32),
+        }
+    }
+
+    fn size(&self, r#type: &Type) -> u32 {
+        self.layout(r#type).0
+    }
+
+    fn align_shift(&self, r#type: &Type) -> u8 {
+        self.layout(r#type).1
+    }
+
+    fn struct_type(&self, r#type: &Type) -> Option<&StructType> {
+        match r#type {
+            Type::Struct(struct_id) => self.structs.get(struct_id),
+            _ => None,
+        }
     }
 }
 
@@ -468,6 +667,7 @@ pub fn generate(
     let state = GeneratorState {
         isa,
         module: &mut module,
+        current_module: ModuleId(0),
         strings: 0,
         printf_id,
         exit_id,
@@ -477,6 +677,7 @@ pub fn generate(
         fn_name_prefix: String::new(),
         compiling_imports: HashSet::new(),
         compiled_imports: HashMap::new(),
+        types: TypeContext::new(),
     };
 
     let mut mod_errors = Vec::new();
@@ -598,6 +799,7 @@ impl Scope {
 struct GeneratorState<'a> {
     isa: std::sync::Arc<dyn isa::TargetIsa>,
     module: &'a mut ObjectModule,
+    current_module: ModuleId,
     strings: usize,
     printf_id: FuncId,
     exit_id: FuncId,
@@ -607,6 +809,7 @@ struct GeneratorState<'a> {
     fn_name_prefix: String,
     compiling_imports: HashSet<PathBuf>,
     compiled_imports: HashMap<PathBuf, HashMap<String, Symbol>>,
+    types: TypeContext,
 }
 
 struct FnGenerator<'a, 'ctx> {
@@ -786,6 +989,8 @@ impl GeneratorState<'_> {
         canonical: &Path,
         mod_errors: &mut Vec<ModuleErrors>,
     ) -> Result<HashMap<String, Symbol>, ManyErrors> {
+        let new_module = ModuleId(self.current_module.0 + 1);
+        let saved_module = std::mem::replace(&mut self.current_module, new_module);
         let saved_scope = std::mem::replace(&mut self.current_scope, Scope::new());
         let saved_dir = std::mem::replace(&mut self.dir, dir.to_path_buf());
         let new_prefix = module_prefix(canonical, self.compiled_imports.len());
@@ -794,6 +999,7 @@ impl GeneratorState<'_> {
         let mut errors = Vec::new();
 
         if let Err(errors) = self.pass1(&program, mod_errors, false) {
+            self.current_module = saved_module;
             self.current_scope = saved_scope;
             self.dir = saved_dir;
             self.fn_name_prefix = saved_prefix;
@@ -803,6 +1009,7 @@ impl GeneratorState<'_> {
         self.pass2(&program, &mut errors);
 
         let module_symbols = std::mem::replace(&mut self.current_scope, saved_scope).symbols;
+        self.current_module = saved_module;
         self.dir = saved_dir;
         self.fn_name_prefix = saved_prefix;
 
@@ -867,7 +1074,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 };
 
                 let Some(var_type) = self.state.get_crane_type(&value.1) else {
-                    return CodeError::BindingType(value.1).err(expr.1);
+                    return CodeError::BindingType(value.1.to_string()).err(expr.1);
                 };
 
                 let var = self.builder.declare_var(var_type);
@@ -880,8 +1087,11 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     let value = self.build_expression(expr, Some(var_type.clone()))?;
 
                     if value.1 != var_type {
-                        return CodeError::AssignmentIncompatibleTypes(var_type, value.1)
-                            .err(statement.1);
+                        return CodeError::AssignmentIncompatibleTypes(
+                            var_type.to_string(),
+                            value.1.to_string(),
+                        )
+                        .err(statement.1);
                     }
 
                     self.builder.def_var(var, value.0);
@@ -939,11 +1149,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         return_dest: Value,
     ) {
         // Align current offset to field's alignment requirement
-        let field_align_shift = struct_field.r#type.align_shift();
+        let field_align_shift = self.state.types.align_shift(&struct_field.r#type);
         *current_offset = Self::align_to(*current_offset, field_align_shift);
 
         match &struct_field.r#type {
-            Type::Struct(struct_type) => {
+            Type::Struct(struct_id) => {
+                let struct_type = self.state.types.structs[struct_id].clone();
                 // For nested structs, recursively copy each field
                 for field in struct_type.fields.values() {
                     self.build_return_field_copy(field, current_offset, struct_addr, return_dest);
@@ -966,7 +1177,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     .store(MemFlags::trusted(), value, return_dest, *current_offset);
 
                 // Advance offset by field size
-                *current_offset += struct_field.r#type.size() as i32;
+                *current_offset += self.state.types.size(&struct_field.r#type) as i32;
             }
         }
     }
@@ -983,7 +1194,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         if self.current_func_type.name == "main" {
             if value.1 != Type::Never && value.1 != Type::I32 {
                 // self.builder.ins().return_(&[]);
-                return CodeError::InvalidReturnType(Type::I32, value.1).err(expr.1);
+                return CodeError::InvalidReturnType(Type::I32.to_string(), value.1.to_string())
+                    .err(expr.1);
             }
             if value.1 != Type::Never {
                 self.builder.ins().return_(&[value.0]);
@@ -991,8 +1203,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         } else {
             if value.1 != Type::Never && *self.current_func_type.return_type != value.1 {
                 return CodeError::InvalidReturnType(
-                    (*self.current_func_type.return_type).clone(),
-                    value.1.clone(),
+                    self.current_func_type.return_type.to_string(),
+                    value.1.to_string(),
                 )
                 .err(expr.1);
             }
@@ -1002,7 +1214,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Type::Void => {
                     self.builder.ins().return_(&[]);
                 }
-                Type::Struct(struct_type) => {
+                Type::Struct(struct_id) => {
+                    let struct_type = &self.state.types.structs[&struct_id].clone();
                     let return_dest = self
                         .return_dest
                         .expect("Return destination must be valid when returning struct.");
@@ -1043,7 +1256,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
                 let mut check_and_emit = |min: i64, max: i64, cranelift_type, out_type: Type| {
                     if *value < min || *value > max {
-                        CodeError::CoerseInt(out_type.clone(), *value).err(*span)
+                        CodeError::CoerseInt(out_type.to_string(), *value).err(*span)
                     } else {
                         Ok((self.builder.ins().iconst(cranelift_type, *value), out_type))
                     }
@@ -1067,7 +1280,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     Type::I64 => Ok((self.builder.ins().iconst(types::I64, *value), Type::I64)),
                     Type::U64 => {
                         if *value < 0 {
-                            CodeError::CoerseInt(Type::U64, *value).err(*span)
+                            CodeError::CoerseInt(Type::U64.to_string(), *value).err(*span)
                         } else {
                             Ok((self.builder.ins().iconst(types::I64, *value), Type::U64))
                         }
@@ -1114,7 +1327,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 let y_value = self.build_expression(y.as_ref(), try_into_type)?;
 
                 if x_value.1 != y_value.1 {
-                    return CodeError::IncompatipleBinOpTypes(*op, x_value.1, y_value.1).err(*span);
+                    return CodeError::IncompatipleBinOpTypes(
+                        *op,
+                        x_value.1.to_string(),
+                        y_value.1.to_string(),
+                    )
+                    .err(*span);
                 }
 
                 let result = match x_value.1 {
@@ -1125,7 +1343,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         self.build_float_bin_op(*op, x_value.0, y_value.0, x_value.1)
                     }
                     Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
-                    Type::Enum(enum_type) if matches!(*op, BinOp::Equal | BinOp::NotEqual) => {
+                    Type::Enum(enum_id) if matches!(*op, BinOp::Equal | BinOp::NotEqual) => {
+                        let enum_type = &self.state.types.enums[&enum_id];
                         let result = if enum_type.variants.len() <= 1 {
                             let always = if *op == BinOp::Equal { 1 } else { 0 };
                             self.builder.ins().iconst(types::I8, always)
@@ -1141,7 +1360,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     }
                     _ => None,
                 }
-                .ok_or_else(|| CodeError::InvalidBinOpType(*op, y_value.1).spanned(*span))?;
+                .ok_or_else(|| {
+                    CodeError::InvalidBinOpType(*op, y_value.1.to_string()).spanned(*span)
+                })?;
                 Ok(result)
             }
             Expression::Unary(op, expr) => {
@@ -1150,7 +1371,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     let result = self.builder.ins().bxor_imm(value.0, 1);
                     Ok((result, Type::Bool))
                 } else {
-                    CodeError::InvalidUnOpType(*op, value.1).err(*span)
+                    CodeError::InvalidUnOpType(*op, value.1.to_string()).err(*span)
                 }
             }
             Expression::Intrinsic(intrinsic, args) => match intrinsic {
@@ -1175,25 +1396,28 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             },
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
             Expression::FieldAccess(expr, field_name) => {
-                if let Some(symbol) = self.resolve_expr_as_symbol(expr) {
+                if let Some(symbol) = self.resolve_expr_as_symbol(expr).cloned() {
                     return match symbol {
                         Symbol::Module(_) => {
                             CodeError::ModuleUsedAsValue(field_name.0.clone()).err(field_name.1)
                         }
-                        Symbol::Type(Type::Enum(enum_type)) => {
-                            let enum_type = enum_type.clone();
-                            let Some(idx) = enum_type.variants.get_index_of(&field_name.0) else {
+                        Symbol::Type(Type::Enum(enum_id)) => {
+                            let Some(idx) = self.state.types.enums[&enum_id]
+                                .variants
+                                .get_index_of(&field_name.0)
+                            else {
                                 return CodeError::UnknownVariant(
-                                    enum_type.name.clone(),
+                                    self.state.types.type_name(enum_id),
                                     field_name.0.clone(),
                                 )
                                 .err(field_name.1);
                             };
                             let val = self.builder.ins().iconst(types::I32, idx as i64);
-                            return Ok((val, Type::Enum(enum_type)));
+                            return Ok((val, Type::Enum(enum_id)));
                         }
-                        Symbol::Type(Type::Struct(struct_type)) => {
-                            CodeError::TypeUsedAsValue(struct_type.name.clone()).err(expr.1)
+                        Symbol::Type(Type::Struct(struct_id)) => {
+                            CodeError::TypeUsedAsValue(self.state.types.type_name(struct_id))
+                                .err(expr.1)
                         }
                         Symbol::Type(_) => {
                             unreachable!("Only struct and enum types may be imported.")
@@ -1210,13 +1434,15 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 let expr_value = self.build_expression(expr, None)?;
                 let name = field_name;
                 let field = match &expr_value.1 {
-                    Type::Struct(struct_type) if struct_type.fields.contains_key(&name.0) => {
-                        &struct_type.fields[&name.0]
+                    Type::Struct(struct_id) => {
+                        self.state.types.structs[struct_id].fields.get(&name.0)
                     }
-                    _ => {
-                        return CodeError::UnknownField(expr_value.1, name.0.clone()).err(name.1);
-                    }
-                };
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    CodeError::UnknownField(expr_value.1.to_string(), name.0.clone())
+                        .spanned(name.1)
+                })?;
 
                 let field_crane_type = self
                     .state
@@ -1243,7 +1469,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 for arg in &struct_init.args {
                     let maybe_type = r#type
                         .as_ref()
-                        .and_then(|r#type| r#type.struct_type())
+                        .and_then(|r#type| self.state.types.struct_type(r#type))
                         .and_then(|struct_type| struct_type.fields.get(&arg.0.0).cloned())
                         .map(|struct_field| struct_field.r#type);
 
@@ -1270,8 +1496,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     return Err(errors);
                 };
 
-                let Type::Struct(struct_type) = &r#type else {
-                    errors.push(CodeError::NotStructType(r#type).spanned(path_span));
+                let Type::Struct(struct_id) = &r#type else {
+                    errors.push(CodeError::NotStructType(r#type.to_string()).spanned(path_span));
                     return Err(errors);
                 };
 
@@ -1279,10 +1505,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     return Err(errors);
                 }
 
+                let struct_type = &self.state.types.structs[struct_id];
+
                 let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    struct_type.size(),
-                    struct_type.align_shift(),
+                    struct_type.size,
+                    struct_type.align_shift,
                 ));
 
                 let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
@@ -1295,8 +1523,11 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
                     if value.1 != field.r#type {
                         errors.push(
-                            CodeError::StructInitInvalidType(field.r#type.clone(), value.1.clone())
-                                .spanned(*span),
+                            CodeError::StructInitInvalidType(
+                                field.r#type.to_string(),
+                                value.1.to_string(),
+                            )
+                            .spanned(*span),
                         );
                         continue;
                     }
@@ -1455,11 +1686,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         Type::Bool,
                         Type::String,
                     ];
+                    const PRINT_ARG_TYPE_NAMES: [&str; 10] = [
+                        "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "bool", "string",
+                    ];
                     if !PRINT_ARG_TYPES.contains(&value.1) && !matches!(value.1, Type::Enum(_)) {
                         return CodeError::IntrisicArgumentType(
                             "print",
-                            &PRINT_ARG_TYPES,
-                            value.1.clone(),
+                            &PRINT_ARG_TYPE_NAMES,
+                            value.1.to_string(),
                         )
                         .err(expr.1);
                     }
@@ -1540,7 +1774,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Ok(condition_value) if condition_value.1 == Type::Bool => condition_value,
                 Ok((_, r#type)) => {
                     errors.push(
-                        CodeError::InvalidConditionType(r#type).spanned(conditional.condition.1),
+                        CodeError::InvalidConditionType(r#type.to_string())
+                            .spanned(conditional.condition.1),
                     );
                     continue;
                 }
@@ -1622,7 +1857,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         let condition_value = self.build_expression(condition, None)?;
         if condition_value.1 != Type::Bool {
-            return CodeError::InvalidConditionType(condition_value.1.clone()).err(condition.1);
+            return CodeError::InvalidConditionType(condition_value.1.to_string()).err(condition.1);
         }
 
         self.builder
@@ -1673,7 +1908,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         let condition = self.build_expression(&args[0], None)?;
         if condition.1 != Type::Bool {
-            return CodeError::IntrisicArgumentType("assert", &[Type::Bool], condition.1)
+            return CodeError::IntrisicArgumentType("assert", &["bool"], condition.1.to_string())
                 .err(args[0].1);
         }
 
@@ -1715,7 +1950,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         let expr = self.build_expression(&args[0], Some(Type::I32))?;
         if expr.1 != Type::I32 {
-            return CodeError::IntrisicArgumentType("exit", &[Type::I32], expr.1).err(args[0].1);
+            return CodeError::IntrisicArgumentType("exit", &["i32"], expr.1.to_string())
+                .err(args[0].1);
         }
 
         let exit_ref = self
@@ -1738,7 +1974,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         let expr = self.build_expression(&args[0], None)?;
         if !matches!(expr.1, Type::Enum(_)) {
-            return CodeError::IntrinsicExpectedEnum("enumToInt", expr.1).err(args[0].1);
+            return CodeError::IntrinsicExpectedEnum("enumToInt", expr.1.to_string())
+                .err(args[0].1);
         }
 
         Ok((expr.0, Type::I32))
@@ -1807,9 +2044,10 @@ impl GeneratorState<'_> {
                 errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
             param_types.push(r#type.clone());
-            let purpose = if let Type::Struct(struct_type) = &r#type
+            let purpose = if let Type::Struct(struct_id) = &r#type
                 && *is_extern
             {
+                let struct_type = &self.types.structs[struct_id];
                 ArgumentPurpose::StructArgument(struct_type.size_pad_8())
             } else {
                 ArgumentPurpose::Normal
@@ -1834,7 +2072,7 @@ impl GeneratorState<'_> {
                 Type::Void => (Type::I32, true),
                 Type::I32 => (Type::I32, false),
                 other => {
-                    errors.push(CodeError::MainInvalidReturnType(other.clone()).spanned(*span));
+                    errors.push(CodeError::MainInvalidReturnType(other.to_string()).spanned(*span));
                     (Type::I32, false)
                 }
             }
@@ -1846,7 +2084,7 @@ impl GeneratorState<'_> {
             return Err(errors);
         }
 
-        if return_type.size() > 8 {
+        if self.types.size(&return_type) > 8 {
             todo!("Return values larger than 8 bytes.")
         }
 
@@ -2162,8 +2400,8 @@ impl FnGenerator<'_, '_> {
                 if value.1 != *param_type {
                     return CodeError::FunctionCallArgumentType(
                         expr_callee_name(&callee.0),
-                        param_type.clone(),
-                        value.1,
+                        param_type.to_string(),
+                        value.1.to_string(),
                     )
                     .err(expr.1);
                 }
@@ -2172,15 +2410,13 @@ impl FnGenerator<'_, '_> {
             })
             .collect::<Result<Vec<Value>, ManyErrors>>()?;
 
-        if let Type::Struct(struct_type) = &*func_type.return_type {
+        if let Type::Struct(struct_id) = &*func_type.return_type {
+            let (size, align_shift) = self.state.types.layout(&Type::Struct(*struct_id));
             if func_type.is_extern {
                 todo!("Extern return structs.");
             }
-            let stack_slot_data = StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                struct_type.size(),
-                struct_type.align_shift(),
-            );
+            let stack_slot_data =
+                StackSlotData::new(StackSlotKind::ExplicitSlot, size, align_shift);
             let stack_slot = self.builder.create_sized_stack_slot(stack_slot_data);
 
             let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
@@ -2232,9 +2468,8 @@ impl GeneratorState<'_> {
                 errors.push(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1));
                 continue;
             };
-
-            let field_size = field_type.size() as i32;
-            let field_align = 1i32 << field_type.align_shift();
+            let (field_size, field_align_shift) = self.types.layout(&field_type);
+            let field_align = 1i32 << field_align_shift;
             let padding = (field_align - (current_offset % field_align)) % field_align;
             current_offset += padding;
             fields.insert(
@@ -2244,23 +2479,23 @@ impl GeneratorState<'_> {
                     offset: current_offset,
                 },
             );
-            current_offset += field_size;
+            current_offset += field_size as i32;
         }
 
         if !errors.is_empty() {
             return Err(errors);
         }
 
-        let struct_type = StructType {
-            name: decl.name.0.clone(),
-            fields,
-        };
+        let name = QualifiedName(self.current_module, decl.name.0.clone());
+        let struct_type = StructType::new(name, fields, &self.types);
+        let struct_id = self.types.alloc_type_id(self.current_module);
 
         if self.verbose {
             println!("Defined struct: \n {struct_type:?}");
         }
+        self.types.structs.insert(struct_id, struct_type);
         self.current_scope
-            .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Struct(struct_type)))
+            .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Struct(struct_id)))
             .expect("Must not overwrite symbol");
         Ok(())
     }
@@ -2289,16 +2524,18 @@ impl GeneratorState<'_> {
         }
 
         let enum_type = EnumType {
-            name: decl.name.0.clone(),
+            name: QualifiedName(self.current_module, decl.name.0.clone()),
             variants,
         };
+        let enum_id = self.types.alloc_type_id(self.current_module);
 
         if self.verbose {
             println!("Defined enum: \n {enum_type:?}");
         }
 
+        self.types.enums.insert(enum_id, enum_type);
         self.current_scope
-            .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Enum(enum_type)))
+            .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Enum(enum_id)))
             .expect("Must not overwrite symbol");
 
         Ok(())
@@ -2316,10 +2553,11 @@ impl GeneratorState<'_> {
             Type::String => self.isa.pointer_type(),
             Type::Bool => types::I8,
             Type::Enum(_) => types::I32,
-            Type::Struct(struct_type) => {
+            Type::Struct(struct_id) => {
+                let struct_type = &self.types.structs[struct_id];
                 // StructArgument must have a size that's a multiple of 8 byte
                 purpose = ArgumentPurpose::StructArgument(struct_type.size_pad_8());
-                match struct_type.size() {
+                match struct_type.size {
                     0..=8 => types::I64,
                     9..=16 if self.isa.default_call_conv() == CallConv::SystemV => types::I128, // TODO: test this
                     _ => self.isa.pointer_type(),
