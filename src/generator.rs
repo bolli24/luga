@@ -67,6 +67,7 @@ pub enum Type {
     Fn(FuncType),
     Struct(TypeId),
     Enum(TypeId),
+    Error,
 }
 
 impl Type {
@@ -91,6 +92,10 @@ impl Type {
     fn is_unsigned_int(&self) -> bool {
         matches!(self, Self::U8 | Self::U16 | Self::U32 | Self::U64)
     }
+}
+
+fn can_coerce_type(actual: &Type, expected: &Type) -> bool {
+    matches!(actual, Type::Never | Type::Error) || actual == expected
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +214,7 @@ impl std::fmt::Display for DisplayType<'_> {
             Type::Fn(func_type) => {
                 write!(f, "{}", func_type.display(self.types))
             }
+            Type::Error => write!(f, "ERROR"),
         }
     }
 }
@@ -233,6 +239,7 @@ impl Display for Type {
             Self::Fn(func_type) => write!(f, "{func_type}"),
             Self::Struct(id) => write!(f, "<struct {id:?}>"),
             Self::Enum(id) => write!(f, "<enum {id:?}>"),
+            Self::Error => write!(f, "ERROR"),
         }
     }
 }
@@ -427,6 +434,7 @@ impl TypeContext {
                 (struct_type.size, struct_type.align_shift)
             }
             Type::Enum(_) => self.layout(&Type::U32),
+            Type::Error => (0, 0),
         }
     }
 
@@ -910,11 +918,22 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 self.build_expression(expr, None)?;
             }
             Statement::Binding(name, expr) => {
-                let value = self.build_expression(expr, None)?;
-
                 if self.state.current_scope.symbols.contains_key(name) {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 };
+
+                let value = match self.build_expression(expr, None) {
+                    Ok(value) => value,
+                    Err(errors) => {
+                        self.new_error_var(name.to_owned());
+                        return Err(errors);
+                    }
+                };
+
+                if value.1 == Type::Error {
+                    self.new_error_var(name.to_owned());
+                    return Ok(false);
+                }
 
                 let Some(var_type) = self.state.get_crane_type(&value.1) else {
                     return CodeError::BindingType(value.1.to_string()).err(expr.1);
@@ -929,12 +948,16 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     let (var, var_type) = (*var, var_type.clone());
                     let value = self.build_expression(expr, Some(var_type.clone()))?;
 
-                    if value.1 != var_type {
+                    if !can_coerce_type(&value.1, &var_type) {
                         return CodeError::AssignmentIncompatibleTypes(
                             var_type.to_string(),
                             value.1.to_string(),
                         )
                         .err(statement.1);
+                    }
+
+                    if matches!(value.1, Type::Never | Type::Error) {
+                        return Ok(value.1 == Type::Never);
                     }
 
                     self.builder.def_var(var, value.0);
@@ -1034,17 +1057,20 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_return(&mut self, expr: &Spanned<Expression>) -> Result<bool, ManyErrors> {
         let value =
             self.build_expression(expr, Some(*self.current_func_type.return_type.clone()))?;
+        if value.1 == Type::Error {
+            return Ok(false);
+        }
         if self.current_func_type.name == "main" {
-            if value.1 != Type::Never && value.1 != Type::I32 {
+            if !can_coerce_type(&value.1, &Type::I32) {
                 // self.builder.ins().return_(&[]);
                 return CodeError::InvalidReturnType(Type::I32.to_string(), value.1.to_string())
                     .err(expr.1);
             }
-            if value.1 != Type::Never {
+            if !matches!(value.1, Type::Never | Type::Error) {
                 self.builder.ins().return_(&[value.0]);
             }
         } else {
-            if value.1 != Type::Never && *self.current_func_type.return_type != value.1 {
+            if !can_coerce_type(&value.1, &self.current_func_type.return_type) {
                 return CodeError::InvalidReturnType(
                     self.current_func_type.return_type.to_string(),
                     value.1.to_string(),
@@ -1169,6 +1195,15 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 let x_value = self.build_expression(x.as_ref(), try_into_type.clone())?;
                 let y_value = self.build_expression(y.as_ref(), try_into_type)?;
 
+                if x_value.1 == Type::Never || y_value.1 == Type::Never {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                }
+
+                if x_value.1 == Type::Error || y_value.1 == Type::Error {
+                    let value = self.builder.ins().iconst(types::I32, 0);
+                    return Ok((value, Type::Error));
+                }
+
                 if x_value.1 != y_value.1 {
                     return CodeError::IncompatipleBinOpTypes(
                         *op,
@@ -1210,6 +1245,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             }
             Expression::Unary(op, expr) => {
                 let value = self.build_expression(expr.as_ref(), try_into_type)?;
+                if matches!(value.1, Type::Never | Type::Error) {
+                    return Ok(value);
+                }
+
                 if value.1 == Type::Bool && *op == UnOp::Not {
                     let result = self.builder.ins().bxor_imm(value.0, 1);
                     Ok((result, Type::Bool))
@@ -1275,6 +1314,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 }
 
                 let expr_value = self.build_expression(expr, None)?;
+                if matches!(expr_value.1, Type::Never | Type::Error) {
+                    return Ok(expr_value);
+                }
                 let name = field_name;
                 let field = match &expr_value.1 {
                     Type::Struct(struct_id) => {
@@ -1357,6 +1399,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 ));
 
                 let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
+                let mut poison_type = None;
 
                 for (name, field) in &struct_type.fields {
                     let Some(value) = arg_values.get(name) else {
@@ -1364,7 +1407,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         continue;
                     };
 
-                    if value.1 != field.r#type {
+                    if !can_coerce_type(&value.1, &field.r#type) {
                         errors.push(
                             CodeError::StructInitInvalidType(
                                 field.r#type.to_string(),
@@ -1372,6 +1415,11 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                             )
                             .spanned(*span),
                         );
+                        continue;
+                    }
+
+                    if matches!(value.1, Type::Never | Type::Error) {
+                        poison_type = Some(value.1.clone());
                         continue;
                     }
 
@@ -1385,6 +1433,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
                 if !errors.is_empty() {
                     return Err(errors);
+                }
+
+                if let Some(poison_type) = poison_type {
+                    return Ok((Value::from_u32(u32::MAX - 1), poison_type));
                 }
 
                 Ok((struct_addr, r#type))
@@ -1532,6 +1584,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     const PRINT_ARG_TYPE_NAMES: [&str; 10] = [
                         "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "bool", "string",
                     ];
+                    if matches!(value.1, Type::Never | Type::Error) {
+                        return Ok((value.0, value.1.clone()));
+                    }
                     if !PRINT_ARG_TYPES.contains(&value.1) && !matches!(value.1, Type::Enum(_)) {
                         return CodeError::IntrisicArgumentType(
                             "print",
@@ -1545,6 +1600,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             })
             .collect_all()
             .map_err(|errors| errors.into_iter().flatten().collect::<ManyErrors>())?;
+
+        if arg_values.iter().any(|(_, ty)| *ty == Type::Never) {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+        }
+
+        if arg_values.iter().any(|(_, ty)| *ty == Type::Error) {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+        }
 
         let format_string_value = self.build_expression(&format_string_arg, None)?;
         debug_assert_eq!(format_string_value.1, Type::String);
@@ -1586,6 +1649,13 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.var_count += 1;
     }
 
+    fn new_error_var(&mut self, name: String) {
+        let var = self.builder.declare_var(types::I32);
+        let value = self.builder.ins().iconst(types::I32, 0);
+        self.builder.def_var(var, value);
+        self.new_var(name, var, (value, Type::Error));
+    }
+
     // TODO: if expression
     // TODO: add clif comments to blocks
     fn build_if(&mut self, if_statement: &If) -> Result<bool, ManyErrors> {
@@ -1610,30 +1680,43 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         for (index, conditional) in if_statement.if_branches.iter().enumerate() {
             let condition_block = condition_blocks[index];
-            let then_block = self.builder.create_block();
-            self.builder.seal_block(condition_block);
-            self.builder.switch_to_block(condition_block);
-            let condition_value = match self.build_expression(&conditional.condition, None) {
-                Ok(condition_value) if condition_value.1 == Type::Bool => condition_value,
-                Ok((_, r#type)) => {
-                    errors.push(
-                        CodeError::InvalidConditionType(r#type.to_string())
-                            .spanned(conditional.condition.1),
-                    );
-                    continue;
-                }
-                Err(mut err) => {
-                    errors.append(&mut err);
-                    continue;
-                }
-            };
-
             let next_block: Block = condition_blocks
                 .get(index + 1)
                 .copied()
                 .or(else_block)
                 .unwrap_or(exit_block);
 
+            self.builder.seal_block(condition_block);
+            self.builder.switch_to_block(condition_block);
+            let condition_value = match self.build_expression(&conditional.condition, None) {
+                Ok((_, Type::Never)) => {
+                    self.builder.ins().jump(next_block, []);
+                    continue;
+                }
+                Ok((_, Type::Error)) => {
+                    returned = false;
+                    self.builder.ins().jump(next_block, []);
+                    continue;
+                }
+                Ok(condition_value) if can_coerce_type(&condition_value.1, &Type::Bool) => {
+                    condition_value
+                }
+                Ok((_, r#type)) => {
+                    errors.push(
+                        CodeError::InvalidConditionType(r#type.to_string())
+                            .spanned(conditional.condition.1),
+                    );
+                    self.builder.ins().jump(next_block, []);
+                    continue;
+                }
+                Err(mut err) => {
+                    errors.append(&mut err);
+                    self.builder.ins().jump(next_block, []);
+                    continue;
+                }
+            };
+
+            let then_block = self.builder.create_block();
             self.builder
                 .ins()
                 .brif(condition_value.0, then_block, [], next_block, []);
@@ -1699,7 +1782,15 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.builder.switch_to_block(condition_block);
 
         let condition_value = self.build_expression(condition, None)?;
-        if condition_value.1 != Type::Bool {
+        if matches!(condition_value.1, Type::Never | Type::Error) {
+            self.builder.ins().jump(exit_block, []);
+            self.builder.switch_to_block(exit_block);
+            self.builder.seal_block(condition_block);
+            self.builder.seal_block(while_block);
+            self.builder.seal_block(exit_block);
+            return Ok(false);
+        }
+        if !can_coerce_type(&condition_value.1, &Type::Bool) {
             return CodeError::InvalidConditionType(condition_value.1.to_string()).err(condition.1);
         }
 
@@ -1750,7 +1841,13 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
 
         let condition = self.build_expression(&args[0], None)?;
-        if condition.1 != Type::Bool {
+        if condition.1 == Type::Never {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+        }
+        if condition.1 == Type::Error {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+        }
+        if !can_coerce_type(&condition.1, &Type::Bool) {
             return CodeError::IntrisicArgumentType("assert", &["bool"], condition.1.to_string())
                 .err(args[0].1);
         }
@@ -1792,7 +1889,13 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
 
         let expr = self.build_expression(&args[0], Some(Type::I32))?;
-        if expr.1 != Type::I32 {
+        if expr.1 == Type::Never {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+        }
+        if expr.1 == Type::Error {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+        }
+        if !can_coerce_type(&expr.1, &Type::I32) {
             return CodeError::IntrisicArgumentType("exit", &["i32"], expr.1.to_string())
                 .err(args[0].1);
         }
@@ -1816,6 +1919,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
 
         let expr = self.build_expression(&args[0], None)?;
+        if expr.1 == Type::Never {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+        }
+        if expr.1 == Type::Error {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+        }
         if !matches!(expr.1, Type::Enum(_)) {
             return CodeError::IntrinsicExpectedEnum("enumToInt", expr.1.to_string())
                 .err(args[0].1);
@@ -2235,12 +2344,12 @@ impl FnGenerator<'_, '_> {
             .err(*span);
         }
 
-        let mut arg_values = args
+        let arg_values = args
             .iter()
             .zip(func_type.params.iter())
             .map(|(expr, param_type)| {
                 let value = self.build_expression(expr, Some(param_type.clone()))?;
-                if value.1 != *param_type {
+                if !can_coerce_type(&value.1, param_type) {
                     return CodeError::FunctionCallArgumentType(
                         expr_callee_name(&callee.0),
                         param_type.to_string(),
@@ -2249,9 +2358,22 @@ impl FnGenerator<'_, '_> {
                     .err(expr.1);
                 }
 
-                Ok(value.0)
+                Ok(value)
             })
-            .collect::<Result<Vec<Value>, ManyErrors>>()?;
+            .collect::<Result<Vec<(Value, Type)>, ManyErrors>>()?;
+
+        if arg_values.iter().any(|(_, ty)| *ty == Type::Never) {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+        }
+
+        if arg_values.iter().any(|(_, ty)| *ty == Type::Error) {
+            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+        }
+
+        let mut arg_values = arg_values
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect::<Vec<_>>();
 
         if let Type::Struct(struct_id) = &*func_type.return_type {
             let (size, align_shift) = self.state.types.layout(&Type::Struct(*struct_id));
@@ -2447,10 +2569,67 @@ fn combine_spans(a: SimpleSpan, b: SimpleSpan) -> SimpleSpan {
     SimpleSpan::new(a.context, a.start..b.end)
 }
 
-fn join<T: ToString>(items: &[T]) -> String {
-    items
-        .iter()
-        .map(|item| item.to_string())
-        .collect::<Vec<String>>()
-        .join(", ")
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use luga_syntax::parse_source;
+
+    use super::*;
+
+    fn generation_errors(src: &str) -> ManyErrors {
+        let path = Path::new("test.luga");
+        let program = parse_source(path, src, false)
+            .unwrap_or_else(|err| panic!("test source must parse: {}", err.short_reason()));
+
+        match generate(program, path, false, false) {
+            Err(GeneratorErrors::CodeErrors(errors)) => errors,
+            Err(GeneratorErrors::VerifierErrors(errors)) => {
+                panic!("expected code errors, got verifier errors: {errors:?}")
+            }
+            Err(GeneratorErrors::MissingMain) => panic!("expected code errors, got missing main"),
+            Ok(_) => panic!("expected code errors"),
+        }
+    }
+
+    fn has_unreachable(errors: &ManyErrors) -> bool {
+        errors
+            .iter()
+            .any(|Spanned(error, _)| matches!(error, CodeError::UnreachableStatement))
+    }
+
+    #[test]
+    fn poisoned_return_expression_does_not_make_following_statement_unreachable() {
+        let errors = generation_errors(
+            r#"
+fn main() {
+    let bad = "x" + 1;
+    return bad;
+    @println("after");
+}
+"#,
+        );
+
+        assert!(!has_unreachable(&errors));
+    }
+
+    #[test]
+    fn poisoned_if_condition_does_not_make_else_branch_prove_return() {
+        let errors = generation_errors(
+            r#"
+fn main() {
+    let bad = "x" + 1;
+    if (bad) {
+        @println("then");
+    } else {
+        return 0;
+    }
+    @println("after");
+}
+"#,
+        );
+
+        assert!(!has_unreachable(&errors));
+    }
 }
