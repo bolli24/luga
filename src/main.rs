@@ -464,3 +464,22 @@ fn extract_runtime_lib() -> io::Result<PathBuf> {
 
     Ok(lib_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_test_files() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test");
+        for release in [false, true] {
+            let cli = Cli {
+                release,
+                verbose: false,
+                command: CliCommand::Test { path: path.clone() },
+            };
+
+            assert!(test_files(&cli, &path).is_ok());
+        }
+    }
+}
