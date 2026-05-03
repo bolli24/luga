@@ -326,14 +326,14 @@ fn build_file(
 ) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
-    let file_name = base_name.to_string_lossy().to_string();
 
     let src = fs::read_to_string(file_path)
         .map_err(|err| BuildError::Io(file_path.to_path_buf(), err))?;
 
     let program = parse_source(&src, verbose).map_err(|err| {
+        let diagnostic_path = diagnostic_path(file_path);
         let src_report = Source::from(src.as_str());
-        err.report(&file_name, &src_report);
+        err.report(&diagnostic_path, &src_report);
         match err {
             ParseFailure::Lex(_) => BuildError::Lexer(file_path.to_path_buf()),
             ParseFailure::Parse(_) => BuildError::Parser(file_path.to_path_buf()),
@@ -348,11 +348,10 @@ fn build_file(
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::ModuleErrors(modules) => {
+                let diagnostic_path = diagnostic_path(file_path);
                 for module_errors in modules {
                     let src_report = Source::from(module_errors.src.as_str());
-                    let module_file_name = module_errors.path.display().to_string();
-
-                    report_compile_errors(&module_file_name, &src_report, module_errors.errors);
+                    report_compile_errors(&diagnostic_path, &src_report, module_errors.errors);
                 }
 
                 return Err(BuildError::Generator(file_path.into()));
@@ -417,6 +416,25 @@ fn build_file(
     }
 
     Ok(exe_file)
+}
+
+fn diagnostic_path(file_path: &Path) -> String {
+    let path = if file_path.is_absolute() {
+        env::current_dir()
+            .ok()
+            .and_then(|cwd| {
+                let cwd = cwd.canonicalize().unwrap_or(cwd);
+                let file_path = file_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| file_path.to_path_buf());
+                file_path.strip_prefix(cwd).ok().map(Path::to_path_buf)
+            })
+            .unwrap_or_else(|| file_path.to_path_buf())
+    } else {
+        file_path.to_path_buf()
+    };
+
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn clean() -> Result<(), ()> {
