@@ -1,0 +1,10 @@
+[package]
+name = "luga_syntax"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariadne = "0.6"
+chumsky = "0.12"
+logos = "0.16"
+thiserror = "2.0"

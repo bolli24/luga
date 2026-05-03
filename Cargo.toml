@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["runtime", "lsp"]
+members = ["runtime", "lsp", "crates/luga_syntax"]
 
 [dependencies]
-chumsky = "0.12"
 ariadne = "0.6"
-logos = "0.16"
 thiserror = "2.0"
+luga_syntax = { path = "crates/luga_syntax" }
 
 cranelift = { version = "0.130", features = [
     "core",

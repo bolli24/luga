@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use ariadne::Source;
-use luga::generator::{GeneratorErrors, generate};
+use luga::GeneratorErrors;
+use luga::errors::report_compile_errors;
+use luga::generator::generate;
+use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
 
 use colored::Colorize;
@@ -10,10 +13,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, io};
-
-use luga::parsing::{ParseFailure, parse_source, report_compile_errors};
-
-pub use chumsky::span::SimpleSpan;
 
 #[derive(clap::Parser)]
 struct Cli {

@@ -1,4 +1,3 @@
-use crate::generator::CompileError;
 use crate::lexer::{LexingError, Token};
 use crate::parser::{Program, Spanned, luga_parser};
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -26,15 +25,6 @@ impl ParseFailure {
         match self {
             Self::Lex(errors) => report_errors(file_name, src, errors),
             Self::Parse(errors) => report_errors(file_name, src, errors),
-        }
-    }
-}
-
-impl From<ParseFailure> for Vec<CompileError> {
-    fn from(value: ParseFailure) -> Self {
-        match value {
-            ParseFailure::Lex(errors) => errors.into_iter().map(CompileError::Lex).collect(),
-            ParseFailure::Parse(errors) => errors.into_iter().map(CompileError::Parse).collect(),
         }
     }
 }
@@ -108,20 +98,5 @@ pub fn report_errors<'a, T>(
 {
     for err in errors {
         report_error(file_name, src, err);
-    }
-}
-
-pub fn report_compile_errors(
-    file_name: &str,
-    src: &Source<&str>,
-    errors: impl IntoIterator<Item = CompileError>,
-) {
-    for err in errors {
-        match err {
-            CompileError::Code(err) => report_error(file_name, src, &err),
-            CompileError::Lex(err) => report_error(file_name, src, &err),
-            CompileError::Parse(err) => report_error(file_name, src, &err),
-            CompileError::ModuleInner => {}
-        }
     }
 }

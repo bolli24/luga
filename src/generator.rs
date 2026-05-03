@@ -6,17 +6,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chumsky::span::{SimpleSpan, Span};
 use cranelift::{
-    codegen::{Context, ir::ArgumentPurpose, verifier::VerifierError},
+    codegen::{Context, ir::ArgumentPurpose},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::{isa::CallConv, *},
 };
 use indexmap::{IndexMap, IndexSet};
 
-use crate::{lexer::LexingError, util::ResultCollectAll};
-use crate::{
+use luga_syntax::{SimpleSpan, Span};
+use luga_syntax::{
     parser::{
         BinOp, Conditional, EnumDecl, Expression, FunctionDecl, If, Intrinsic, Param, Program,
         Spanned, Statement, StructDecl, TopLevelItem, UnOp,
@@ -24,161 +23,12 @@ use crate::{
     parsing::parse_source,
 };
 
+use crate::errors::{
+    CodeError, CompileError, GeneratorErrors, MainModuleError, ManyErrors, ModuleErrors,
+};
+use crate::util::ResultCollectAll;
+
 const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum CodeError {
-    #[error("Invalid type of return value. Exprected '{}' but found: '{}'", .0, .1)]
-    InvalidReturnType(String, String),
-
-    #[error("{} isn't supported yet.", .0)]
-    NoYetSupported(String),
-
-    #[error("Incompatiple types for binary operator '{}': '{}' and '{}'", .0, .1, .2)]
-    IncompatipleBinOpTypes(BinOp, String, String),
-    #[error("Invalid type '{}' for binary operator '{}'", .1 ,.0)]
-    InvalidBinOpType(BinOp, String),
-    #[error("Invalid type '{}' for unary operator '{}'", .1 ,.0)]
-    InvalidUnOpType(UnOp, String),
-
-    #[error("Intrisic '@{}' invoked with too few arguments. Expected at least {} but found {}.", .0, .1, .2)]
-    IntrinsicTooFewArguments(&'static str, usize, usize),
-    #[error("Intrisic '@{}' invoked with too many arguments. Expected at most {} but found {}.", .0, .1, .2)]
-    IntrinsicTooManyArguments(&'static str, usize, usize),
-    #[error("Intrisic '@{}' invoked wrong number of arguments. Expected exactly {} but found {}.", .0, .1, .2)]
-    IntrinsicArgumentCount(&'static str, usize, usize),
-    #[error("Intrisic '@{}' invoked with wrong argument type. Expected one of '{}' but found '{}'.", .0, join(.1), .2)]
-    IntrisicArgumentType(&'static str, &'static [&'static str], String),
-    #[error("Intrinsic '@{}' expected an enum type but found '{}'.", .0, .1)]
-    IntrinsicExpectedEnum(&'static str, String),
-
-    #[error("Expected string literal.")]
-    ExpectedStringLiteral,
-
-    #[error("Redefinition of existing variable '{}'.", .0)]
-    VariableRedefinition(String),
-    #[error("Use of unknown variable '{}'.", .0)]
-    UnknownVariable(String),
-    #[error("Can't assign value of type '{}' to variable of type '{}'.", .1, .0)]
-    AssignmentIncompatibleTypes(String, String),
-    #[error("Can't create variable of type '{}'.", .0)]
-    BindingType(String),
-    #[error("Can't capture variable '{0}' outside of function scope")]
-    Capture(String),
-
-    #[error("Invalid type '{}' for condition. Must be 'bool'.", .0)]
-    InvalidConditionType(String),
-    #[error("All branches of an if expression must have same type.")]
-    IfExpressionType,
-
-    #[error("Unknown type '{}'.", .0)]
-    UnknownType(String),
-    #[error("Type '{}' already declared.", .0)]
-    TypeRedeclaration(String),
-    #[error("Can't coerse integer literal of value '{}' into integer type '{}'", .0, .0)]
-    CoerseInt(String, i64),
-
-    #[error("Duplicate function parameter '{}'", .0)]
-    FunctionParamDuplicate(String),
-    #[error("Function '{}' already declared.", .0)]
-    FunctionRedeclaration(String),
-    #[error("Name '{}' already defined.", .0)]
-    NameAlreadyDefined(String),
-    #[error("Call to unknown function '{}'.", .0)]
-    UnknownFunction(String),
-    #[error("Function '{}' called with wrong number of arguments. Expected {} but found {}.", .0, .1, .2)]
-    FunctionCallArgumentCount(String, usize, usize),
-    #[error("Function '{}' called with wrong argument type. Expected '{}' but found '{}'.", .0, .1, .2)]
-    FunctionCallArgumentType(String, String, String),
-
-    #[error("Unreachable statement.")]
-    UnreachableStatement,
-    #[error("Function does not return on all code paths.")]
-    MissingReturnStatement,
-
-    #[error("Struct field '{}' already declared.", .0)]
-    StructDuplicateField(String),
-    #[error("Type '{}' has no field named '{}'.", .0, .1)]
-    UnknownField(String, String),
-    #[error("Type '{}' is not a struct type.", .0)]
-    NotStructType(String),
-    #[error("Duplicate initialization of field '{}'.", .0)]
-    StructInitArgDuplicate(String),
-    #[error("Missing initialization of field '{}'.", .0)]
-    StructInitMissingArg(String),
-    #[error("Invalid type for field initialization. Expected '{}' but found '{}'.", .0, .1)]
-    StructInitInvalidType(String, String),
-
-    #[error("Enum variant '{}' already declared.", .0)]
-    EnumDuplicateVariant(String),
-    #[error("Enum '{}' has no variant named '{}'.", .0, .1)]
-    UnknownVariant(String, String),
-
-    #[error("`fn main` must have no parameters.")]
-    MainHasParams,
-    #[error("`fn main` must return `i32`, but `{}` was declared.", .0)]
-    MainInvalidReturnType(String),
-    #[error("Type '{}' cannot be used as a value.", .0)]
-    TypeUsedAsValue(String),
-    #[error("Module '{}' cannot be used as a value.", .0)]
-    ModuleUsedAsValue(String),
-    #[error("Function '{}' cannot be used as a value.", .0)]
-    FunctionUsedAsValue(String),
-    #[error("Failed to import '{}': {}", .0, .1)]
-    ImportError(String, String),
-    #[error("Import not found: '{}'.", .0)]
-    ImportNotFound(String),
-    #[error("Circular import of '{}'.", .0)]
-    CircularImport(String),
-}
-
-impl From<Spanned<CodeError>> for ManyErrors {
-    fn from(value: Spanned<CodeError>) -> Self {
-        vec![value.into()]
-    }
-}
-
-impl CodeError {
-    fn err<T>(self, span: SimpleSpan) -> Result<T, Vec<Spanned<Self>>> {
-        Err(Spanned(self, span).into())
-    }
-
-    const fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
-        Spanned(self, span)
-    }
-}
-
-pub enum GeneratorErrors {
-    ModuleErrors(Vec<ModuleErrors>),
-    VerifierErrors(Vec<VerifierError>),
-    MissingMain,
-}
-
-#[derive(Debug, Clone)]
-pub enum CompileError {
-    Code(Spanned<CodeError>),
-    ModuleInner,
-    Lex(Spanned<LexingError>),
-    Parse(Spanned<String>),
-}
-
-impl CompileError {
-    const fn spanned(self, span: SimpleSpan) -> Spanned<Self> {
-        Spanned(self, span)
-    }
-}
-
-impl From<Spanned<CodeError>> for CompileError {
-    fn from(val: Spanned<CodeError>) -> Self {
-        CompileError::Code(val)
-    }
-}
-
-pub struct ModuleErrors {
-    pub path: PathBuf,
-    pub src: String,
-    pub errors: Vec<CompileError>,
-}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleId(usize);
@@ -701,8 +551,6 @@ pub fn generate(
     Ok(module.finish())
 }
 
-type ManyErrors = Vec<Spanned<CodeError>>;
-
 struct Scope {
     symbols: HashMap<String, Symbol>,
     parent: Option<Box<Scope>>,
@@ -820,11 +668,6 @@ struct FnGenerator<'a, 'ctx> {
     return_dest: Option<Variable>,
 }
 
-pub enum MainModuleError {
-    MissingMain,
-    CodeErrors(ManyErrors),
-}
-
 impl GeneratorState<'_> {
     fn build_main_module(
         mut self,
@@ -839,7 +682,7 @@ impl GeneratorState<'_> {
             return Err(MainModuleError::MissingMain);
         }
 
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         self.pass2(&program, &mut errors);
 
@@ -856,7 +699,7 @@ impl GeneratorState<'_> {
         mod_errors: &mut Vec<ModuleErrors>,
         is_entry: bool,
     ) -> Result<bool, ManyErrors> {
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         let mut found_main = false;
         for item in &program.items {
@@ -948,7 +791,7 @@ impl GeneratorState<'_> {
                     mod_errors.push(ModuleErrors {
                         path: canonical,
                         src: src.to_owned(),
-                        errors: failure.into(),
+                        errors: CompileError::from_parse_failure(failure),
                     });
                     return Err(CompileError::ModuleInner);
                 }
@@ -996,7 +839,7 @@ impl GeneratorState<'_> {
         let new_prefix = module_prefix(canonical, self.compiled_imports.len());
         let saved_prefix = std::mem::replace(&mut self.fn_name_prefix, new_prefix);
 
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         if let Err(errors) = self.pass1(&program, mod_errors, false) {
             self.current_module = saved_module;
@@ -1031,7 +874,7 @@ fn module_prefix(canonical_path: &Path, module_index: usize) -> String {
 
 impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_statements(&mut self, statements: &[Spanned<Statement>]) -> Result<bool, ManyErrors> {
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
         let mut iter = statements.iter().peekable();
         let mut returned = false;
         while let Some(statement) = iter.next() {
@@ -1459,7 +1302,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Ok((struct_value, field.r#type.clone()))
             }
             Expression::StructInit(struct_init) => {
-                let mut errors = Vec::new();
+                let mut errors = ManyErrors::new();
                 let mut arg_values = HashMap::with_capacity(struct_init.args.len());
 
                 let path = &struct_init.path;
@@ -1759,7 +1602,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         let exit_block = self.builder.create_block();
 
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         self.builder.ins().jump(condition_blocks[0], []);
 
@@ -1846,7 +1689,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         Ok(returned)
     }
 
-    fn build_while(&mut self, conditional: &Conditional) -> Result<bool, Vec<Spanned<CodeError>>> {
+    fn build_while(&mut self, conditional: &Conditional) -> Result<bool, ManyErrors> {
         let Conditional { condition, block } = conditional;
 
         let while_block = self.builder.create_block();
@@ -2020,7 +1863,7 @@ impl GeneratorState<'_> {
         let is_main = is_top_level && !*is_extern && name == "main";
 
         let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
         let mut param_types = Vec::new();
 
         if let LookupResult::Found(_) = self.current_scope.get_symbol(name) {
@@ -2248,7 +2091,7 @@ impl GeneratorState<'_> {
         fn_builder.switch_to_block(entry_block);
         fn_builder.seal_block(entry_block);
 
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         // Move current scope into a child function scope.
         let outer_scope = std::mem::replace(&mut self.current_scope, Scope::new());
@@ -2446,7 +2289,7 @@ impl FnGenerator<'_, '_> {
 
 impl GeneratorState<'_> {
     fn build_struct_decl(&mut self, decl: &StructDecl) -> Result<(), ManyErrors> {
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         if matches!(
             self.current_scope.get_symbol(&decl.name.0),
@@ -2501,7 +2344,7 @@ impl GeneratorState<'_> {
     }
 
     fn build_enum_decl(&mut self, decl: &EnumDecl) -> Result<(), ManyErrors> {
-        let mut errors = Vec::new();
+        let mut errors = ManyErrors::new();
 
         if matches!(
             self.current_scope.get_symbol(&decl.name.0),
