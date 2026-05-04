@@ -81,7 +81,7 @@ where
         .with_message(err.0.to_string())
         .with_label(
             Label::new((file_name, err.1.into_range()))
-                .with_message(err.0.to_string())
+                // .with_message(err.0.to_string())
                 .with_color(Color::Red),
         )
         .finish()
