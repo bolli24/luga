@@ -1,12 +1,18 @@
+use std::collections::HashMap;
 use std::fs::File;
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use crate::text::Text;
+
+mod text;
+
 #[derive(Debug)]
 struct Backend {
     client: Client,
+    documents: HashMap<TextDocumentIdentifier, Text>,
 }
 
 #[tower_lsp::async_trait]
@@ -27,6 +33,8 @@ impl LanguageServer for Backend {
         tracing::info!("shutdown");
         Ok(())
     }
+
+    async fn did_open(&self, _params: DidOpenTextDocumentParams) {}
 }
 
 #[tokio::main]
@@ -48,6 +56,9 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend { client });
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        documents: HashMap::new(),
+    });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
