@@ -11,16 +11,16 @@ ariadne = "0.6"
 thiserror = "2.0"
 luga_syntax = { path = "crates/luga_syntax" }
 
-cranelift = { version = "0.130", features = [
+cranelift = { version = "0.131", features = [
     "core",
     "frontend",
     "module",
     "object",
 ] }
 
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 colored = "3.1"
 
-indexmap = "2.10"
+indexmap = "2.14"
 walkdir = "2.5"
 

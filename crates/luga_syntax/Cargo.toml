@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 ariadne = "0.6"
-chumsky = "0.12"
+chumsky = "0.13"
 logos = "0.16"
 thiserror = "2.0"
