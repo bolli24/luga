@@ -2554,7 +2554,6 @@ fn combine_spans(a: SimpleSpan, b: SimpleSpan) -> SimpleSpan {
     SimpleSpan::new(a.context, a.start..b.end)
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -2565,11 +2564,18 @@ mod tests {
 
     fn generation_errors(src: &str) -> ManyErrors {
         let path = Path::new("test.luga");
-        let program = parse_source(path, src, false)
+        let program = parse_source(src, false)
             .unwrap_or_else(|err| panic!("test source must parse: {}", err.short_reason()));
 
-        match generate(program, path, false, false) {
-            Err(GeneratorErrors::CodeErrors(errors)) => errors,
+        match generate(program, path, src, false, false) {
+            Err(GeneratorErrors::ModuleErrors(modules)) => modules
+                .into_iter()
+                .flat_map(|module| module.errors)
+                .filter_map(|error| match error {
+                    CompileError::Code(error) => Some(error),
+                    _ => None,
+                })
+                .collect(),
             Err(GeneratorErrors::VerifierErrors(errors)) => {
                 panic!("expected code errors, got verifier errors: {errors:?}")
             }
