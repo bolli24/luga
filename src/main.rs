@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use ariadne::Source;
-use luga::GeneratorErrors;
 use luga::errors::report_compile_errors;
 use luga::generator::generate;
+use luga::{CompileError, GeneratorErrors, ModuleErrors};
 use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
 
@@ -41,6 +41,9 @@ enum CliCommand {
         #[arg(default_value = "test")]
         path: PathBuf,
     },
+    Check {
+        path: PathBuf,
+    },
     Clean,
 }
 
@@ -65,6 +68,7 @@ fn main() -> ExitCode {
         CliCommand::Build { path, linker_args } => build_files(&cli, path, linker_args).map(|_| ()),
         CliCommand::Run { path, linker_args } => run_file(&cli, path, linker_args),
         CliCommand::Test { path } => test_files(&cli, path),
+        CliCommand::Check { path } => check_file(path, cli.verbose),
         CliCommand::Clean => clean(),
     };
 
@@ -306,15 +310,64 @@ fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), ()> {
     Ok(())
 }
 
-/* fn check_file(file_path: &Path, verbose: bool) -> Result<(), Vec<Spanned<CodeError>>> {
-    let (program, src) = parse_path(file_path, verbose).map_err(|err| match err {
-        ParseFailure::Io(p, e) => BuildError::Io(p, e),
-        ParseFailure::Lex(p) => BuildError::Lexer(p),
-        ParseFailure::Parse(p) => BuildError::Parser(p),
-    });
+fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
+    let src = fs::read_to_string(file_path)
+        .map_err(|err| eprintln!("Error reading file '{}': {}", file_path.display(), err))?;
 
-    todo!();
-}*/
+    let Some(modules) = check_source(file_path, &src, verbose) else {
+        eprintln!("Error checking {}", file_path.display());
+        return Err(());
+    };
+
+    let errored = !modules.is_empty();
+
+    for module_errors in modules {
+        let diagnostic_path = diagnostic_path(&module_errors.path);
+        let src_report = Source::from(module_errors.src.as_str());
+        report_compile_errors(&diagnostic_path, &src_report, module_errors.errors);
+    }
+
+    if errored {
+        return Err(());
+    } else {
+        return Ok(());
+    }
+}
+
+fn check_source(file_path: &Path, src: &str, verbose: bool) -> Option<Vec<ModuleErrors>> {
+    let program = match parse_source(&src, verbose) {
+        Ok(program) => program,
+        Err(failure) => {
+            let module_error = ModuleErrors {
+                path: file_path.to_owned(),
+                src: src.to_owned(),
+                errors: CompileError::from_parse_failure(failure),
+            };
+            return Some(vec![module_error]);
+        }
+    };
+
+    if verbose {
+        println!();
+    }
+
+    match generate(program, file_path, &src, verbose, false) {
+        Ok(_) => return Some(Vec::new()),
+        Err(errors) => match errors {
+            GeneratorErrors::ModuleErrors(modules) => {
+                return Some(modules);
+            }
+            GeneratorErrors::VerifierErrors(verifier_errors) => {
+                for error in verifier_errors {
+                    // TODO: make this printing nice
+                    eprintln!("{error}");
+                }
+                return None;
+            }
+            GeneratorErrors::MissingMain => return Some(Vec::new()),
+        },
+    };
+}
 
 fn build_file(
     file_path: &Path,
@@ -348,8 +401,8 @@ fn build_file(
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::ModuleErrors(modules) => {
-                let diagnostic_path = diagnostic_path(file_path);
                 for module_errors in modules {
+                    let diagnostic_path = diagnostic_path(&module_errors.path);
                     let src_report = Source::from(module_errors.src.as_str());
                     report_compile_errors(&diagnostic_path, &src_report, module_errors.errors);
                 }

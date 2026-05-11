@@ -204,7 +204,7 @@ impl From<Spanned<CodeError>> for CompileError {
 }
 
 impl CompileError {
-    pub(crate) fn from_parse_failure(value: ParseFailure) -> Vec<Self> {
+    pub fn from_parse_failure(value: ParseFailure) -> Vec<Self> {
         match value {
             ParseFailure::Lex(errors) => errors.into_iter().map(Self::Lex).collect(),
             ParseFailure::Parse(errors) => errors.into_iter().map(Self::Parse).collect(),
