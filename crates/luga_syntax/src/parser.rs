@@ -64,6 +64,7 @@ pub struct Param {
 pub struct StructDecl {
     pub name: Spanned<String>,
     pub fields: Vec<(Spanned<String>, Spanned<TypeName>)>,
+    pub functions: Vec<Spanned<FunctionDecl>>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +94,7 @@ pub enum Expression {
 
     Intrinsic(Intrinsic, Vec<Spanned<Expression>>),
     FunctionCall(Box<Spanned<Expression>>, Vec<Spanned<Expression>>),
-    FieldAccess(Box<Spanned<Expression>>, Spanned<String>),
+    MemberAccess(Box<Spanned<Expression>>, Spanned<String>),
     StructInit(StructInit),
 }
 
@@ -162,9 +163,9 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 13] = [
+const KEY_WORDS: [&str; 14] = [
     "let", "return", "if", "else", "while", "true", "false", "fn", "struct", "enum", "extern",
-    "import", "as",
+    "import", "as", "self",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -280,23 +281,24 @@ where
     .map_with(|expr: Expression, extra| -> Spanned<Expression> { Spanned(expr, extra.span()) });
 
     enum Postfix {
-        Field(Spanned<String>),
+        Member(Spanned<String>),
         Call(Vec<Spanned<Expression>>),
     }
 
     let postfix = choice((
         just(Token::Dot)
             .ignore_then(identifier_spanned)
-            .map(Postfix::Field),
+            .map(Postfix::Member),
         args.clone().map(Postfix::Call),
     ));
 
     let field_access = atom
         .clone()
         .foldl_with(postfix.repeated(), |expr, op, extra| match op {
-            Postfix::Field(field) => {
-                Spanned(Expression::FieldAccess(Box::new(expr), field), extra.span())
-            }
+            Postfix::Member(member) => Spanned(
+                Expression::MemberAccess(Box::new(expr), member),
+                extra.span(),
+            ),
             Postfix::Call(call_args) => Spanned(
                 Expression::FunctionCall(Box::new(expr), call_args),
                 extra.span(),
@@ -418,7 +420,20 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
         )
-        .map(|(name, fields)| StructDecl { name, fields });
+        .then(
+            function_decl
+                .clone()
+                .map_with(|decl, extra| Spanned(decl, extra.span()))
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::BraceOpen), just(Token::BraceClose))
+                .or_not(),
+        )
+        .map(|((name, fields), functions)| StructDecl {
+            name,
+            fields,
+            functions: functions.unwrap_or_default(),
+        });
 
     let enum_decl = just(Token::Id("enum"))
         .ignore_then(identifier_spanned)

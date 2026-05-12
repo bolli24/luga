@@ -371,6 +371,7 @@ impl Display for EnumType {
 struct TypeContext {
     pub structs: HashMap<TypeId, StructType>,
     pub enums: HashMap<TypeId, EnumType>,
+    pub associated_functions: HashMap<TypeId, HashMap<String, Symbol>>,
     next_type_id: usize,
 }
 
@@ -379,6 +380,7 @@ impl TypeContext {
         Self {
             structs: HashMap::new(),
             enums: HashMap::new(),
+            associated_functions: HashMap::new(),
             next_type_id: 0,
         }
     }
@@ -558,7 +560,7 @@ pub enum Symbol {
     Variable(Variable, Type),
     Function(FuncId, FuncType),
     Type(Type),
-    Module(HashMap<String, Symbol>),
+    Module(HashMap<String, Symbol>), // TODO: store module symbol table outside and use a ModuleId to refer to it here
 }
 
 pub enum LookupResult<'a> {
@@ -704,6 +706,7 @@ impl GeneratorState<'_> {
                     if is_entry && decl.name == "main" && !decl.r#extern {
                         found_main = true;
                     }
+
                     if let Err(mut e) = self.pre_declare_fn(decl, &item.1, is_entry) {
                         errors.append(&mut e);
                     }
@@ -1048,55 +1051,39 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         if value.1 == Type::Error {
             return Ok(false);
         }
-        if self.current_func_type.name == "main" {
-            if !can_coerce_type(&value.1, &Type::I32) {
-                // self.builder.ins().return_(&[]);
-                return CodeError::InvalidReturnType(Type::I32.to_string(), value.1.to_string())
-                    .err(expr.1);
+        if !can_coerce_type(&value.1, &self.current_func_type.return_type) {
+            return CodeError::InvalidReturnType(
+                self.current_func_type.return_type.to_string(),
+                value.1.to_string(),
+            )
+            .err(expr.1);
+        }
+        match value.1 {
+            // Diverging expression already terminated the block — nothing to emit.
+            Type::Never => {}
+            Type::Void => {
+                self.builder.ins().return_(&[]);
             }
-            if !matches!(value.1, Type::Never | Type::Error) {
+            Type::Struct(struct_id) => {
+                let struct_type = &self.state.types.structs[&struct_id].clone();
+                let return_dest = self
+                    .return_dest
+                    .expect("Return destination must be valid when returning struct.");
+
+                let return_dest = self.builder.use_var(return_dest);
+
+                let mut current_offset = 0;
+
+                for field in struct_type.fields.values() {
+                    self.build_return_field_copy(field, &mut current_offset, value.0, return_dest);
+                }
+
+                self.builder.ins().return_(&[]);
+            }
+            _ => {
                 self.builder.ins().return_(&[value.0]);
             }
-        } else {
-            if !can_coerce_type(&value.1, &self.current_func_type.return_type) {
-                return CodeError::InvalidReturnType(
-                    self.current_func_type.return_type.to_string(),
-                    value.1.to_string(),
-                )
-                .err(expr.1);
-            }
-            match value.1 {
-                // Diverging expression already terminated the block — nothing to emit.
-                Type::Never => {}
-                Type::Void => {
-                    self.builder.ins().return_(&[]);
-                }
-                Type::Struct(struct_id) => {
-                    let struct_type = &self.state.types.structs[&struct_id].clone();
-                    let return_dest = self
-                        .return_dest
-                        .expect("Return destination must be valid when returning struct.");
-
-                    let return_dest = self.builder.use_var(return_dest);
-
-                    let mut current_offset = 0;
-
-                    for field in struct_type.fields.values() {
-                        self.build_return_field_copy(
-                            field,
-                            &mut current_offset,
-                            value.0,
-                            return_dest,
-                        );
-                    }
-
-                    self.builder.ins().return_(&[]);
-                }
-                _ => {
-                    self.builder.ins().return_(&[value.0]);
-                }
-            };
-        }
+        };
         Ok(true)
     }
 
@@ -1265,22 +1252,22 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 LookupResult::NotFound => CodeError::UnknownVariable(name.clone()).err(*span),
             },
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
-            Expression::FieldAccess(expr, field_name) => {
+            Expression::MemberAccess(expr, member_name) => {
                 if let Some(symbol) = self.resolve_expr_as_symbol(expr).cloned() {
                     return match symbol {
                         Symbol::Module(_) => {
-                            CodeError::ModuleUsedAsValue(field_name.0.clone()).err(field_name.1)
+                            CodeError::ModuleUsedAsValue(member_name.0.clone()).err(member_name.1)
                         }
                         Symbol::Type(Type::Enum(enum_id)) => {
                             let Some(idx) = self.state.types.enums[&enum_id]
                                 .variants
-                                .get_index_of(&field_name.0)
+                                .get_index_of(&member_name.0)
                             else {
                                 return CodeError::UnknownVariant(
                                     self.state.types.type_name(enum_id),
-                                    field_name.0.clone(),
+                                    member_name.0.clone(),
                                 )
-                                .err(field_name.1);
+                                .err(member_name.1);
                             };
                             let val = self.builder.ins().iconst(types::I32, idx as i64);
                             return Ok((val, Type::Enum(enum_id)));
@@ -1305,7 +1292,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 if matches!(expr_value.1, Type::Never | Type::Error) {
                     return Ok(expr_value);
                 }
-                let name = field_name;
+                let name = member_name;
                 let field = match &expr_value.1 {
                     Type::Struct(struct_id) => {
                         self.state.types.structs[struct_id].fields.get(&name.0)
@@ -1440,8 +1427,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 ) => Some(sym),
                 _ => None,
             },
-            Expression::FieldAccess(base, field) => match self.resolve_expr_as_symbol(base)? {
-                Symbol::Module(map) => map.get(&field.0),
+            Expression::MemberAccess(base, member) => match self.resolve_expr_as_symbol(base)? {
+                Symbol::Module(map) => map.get(&member.0),
+                Symbol::Type(Type::Struct(type_id) | Type::Enum(type_id)) => self
+                    .state
+                    .types
+                    .associated_functions
+                    .get(type_id)?
+                    .get(&member.0),
                 _ => None,
             },
             _ => None,
@@ -1937,14 +1930,16 @@ impl GeneratorState<'_> {
         }
     }
 
-    // Declare a function's signature in the module and insert it into scope.
+    // Declare a function's signature in the module
     // Does not build the body — call build_fn_body separately for that.
-    fn pre_declare_fn(
+    fn make_function_symbol(
         &mut self,
         decl: &FunctionDecl,
         span: &SimpleSpan,
+        object_name: &str,
+        linkage: Linkage,
         is_top_level: bool,
-    ) -> Result<(), ManyErrors> {
+    ) -> Result<Symbol, ManyErrors> {
         let FunctionDecl {
             name,
             r#extern: is_extern,
@@ -1962,10 +1957,6 @@ impl GeneratorState<'_> {
         let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = Vec::new();
         let mut errors = ManyErrors::new();
         let mut param_types = Vec::new();
-
-        if let LookupResult::Found(_) = self.current_scope.get_symbol(name) {
-            errors.push(CodeError::NameAlreadyDefined(name.to_owned()).spanned(*span));
-        }
 
         if is_main && !params.is_empty() {
             errors.push(CodeError::MainHasParams.spanned(*span));
@@ -2075,61 +2066,101 @@ impl GeneratorState<'_> {
             returns,
         };
 
-        let linkage = if *is_extern {
-            Linkage::Import
-        } else if is_main {
-            Linkage::Export
-        } else {
-            Linkage::Local
-        };
-
-        let object_name = if *is_extern {
-            name.to_owned()
-        } else {
-            format!("{}{}", self.fn_name_prefix, name)
-        };
-
         let func_id = self
             .module
-            .declare_function(&object_name, linkage, &signature)
+            .declare_function(object_name, linkage, &signature)
             .expect("Function must be declarable.");
 
-        self.current_scope
-            .insert_symbol(
-                name.to_owned(),
-                Symbol::Function(func_id, func_type.clone()),
-            )
-            .expect("Must not overwrite symbol");
+        /* self.current_scope
+        .insert_symbol(
+            name.to_owned(),
+            Symbol::Function(func_id, func_type.clone()),
+        )
+        .expect("Must not overwrite symbol"); */
 
-        Ok(())
+        Ok(Symbol::Function(func_id, func_type))
     }
 
-    // Build a function's body. The function must already be pre-declared in scope via pre_declare_fn.
-    fn build_fn_body(
+    fn pre_declare_fn(
         &mut self,
         decl: &FunctionDecl,
         span: &SimpleSpan,
         is_top_level: bool,
     ) -> Result<(), ManyErrors> {
+        if let LookupResult::Found(_) = self.current_scope.get_symbol(&decl.name) {
+            return Err(CodeError::NameAlreadyDefined(decl.name.to_owned())
+                .spanned(*span)
+                .into());
+        }
+
+        let object_name = if decl.r#extern {
+            decl.name.clone()
+        } else {
+            format!("{}{}", self.fn_name_prefix, decl.name)
+        };
+
+        let linkage = if decl.r#extern {
+            Linkage::Import
+        } else if is_top_level && decl.name == "main" {
+            Linkage::Export
+        } else {
+            Linkage::Local
+        };
+
+        let symbol = self.make_function_symbol(decl, span, &object_name, linkage, is_top_level)?;
+
+        self.current_scope
+            .insert_symbol(decl.name.clone(), symbol)
+            .expect("Must not overwrite symbol");
+
+        Ok(())
+    }
+
+    fn pre_declare_assoc_fn(
+        &mut self,
+        owner: TypeId,
+        owner_name: &str,
+        decl: &FunctionDecl,
+        span: &SimpleSpan,
+    ) -> Result<(), ManyErrors> {
+        if self
+            .types
+            .associated_functions
+            .get(&owner)
+            .is_some_and(|map| map.contains_key(&decl.name))
+        {
+            return Err(CodeError::NameAlreadyDefined(decl.name.clone())
+                .spanned(*span)
+                .into());
+        }
+
+        let object_name = format!("{}{}${}", self.fn_name_prefix, owner_name, decl.name);
+
+        let symbol = self.make_function_symbol(decl, span, &object_name, Linkage::Local, false)?;
+
+        self.types
+            .associated_functions
+            .entry(owner)
+            .or_default()
+            .insert(decl.name.clone(), symbol);
+
+        Ok(())
+    }
+
+    // Build a function's body. The function must already be pre-declared in scope via pre_declare_fn.
+    fn build_fn_body_with_symbol(
+        &mut self,
+        decl: &FunctionDecl,
+        func_id: FuncId,
+        func_type: FuncType,
+        span: &SimpleSpan,
+        main_implicit_zero: bool,
+    ) -> Result<(), ManyErrors> {
         if decl.r#extern {
             return Ok(());
         }
 
-        let FunctionDecl {
-            name,
-            params,
-            body,
-            return_type,
-            ..
-        } = decl;
-        let is_main = is_top_level && name == "main";
-        let main_implicit_zero = is_main && return_type.is_none();
-
-        let (func_id, func_type) = self
-            .current_scope
-            .get_function(name)
-            .map(|(id, ft)| (id, ft.clone()))
-            .expect("Function must be pre-declared before building its body");
+        let FunctionDecl { params, body, .. } = decl;
 
         // Reconstruct fn_params from decl names + func_type resolved types.
         let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = params
@@ -2258,6 +2289,44 @@ impl GeneratorState<'_> {
             .unwrap();
 
         Ok(())
+    }
+
+    fn build_fn_body(
+        &mut self,
+        decl: &FunctionDecl,
+        span: &SimpleSpan,
+        is_top_level: bool,
+    ) -> Result<(), ManyErrors> {
+        let (func_id, func_type) = self
+            .current_scope
+            .get_function(&decl.name)
+            .map(|(id, ft)| (id, ft.clone()))
+            .expect("Function must be pre-declared before building its body");
+
+        let main_implicit_zero =
+            is_top_level && !decl.r#extern && decl.name == "main" && decl.return_type.is_none();
+
+        self.build_fn_body_with_symbol(decl, func_id, func_type, span, main_implicit_zero)
+    }
+
+    fn build_assoc_fn_body(
+        &mut self,
+        owner: TypeId,
+        decl: &FunctionDecl,
+        span: &SimpleSpan,
+    ) -> Result<(), ManyErrors> {
+        let Symbol::Function(func_id, func_type) = self
+            .types
+            .associated_functions
+            .get(&owner)
+            .and_then(|map| map.get(&decl.name))
+            .cloned()
+            .expect("Associated function must be pre-declared before building its body")
+        else {
+            unreachable!("associated function table must only contain functions");
+        };
+
+        self.build_fn_body_with_symbol(decl, func_id, func_type, span, false)
     }
 
     // Used for nested function declarations inside function bodies (single-pass is fine there).
@@ -2450,6 +2519,28 @@ impl GeneratorState<'_> {
         self.current_scope
             .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Struct(struct_id)))
             .expect("Must not overwrite symbol");
+
+        for func_decl in &decl.functions {
+            if let Err(mut e) =
+                self.pre_declare_assoc_fn(struct_id, &decl.name.0, &func_decl.0, &func_decl.1)
+            {
+                errors.append(&mut e);
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        for func_decl in &decl.functions {
+            if let Err(mut e) = self.build_assoc_fn_body(struct_id, &func_decl.0, &func_decl.1) {
+                errors.append(&mut e);
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
         Ok(())
     }
 
@@ -2546,8 +2637,8 @@ impl GeneratorState<'_> {
 fn expr_callee_name(expr: &Expression) -> String {
     match expr {
         Expression::Identifier(name) => name.clone(),
-        Expression::FieldAccess(base, field) => {
-            format!("{}.{}", expr_callee_name(&base.0), field.0)
+        Expression::MemberAccess(base, member) => {
+            format!("{}.{}", expr_callee_name(&base.0), member.0)
         }
         _ => "<expression>".to_string(),
     }

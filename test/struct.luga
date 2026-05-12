@@ -1,14 +1,18 @@
 struct iVec {
     x: i32;
     y: i32;
+} {
+    fn add(this: iVec, other: iVec) : iVec {
+        return iVec {x: this.x + other.x, y: this.y + other.y};
+    }
+
+    fn zero() : iVec {
+        return iVec {x: 0, y: 0};
+    } 
 }
 
 fn printVec(vec: iVec) {
     @println("(%d, %d)", vec.x, vec.y);
-}
-
-fn add(a: iVec, b: iVec) : iVec {
-    return iVec {x: a.x + b.x, y: a.y + b.y};
 }
 
 // struct declared inside a function scope
@@ -27,7 +31,7 @@ fn main() {
 
     printVec(iVec {x: 0, y: -4});
 
-    let c = add(a, b);
+    let c = iVec.add(a, b);
 
     printVec(c);
 
@@ -35,4 +39,8 @@ fn main() {
     @assert(-4 == c.y);
 
     @assert(sumComponents() == 42);
+
+    let zero = iVec.zero();
+    @assert(0 == zero.x);
+    @assert(0 == zero.y);
 }

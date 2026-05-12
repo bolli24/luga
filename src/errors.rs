@@ -12,7 +12,7 @@ pub enum CodeError {
     InvalidReturnType(String, String),
 
     #[error("{} isn't supported yet.", .0)]
-    NoYetSupported(String),
+    NotYetSupported(String),
 
     #[error("Incompatiple types for binary operator '{}': '{}' and '{}'", .0, .1, .2)]
     IncompatipleBinOpTypes(BinOp, String, String),
@@ -60,8 +60,6 @@ pub enum CodeError {
 
     #[error("Duplicate function parameter '{}'", .0)]
     FunctionParamDuplicate(String),
-    #[error("Function '{}' already declared.", .0)]
-    FunctionRedeclaration(String),
     #[error("Name '{}' already defined.", .0)]
     NameAlreadyDefined(String),
     #[error("Call to unknown function '{}'.", .0)]
@@ -128,6 +126,10 @@ pub struct ManyErrors(Vec<Spanned<CodeError>>);
 impl ManyErrors {
     pub(crate) fn new() -> Self {
         Self(Vec::new())
+    }
+
+    pub fn vec(self) -> Vec<Spanned<CodeError>> {
+        self.0
     }
 }
 
