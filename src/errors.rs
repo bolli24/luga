@@ -213,13 +213,13 @@ impl CompileError {
 }
 
 pub struct ModuleErrors {
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub src: String,
     pub errors: Vec<CompileError>,
 }
 
 pub fn report_compile_errors(
-    file_name: &str,
+    file_name: Option<&str>,
     src: &Source<&str>,
     errors: impl IntoIterator<Item = CompileError>,
 ) {

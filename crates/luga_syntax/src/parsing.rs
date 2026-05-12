@@ -21,7 +21,7 @@ impl ParseFailure {
         }
     }
 
-    pub fn report(&self, file_name: &str, src: &Source<&str>) {
+    pub fn report(&self, file_name: Option<&str>, src: &Source<&str>) {
         match self {
             Self::Lex(errors) => report_errors(file_name, src, errors),
             Self::Parse(errors) => report_errors(file_name, src, errors),
@@ -73,24 +73,32 @@ pub fn parse_source(src: &str, verbose: bool) -> Result<Program, ParseFailure> {
     })
 }
 
-pub fn report_error<T>(file_name: &str, src: &Source<&str>, err: &Spanned<T>)
+pub fn report_error<T>(file_name: Option<&str>, src: &Source<&str>, err: &Spanned<T>)
 where
     T: ToString + Clone + std::fmt::Debug,
 {
-    Report::build(ReportKind::Error, (file_name, err.1.into()))
-        .with_message(err.0.to_string())
-        .with_label(
-            Label::new((file_name, err.1.into_range()))
-                // .with_message(err.0.to_string())
-                .with_color(Color::Red),
-        )
-        .finish()
-        .eprint((file_name, src))
-        .unwrap();
+    let message = err.0.to_string();
+    let range = err.1.into_range();
+
+    if let Some(file_name) = file_name {
+        Report::build(ReportKind::Error, (file_name, range.clone()))
+            .with_message(message)
+            .with_label(Label::new((file_name, range)).with_color(Color::Red))
+            .finish()
+            .eprint((file_name, src))
+            .unwrap();
+    } else {
+        Report::build(ReportKind::Error, range.clone())
+            .with_message(message)
+            .with_label(Label::new(range).with_color(Color::Red))
+            .finish()
+            .eprint(src)
+            .unwrap();
+    }
 }
 
 pub fn report_errors<'a, T>(
-    file_name: &str,
+    file_name: Option<&str>,
     src: &Source<&str>,
     errors: impl IntoIterator<Item = &'a Spanned<T>>,
 ) where

@@ -3,7 +3,7 @@
 use ariadne::Source;
 use luga::errors::report_compile_errors;
 use luga::generator::generate;
-use luga::{CompileError, GeneratorErrors, ModuleErrors};
+use luga::{GeneratorErrors, check_file, diagnostic_path};
 use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
 
@@ -310,65 +310,6 @@ fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), ()> {
     Ok(())
 }
 
-fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
-    let src = fs::read_to_string(file_path)
-        .map_err(|err| eprintln!("Error reading file '{}': {}", file_path.display(), err))?;
-
-    let Some(modules) = check_source(file_path, &src, verbose) else {
-        eprintln!("Error checking {}", file_path.display());
-        return Err(());
-    };
-
-    let errored = !modules.is_empty();
-
-    for module_errors in modules {
-        let diagnostic_path = diagnostic_path(&module_errors.path);
-        let src_report = Source::from(module_errors.src.as_str());
-        report_compile_errors(&diagnostic_path, &src_report, module_errors.errors);
-    }
-
-    if errored {
-        return Err(());
-    } else {
-        return Ok(());
-    }
-}
-
-fn check_source(file_path: &Path, src: &str, verbose: bool) -> Option<Vec<ModuleErrors>> {
-    let program = match parse_source(&src, verbose) {
-        Ok(program) => program,
-        Err(failure) => {
-            let module_error = ModuleErrors {
-                path: file_path.to_owned(),
-                src: src.to_owned(),
-                errors: CompileError::from_parse_failure(failure),
-            };
-            return Some(vec![module_error]);
-        }
-    };
-
-    if verbose {
-        println!();
-    }
-
-    match generate(program, file_path, &src, verbose, false) {
-        Ok(_) => return Some(Vec::new()),
-        Err(errors) => match errors {
-            GeneratorErrors::ModuleErrors(modules) => {
-                return Some(modules);
-            }
-            GeneratorErrors::VerifierErrors(verifier_errors) => {
-                for error in verifier_errors {
-                    // TODO: make this printing nice
-                    eprintln!("{error}");
-                }
-                return None;
-            }
-            GeneratorErrors::MissingMain => return Some(Vec::new()),
-        },
-    };
-}
-
 fn build_file(
     file_path: &Path,
     output_dir: &Path,
@@ -386,7 +327,7 @@ fn build_file(
     let program = parse_source(&src, verbose).map_err(|err| {
         let diagnostic_path = diagnostic_path(file_path);
         let src_report = Source::from(src.as_str());
-        err.report(&diagnostic_path, &src_report);
+        err.report(Some(&diagnostic_path), &src_report);
         match err {
             ParseFailure::Lex(_) => BuildError::Lexer(file_path.to_path_buf()),
             ParseFailure::Parse(_) => BuildError::Parser(file_path.to_path_buf()),
@@ -397,14 +338,18 @@ fn build_file(
         println!();
     }
 
-    let product = match generate(program, file_path, &src, verbose, release) {
+    let product = match generate(program, Some(file_path), &src, verbose, release) {
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::ModuleErrors(modules) => {
                 for module_errors in modules {
-                    let diagnostic_path = diagnostic_path(&module_errors.path);
+                    let diagnostic_path = module_errors.path.as_deref().map(diagnostic_path);
                     let src_report = Source::from(module_errors.src.as_str());
-                    report_compile_errors(&diagnostic_path, &src_report, module_errors.errors);
+                    report_compile_errors(
+                        diagnostic_path.as_deref(),
+                        &src_report,
+                        module_errors.errors,
+                    );
                 }
 
                 return Err(BuildError::Generator(file_path.into()));
@@ -469,25 +414,6 @@ fn build_file(
     }
 
     Ok(exe_file)
-}
-
-fn diagnostic_path(file_path: &Path) -> String {
-    let path = if file_path.is_absolute() {
-        env::current_dir()
-            .ok()
-            .and_then(|cwd| {
-                let cwd = cwd.canonicalize().unwrap_or(cwd);
-                let file_path = file_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| file_path.to_path_buf());
-                file_path.strip_prefix(cwd).ok().map(Path::to_path_buf)
-            })
-            .unwrap_or_else(|| file_path.to_path_buf())
-    } else {
-        file_path.to_path_buf()
-    };
-
-    path.to_string_lossy().replace('\\', "/")
 }
 
 fn clean() -> Result<(), ()> {

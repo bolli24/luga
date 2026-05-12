@@ -1,13 +1,20 @@
+#![allow(dead_code)]
 use std::fmt::Display;
 
 use tower_lsp::lsp_types::Position;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Text {
     lines: Vec<String>,
 }
 
 impl Text {
+    pub fn new(text: &str) -> Self {
+        Self {
+            lines: text.split_inclusive('\n').map(ToOwned::to_owned).collect(),
+        }
+    }
+
     pub fn update(&mut self, start: Position, end: Position, text: &str) {
         assert!(start.line <= end.line, "LSP range start must be before end");
 
@@ -59,11 +66,9 @@ impl Display for Text {
     }
 }
 
-impl Into<Text> for &str {
-    fn into(self) -> Text {
-        Text {
-            lines: logical_lines(self).map(|l| l.to_owned()).collect(),
-        }
+impl<T: AsRef<str>> From<T> for Text {
+    fn from(value: T) -> Self {
+        Text::new(value.as_ref())
     }
 }
 

@@ -441,7 +441,7 @@ impl TypeContext {
 
 pub fn generate(
     program: Program,
-    file_path: &Path,
+    file_path: Option<&Path>,
     src: &str,
     verbose: bool,
     release: bool,
@@ -516,7 +516,10 @@ pub fn generate(
         exit_id,
         verbose,
         current_scope: Scope::new(),
-        dir: file_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        dir: file_path
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
         fn_name_prefix: String::new(),
         compiling_imports: HashSet::new(),
         compiled_imports: HashMap::new(),
@@ -529,7 +532,7 @@ pub fn generate(
         Err(MainModuleError::MissingMain) => return Err(GeneratorErrors::MissingMain),
         Err(MainModuleError::CodeErrors(errors)) => {
             mod_errors.push(ModuleErrors {
-                path: file_path.to_path_buf(),
+                path: file_path.map(Path::to_path_buf),
                 src: src.to_owned(),
                 errors: errors
                     .into_iter()
@@ -782,7 +785,7 @@ impl GeneratorState<'_> {
                 Ok(program) => program,
                 Err(failure) => {
                     mod_errors.push(ModuleErrors {
-                        path: canonical,
+                        path: Some(canonical),
                         src: src.to_owned(),
                         errors: CompileError::from_parse_failure(failure),
                     });
@@ -796,7 +799,7 @@ impl GeneratorState<'_> {
                 Ok(compiled) => compiled,
                 Err(errors) => {
                     mod_errors.push(ModuleErrors {
-                        path: canonical,
+                        path: Some(canonical),
                         src: src.to_owned(),
                         errors: errors.into_iter().map(CompileError::Code).collect(),
                     });
@@ -2567,7 +2570,7 @@ mod tests {
         let program = parse_source(src, false)
             .unwrap_or_else(|err| panic!("test source must parse: {}", err.short_reason()));
 
-        match generate(program, path, src, false, false) {
+        match generate(program, Some(path), src, false, false) {
             Err(GeneratorErrors::ModuleErrors(modules)) => modules
                 .into_iter()
                 .flat_map(|module| module.errors)
