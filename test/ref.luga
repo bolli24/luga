@@ -1,0 +1,56 @@
+struct Box {
+    value: i32;
+}
+
+struct Pair {
+    left: i32;
+    right: i32;
+}
+
+fn get(ref value: i32) : i32 {
+    return value;
+}
+
+fn set(ref value: i32, next: i32) {
+    value = next;
+}
+
+fn forward(ref value: i32, next: i32) {
+    set(ref value, next);
+}
+
+fn setBox(ref box: Box, next: i32) {
+    box.value = next;
+}
+
+fn setPairLeft(ref pair: Pair, next: i32) {
+    pair.left = next;
+}
+
+fn setPairRight(ref right: i32, next: i32) {
+    right = next;
+}
+
+fn main() {
+    let value = 1;
+    @assert(1 == get(ref value));
+
+    set(ref value, 2);
+    @assert(2 == value);
+
+    forward(ref value, 3);
+    @assert(3 == value);
+
+    let box = Box {value: 4};
+    setBox(ref box, 5);
+    @assert(5 == box.value);
+
+    let pair = Pair {left: 6, right: 7};
+    setPairLeft(ref pair, 8);
+    @assert(8 == pair.left);
+    @assert(7 == pair.right);
+
+    setPairRight(ref pair.right, 9);
+    @assert(8 == pair.left);
+    @assert(9 == pair.right);
+}

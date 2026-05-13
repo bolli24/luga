@@ -2,7 +2,7 @@ struct iVec {
     x: i32;
     y: i32;
 } {
-    fn add(this: iVec, other: iVec) : iVec {
+    fn add(ref this: iVec, other: iVec) : iVec {
         return iVec {x: this.x + other.x, y: this.y + other.y};
     }
 
@@ -25,13 +25,33 @@ fn sumComponents() : i32 {
     return p.a + p.b;
 }
 
+struct Inner {
+    value: i32;
+}
+
+struct Middle {
+    inner: Inner;
+}
+
+struct Outer {
+    middle: Middle;
+}
+
+fn nestedValue(outer: Outer) : i32 {
+    return outer.middle.inner.value;
+}
+
+fn nestedMiddle(outer: Outer) : Middle {
+    return outer.middle;
+}
+
 fn main() {
     let a = iVec {x: 2, y: -2};
     let b = iVec {x: -2, y: -2};
 
     printVec(iVec {x: 0, y: -4});
 
-    let c = iVec.add(a, b);
+    let c = iVec.add(ref a, b);
 
     printVec(c);
 
@@ -43,4 +63,11 @@ fn main() {
     let zero = iVec.zero();
     @assert(0 == zero.x);
     @assert(0 == zero.y);
+
+    let nested = Outer {middle: Middle {inner: Inner {value: 123}}};
+    @assert(123 == nested.middle.inner.value);
+    @assert(123 == nestedValue(nested));
+
+    let middle = nestedMiddle(nested);
+    @assert(123 == middle.inner.value);
 }

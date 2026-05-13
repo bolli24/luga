@@ -23,7 +23,7 @@ pub enum TopLevelItem {
 pub enum Statement {
     Expression(Spanned<Expression>),
     Binding(String, Spanned<Expression>),
-    Assignment(String, Spanned<Expression>),
+    Assignment(Spanned<Expression>, Spanned<Expression>),
     Return(Spanned<Expression>),
     While(Conditional),
     FunctionDecl(FunctionDecl),
@@ -57,6 +57,7 @@ pub struct FunctionDecl {
 pub struct Param {
     pub name: Spanned<String>,
     pub type_name: Spanned<TypeName>,
+    pub is_ref: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +82,12 @@ pub struct StructInit {
 type TypeName = String;
 
 #[derive(Clone, Debug)]
+pub struct Arg {
+    pub expr: Spanned<Expression>,
+    pub is_ref: bool,
+}
+
+#[derive(Clone, Debug)]
 pub enum Expression {
     Identifier(String),
     Float(f64),
@@ -95,7 +102,7 @@ pub enum Expression {
     Unary(UnOp, Box<Spanned<Expression>>),
 
     Intrinsic(Intrinsic, Vec<Spanned<Expression>>),
-    FunctionCall(Box<Spanned<Expression>>, Vec<Spanned<Expression>>),
+    FunctionCall(Box<Spanned<Expression>>, Vec<Spanned<Arg>>),
     MemberAccess(Box<Spanned<Expression>>, Spanned<String>),
     StructInit(StructInit),
 }
@@ -165,9 +172,9 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 15] = [
+const KEY_WORDS: [&str; 16] = [
     "let", "return", "if", "else", "then", "while", "true", "false", "fn", "struct", "enum",
-    "extern", "import", "as", "self",
+    "extern", "import", "as", "self", "ref",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -262,6 +269,21 @@ where
         .collect::<Vec<_>>()
         .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
+    let fn_args = (just(Token::Id("ref")).or_not().then(expression.clone()))
+        .map_with(|(ref_keyword, expr), extra| {
+            Spanned(
+                Arg {
+                    expr,
+                    is_ref: ref_keyword.is_some(),
+                },
+                extra.span(),
+            )
+        })
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<Spanned<Arg>>>()
+        .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
+
     let struct_init = identifier_spanned
         .then(
             just(Token::Dot)
@@ -318,14 +340,14 @@ where
 
     enum Postfix {
         Member(Spanned<String>),
-        Call(Vec<Spanned<Expression>>),
+        Call(Vec<Spanned<Arg>>),
     }
 
     let postfix = choice((
         just(Token::Dot)
             .ignore_then(identifier_spanned)
             .map(Postfix::Member),
-        args.clone().map(Postfix::Call),
+        fn_args.map(Postfix::Call),
     ));
 
     let field_access = atom
@@ -401,13 +423,21 @@ where
 
     let binary = equality;
 
-    let decl_params = (identifier_spanned
+    let one_param = just(Token::Id("ref"))
+        .or_not()
+        .then(identifier_spanned)
         .then_ignore(just(Token::Colon))
         .then(identifier_spanned)
-        .map(|(name, type_name)| Param { name, type_name }))
-    .separated_by(just(Token::Comma))
-    .collect()
-    .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
+        .map(|((ref_token, name), type_name)| Param {
+            name,
+            type_name,
+            is_ref: ref_token.is_some(),
+        });
+
+    let decl_params = one_param
+        .separated_by(just(Token::Comma))
+        .collect()
+        .delimited_by(just(Token::ParenOpen), just(Token::ParenClose));
 
     let function_decl = choice((
         just(Token::Id("fn"))
@@ -496,11 +526,12 @@ where
             Spanned(Statement::Binding(ident.to_owned(), expr), extra.span())
         });
 
-    let assignment = identifier
+    let assignment = expression
+        .clone()
         .then_ignore(just(Token::Equal))
         .then(expression.clone())
-        .map_with(|(ident, expr), extra| -> Spanned<Statement> {
-            Spanned(Statement::Assignment(ident.to_owned(), expr), extra.span())
+        .map_with(|(target, expr), extra| -> Spanned<Statement> {
+            Spanned(Statement::Assignment(target, expr), extra.span())
         });
 
     let r#return = just(Token::Id("return"))

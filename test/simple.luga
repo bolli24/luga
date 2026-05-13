@@ -1,27 +1,23 @@
-/// EXIT_CODE=69
-
-fn main(): i32 {
-    {
-        let pi = 3;
-        let tau = 2 * pi;
-        tau = 6;
-
-        {
-            @print("pi: %d \n", pi);
-            @print("tau: %d\n", tau);
-        }
-
-        {
-            let x = pi + tau;
-            @print("x: %d\n", x);
-        }
-
-        let test = {
-            =pi + tau;
-        };
-
-        @print("test: %d\n", test);
+struct Pos {
+    x: i32;
+    y: i32;
+} {
+    fn print(pos: Pos) {
+        @println("(%d, %d)", pos.x, pos.y);
     }
+}
 
-    return 3 * (4 * 4 + 4) + 3 * 3;
+fn main() {
+    let a = Pos {x: 1, y: -4};
+    test(ref a.x);
+
+    Pos.print(a); 
+}
+
+fn test(ref x: i32) {
+    x = x + 2;
+}
+
+fn test2(ref pos: Pos) {
+    pos.x = pos.x + 2;
 }

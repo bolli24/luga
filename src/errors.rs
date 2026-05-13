@@ -62,6 +62,8 @@ pub enum CodeError {
 
     #[error("Duplicate function parameter '{}'", .0)]
     FunctionParamDuplicate(String),
+    #[error("Parameter of external function must not be 'ref'")]
+    ExternParamIsRef,
     #[error("Name '{}' already defined.", .0)]
     NameAlreadyDefined(String),
     #[error("Call to unknown function '{}'.", .0)]
@@ -70,6 +72,10 @@ pub enum CodeError {
     FunctionCallArgumentCount(String, usize, usize),
     #[error("Function '{}' called with wrong argument type. Expected '{}' but found '{}'.", .0, .1, .2)]
     FunctionCallArgumentType(String, String, String),
+    #[error("Must pass argument as reference.")]
+    ExpectedRefArgument,
+    #[error("Must not pass argument as reference.")]
+    UnExpectedRefArgument,
 
     #[error("Unreachable statement.")]
     UnreachableStatement,
@@ -112,6 +118,9 @@ pub enum CodeError {
     ImportNotFound(String),
     #[error("Circular import of '{}'.", .0)]
     CircularImport(String),
+
+    #[error("Expected lvalue.")]
+    ExpectedLValue,
 }
 
 impl CodeError {

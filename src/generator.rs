@@ -7,14 +7,17 @@ use std::{
 };
 
 use cranelift::{
-    codegen::{Context, ir::ArgumentPurpose},
+    codegen::{
+        Context,
+        ir::{ArgumentPurpose, StackSlot},
+    },
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::{isa::CallConv, *},
 };
 use indexmap::{IndexMap, IndexSet};
 
-use luga_syntax::{SimpleSpan, Span};
+use luga_syntax::{SimpleSpan, Span, parser::Arg};
 use luga_syntax::{
     parser::{
         BinOp, Conditional, EnumDecl, Expression, FunctionDecl, If, Intrinsic, Param, Program,
@@ -68,6 +71,7 @@ pub enum Type {
     Struct(TypeId),
     Enum(TypeId),
     Error,
+    Ref(Box<Type>),
 }
 
 impl Type {
@@ -92,10 +96,30 @@ impl Type {
     fn is_unsigned_int(&self) -> bool {
         matches!(self, Self::U8 | Self::U16 | Self::U32 | Self::U64)
     }
+
+    fn is_ref(&self) -> bool {
+        matches!(self, Self::Ref(_))
+    }
+
+    fn ref_of(self) -> Option<Self> {
+        match self {
+            Self::Ref(ref_type) => {
+                debug_assert!(!ref_type.is_ref());
+                Some(*ref_type)
+            }
+            _ => None,
+        }
+    }
+
+    fn into_ref(self) -> Self {
+        Self::Ref(Box::new(self))
+    }
 }
 
 fn can_coerce_type(actual: &Type, expected: &Type) -> bool {
-    matches!(actual, Type::Never | Type::Error) || actual == expected
+    matches!(actual, Type::Never | Type::Error)
+        || actual == expected
+        || matches!(actual, Type::Ref(inner) if inner.as_ref() == expected)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +249,7 @@ impl Display for Type {
             Self::Struct(id) => write!(f, "<struct {id:?}>"),
             Self::Enum(id) => write!(f, "<enum {id:?}>"),
             Self::Error => write!(f, "ERROR"),
+            Self::Ref(ref_type) => write!(f, "ref<{ref_type}>"),
         }
     }
 }
@@ -413,7 +438,7 @@ impl TypeContext {
             Type::F32 => (4, 2),
             Type::F64 => (8, 3),
             Type::Void | Type::Never => (0, 0),
-            Type::String => (8, 3), // TODO: platform pointer size
+            Type::String | Type::Ref(_) => (8, 3), // TODO: platform pointer size
             Type::Bool => (1, 0),
             Type::Fn(_) => (0, 0),
             Type::Struct(struct_id) => {
@@ -439,6 +464,33 @@ impl TypeContext {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExprValue {
+    Slot(StackSlot, Type),
+    Addr(Value, Type),
+    Ssa(Value, Type),
+    Never,
+    Void,
+    Error,
+}
+
+impl ExprValue {
+    fn get_type(&self) -> Type {
+        match self {
+            ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty.clone(),
+            ExprValue::Never => Type::Never,
+            ExprValue::Void => Type::Void,
+            ExprValue::Error => Type::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Place {
+    addr: Value,
+    ty: Type,
 }
 
 pub fn generate(
@@ -557,7 +609,7 @@ struct Scope {
 
 #[derive(Clone)]
 pub enum Symbol {
-    Variable(Variable, Type),
+    Variable(StackSlot, Type),
     Function(FuncId, FuncType),
     Type(Type),
     Module(HashMap<String, Symbol>), // TODO: store module symbol table outside and use a ModuleId to refer to it here
@@ -663,7 +715,7 @@ struct FnGenerator<'a, 'ctx> {
     builder: FunctionBuilder<'ctx>,
     var_count: usize,
     current_func_type: FuncType,
-    return_dest: Option<Variable>,
+    return_dest: Option<StackSlot>,
 }
 
 impl GeneratorState<'_> {
@@ -872,14 +924,49 @@ fn module_prefix(canonical_path: &Path, module_index: usize) -> String {
 }
 
 impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
+    fn get_value(&mut self, value: ExprValue) -> Option<(Value, Type)> {
+        match value {
+            ExprValue::Ssa(value, ty) => Some((value, ty)),
+            ExprValue::Addr(addr, ty @ Type::Struct(_)) => Some((addr, ty)),
+            ExprValue::Addr(addr, ty) => {
+                let crane_ty = self.state.get_crane_type(&ty)?;
+                let value = self
+                    .builder
+                    .ins()
+                    .load(crane_ty, MemFlags::trusted(), addr, 0);
+                Some((value, ty))
+            }
+            ExprValue::Slot(slot, ty @ Type::Struct(_)) => {
+                let addr = self
+                    .builder
+                    .ins()
+                    .stack_addr(self.state.isa.pointer_type(), slot, 0);
+                Some((addr, ty))
+            }
+            ExprValue::Slot(slot, ty) => {
+                let crane_ty = self.state.get_crane_type(&ty)?;
+                let addr = self
+                    .builder
+                    .ins()
+                    .stack_addr(self.state.isa.pointer_type(), slot, 0);
+                let value = self
+                    .builder
+                    .ins()
+                    .load(crane_ty, MemFlags::trusted(), addr, 0);
+                Some((value, ty))
+            }
+            ExprValue::Never | ExprValue::Void | ExprValue::Error => None,
+        }
+    }
+
     fn build_statements(
         &mut self,
         statements: &[Spanned<Statement>],
         try_into_type: Option<Type>,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         let mut errors = ManyErrors::new();
         let mut iter = statements.iter().peekable();
-        let mut block_value = (Value::from_u32(u32::MAX - 1), Type::Void);
+        let mut block_value = ExprValue::Void;
         while let Some(statement) = iter.next() {
             let is_result = matches!(statement.0, Statement::Result(_));
 
@@ -894,7 +981,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Err(mut error) => {
                     errors.append(&mut error);
                 }
-                Ok(value @ (_, Type::Never)) => {
+                Ok(value @ ExprValue::Never) => {
                     if let Some(next) = iter.peek() {
                         if is_result {
                             errors.push(CodeError::ResultStatementNotLast.spanned(statement.1));
@@ -928,25 +1015,25 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         &mut self,
         statement: &Spanned<Statement>,
         try_into_type: Option<Type>,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         match &statement.0 {
             Statement::Return(expr) => {
                 if self.build_return(expr)? {
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                    return Ok(ExprValue::Never);
                 } else {
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
+                    return Ok(ExprValue::Void);
                 }
             }
             Statement::Expression(expr) => {
                 let value = self.build_expression(expr, try_into_type)?;
-                if value.1 == Type::Never {
+                if matches!(value, ExprValue::Never) {
                     return Ok(value);
                 }
             }
             Statement::Binding(name, expr) => {
                 if self.state.current_scope.symbols.contains_key(name) {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
-                };
+                }
 
                 let value = match self.build_expression(expr, None) {
                     Ok(value) => value,
@@ -956,55 +1043,63 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     }
                 };
 
-                if value.1 == Type::Never {
-                    return Ok(value);
-                }
-
-                if value.1 == Type::Error {
-                    self.new_error_var(name.to_owned());
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void)); // TODO: should this return Type::Error?
-                }
-
-                let Some(var_type) = self.state.get_crane_type(&value.1) else {
-                    return CodeError::BindingType(value.1.to_string()).err(expr.1);
+                let ty = match &value {
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                    ExprValue::Error => {
+                        self.new_error_var(name.to_owned());
+                        return Ok(ExprValue::Void);
+                    }
+                    ExprValue::Never => {
+                        return Ok(ExprValue::Never);
+                    }
+                    ExprValue::Void => {
+                        return CodeError::BindingType(Type::Void.to_string()).err(expr.1);
+                    }
                 };
 
-                let var = self.builder.declare_var(var_type);
-                self.builder.def_var(var, value.0);
-                self.new_var(name.to_owned(), var, value);
+                if self.state.get_crane_type(ty).is_none() {
+                    return CodeError::BindingType(ty.to_string()).err(expr.1);
+                }
+
+                let value = self
+                    .get_value(value)
+                    .expect("ssa or stack slot expression must produce a value");
+
+                let slot = self.stack_slot_for_type(&value.1);
+                self.store_to_slot(slot, &value.1, value.0);
+                self.new_var(name.to_owned(), slot, value.1);
             }
-            Statement::Assignment(name, expr) => match self.state.current_scope.get_symbol(name) {
-                LookupResult::Found(Symbol::Variable(var, var_type)) => {
-                    let (var, var_type) = (*var, var_type.clone());
-                    let value = self.build_expression(expr, Some(var_type.clone()))?;
+            Statement::Assignment(target, expr) => {
+                let place = self.build_place(target)?;
 
-                    if !can_coerce_type(&value.1, &var_type) {
-                        return CodeError::AssignmentIncompatibleTypes(
-                            var_type.to_string(),
-                            value.1.to_string(),
-                        )
-                        .err(statement.1);
-                    }
+                let value = self.build_expression(expr, Some(place.ty.clone()))?;
 
-                    if matches!(value.1, Type::Never | Type::Error) {
-                        return Ok(value);
-                    }
+                let ty = match &value {
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                    ExprValue::Never => return Ok(ExprValue::Never),
+                    ExprValue::Error => return Ok(ExprValue::Void),
+                    ExprValue::Void => &Type::Void,
+                };
 
-                    self.builder.def_var(var, value.0);
+                if !can_coerce_type(ty, &place.ty) {
+                    return CodeError::AssignmentIncompatibleTypes(
+                        place.ty.to_string(),
+                        ty.to_string(),
+                    )
+                    .err(statement.1);
                 }
-                LookupResult::CaptureError => {
-                    return CodeError::Capture(name.clone()).err(statement.1);
-                }
-                _ => {
-                    return CodeError::UnknownVariable(name.clone()).err(statement.1);
-                }
-            },
+
+                let value = self
+                    .get_value(value)
+                    .expect("ssa or stack slot expression must produce a value");
+
+                self.store_to_addr(place.addr, &place.ty, value.0);
+            }
             Statement::While(r#while) => {
                 if self.build_while(r#while)? {
-                    // TODO: if expresion value
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                    return Ok(ExprValue::Never);
                 } else {
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
+                    return Ok(ExprValue::Void);
                 }
             }
             Statement::FunctionDecl(decl) => {
@@ -1021,46 +1116,81 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             }
         }
 
-        return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
+        Ok(ExprValue::Void)
     }
 
-    fn build_return_field_copy(
-        &mut self,
-        struct_field: &StructField,
-        current_offset: &mut i32,
-        struct_addr: Value,
-        return_dest: Value,
-    ) {
-        // Align current offset to field's alignment requirement
-        let field_align_shift = self.state.types.align_shift(&struct_field.r#type);
-        *current_offset = Self::align_to(*current_offset, field_align_shift);
+    fn copy_memory(&mut self, src: Value, dest: Value, size: u32) {
+        // TODO: copy wider (word wide) chunks
+        for offset in 0..size {
+            let value = self
+                .builder
+                .ins()
+                .load(types::I8, MemFlags::trusted(), src, offset as i32);
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), value, dest, offset as i32);
+        }
+    }
 
-        match &struct_field.r#type {
-            Type::Struct(struct_id) => {
-                let struct_type = self.state.types.structs[struct_id].clone();
-                // For nested structs, recursively copy each field
-                for field in struct_type.fields.values() {
-                    self.build_return_field_copy(field, current_offset, struct_addr, return_dest);
-                }
-            }
-            _ => {
-                // Copy primitive field
-                let crane_type = self
-                    .state
-                    .get_crane_type(&struct_field.r#type)
-                    .expect("Field type must be valid");
-                let value = self.builder.ins().load(
-                    crane_type,
+    fn copy_struct_value(&mut self, struct_id: TypeId, src: Value, dest: Value) {
+        let size = self.state.types.size(&Type::Struct(struct_id));
+        self.copy_memory(src, dest, size);
+    }
+
+    fn stack_slot_for_type(&mut self, ty: &Type) -> StackSlot {
+        let (size, align_shift) = self.state.types.layout(ty);
+        self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size,
+            align_shift,
+        ))
+    }
+
+    fn stack_slot_addr(&mut self, slot: StackSlot) -> Value {
+        self.builder
+            .ins()
+            .stack_addr(self.state.isa.pointer_type(), slot, 0)
+    }
+
+    fn store_to_slot(&mut self, slot: StackSlot, ty: &Type, value: Value) {
+        let addr = self.stack_slot_addr(slot);
+        self.store_to_addr(addr, ty, value);
+    }
+
+    fn store_to_addr(&mut self, addr: Value, ty: &Type, value: Value) {
+        if let Type::Struct(struct_id) = ty {
+            self.copy_struct_value(*struct_id, value, addr);
+        } else {
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), value, addr, 0);
+        }
+    }
+
+    fn read_slot(&mut self, slot: StackSlot, ty: Type) -> ExprValue {
+        let addr = self.stack_slot_addr(slot);
+        match ty {
+            Type::Error => ExprValue::Error,
+            Type::Struct(_) => ExprValue::Addr(addr, ty),
+            Type::Ref(inner) => {
+                let ptr = self.builder.ins().load(
+                    self.state.isa.pointer_type(),
                     MemFlags::trusted(),
-                    struct_addr,
-                    *current_offset,
+                    addr,
+                    0,
                 );
-                self.builder
+                ExprValue::Addr(ptr, *inner)
+            }
+            ty => {
+                let crane_ty = self
+                    .state
+                    .get_crane_type(&ty)
+                    .expect("Variable type must have a Cranelift type.");
+                let value = self
+                    .builder
                     .ins()
-                    .store(MemFlags::trusted(), value, return_dest, *current_offset);
-
-                // Advance offset by field size
-                *current_offset += self.state.types.size(&struct_field.r#type) as i32;
+                    .load(crane_ty, MemFlags::trusted(), addr, 0);
+                ExprValue::Ssa(value, ty)
             }
         }
     }
@@ -1079,56 +1209,248 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
     fn build_return_value(
         &mut self,
-        value: (Value, Type),
+        value: ExprValue,
         span: SimpleSpan,
     ) -> Result<bool, ManyErrors> {
-        if value.1 == Type::Error {
-            return Ok(false);
-        }
-        if !can_coerce_type(&value.1, &self.current_func_type.return_type) {
+        let ty = match &value {
+            ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty.clone(),
+            ExprValue::Error => return Ok(false),
+            ExprValue::Never => return Ok(true),
+            ExprValue::Void => Type::Void,
+        };
+
+        if !can_coerce_type(&ty, &self.current_func_type.return_type) {
             return CodeError::InvalidReturnType(
                 self.current_func_type.return_type.to_string(),
-                value.1.to_string(),
+                ty.to_string(),
             )
             .err(span);
         }
-        match value.1 {
-            // Diverging expression already terminated the block — nothing to emit.
-            Type::Never => {}
+
+        match &ty {
             Type::Void => {
                 self.builder.ins().return_(&[]);
             }
             Type::Struct(struct_id) => {
-                let struct_type = &self.state.types.structs[&struct_id].clone();
+                let value = self
+                    .get_value(value)
+                    .expect("ssa or stack slot expression must produce a value");
+
                 let return_dest = self
                     .return_dest
                     .expect("Return destination must be valid when returning struct.");
 
-                let return_dest = self.builder.use_var(return_dest);
-
-                let mut current_offset = 0;
-
-                for field in struct_type.fields.values() {
-                    self.build_return_field_copy(field, &mut current_offset, value.0, return_dest);
-                }
+                let return_dest = self.stack_slot_addr(return_dest);
+                let return_dest = self.builder.ins().load(
+                    self.state.isa.pointer_type(),
+                    MemFlags::trusted(),
+                    return_dest,
+                    0,
+                );
+                self.copy_struct_value(*struct_id, value.0, return_dest);
 
                 self.builder.ins().return_(&[]);
             }
             _ => {
+                let value = self
+                    .get_value(value)
+                    .expect("ssa or stack slot expression must produce a value");
+
                 self.builder.ins().return_(&[value.0]);
             }
-        };
+        }
+
         Ok(true)
     }
 
+    fn build_place_value(
+        &mut self,
+        expression: &Spanned<Expression>,
+        _try_into_type: Option<Type>,
+    ) -> Result<ExprValue, ManyErrors> {
+        let Spanned(expression, span) = expression;
+        match expression {
+            Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
+                LookupResult::Found(Symbol::Variable(slot, var_type)) => {
+                    Ok(self.read_slot(*slot, var_type.clone()))
+                }
+                LookupResult::Found(Symbol::Function(..) | Symbol::Type(_)) => {
+                    CodeError::TypeUsedAsValue(name.clone()).err(*span)
+                }
+                LookupResult::Found(Symbol::Module(..)) => {
+                    CodeError::ModuleUsedAsValue(name.clone()).err(*span)
+                }
+                LookupResult::CaptureError => CodeError::Capture(name.clone()).err(*span),
+                LookupResult::NotFound => CodeError::UnknownVariable(name.clone()).err(*span),
+            },
+
+            Expression::MemberAccess(expr, member_name) => {
+                if let Some(symbol) = self.resolve_expr_as_symbol(expr).cloned() {
+                    return match symbol {
+                        Symbol::Module(_) => {
+                            CodeError::ModuleUsedAsValue(member_name.0.clone()).err(member_name.1)
+                        }
+                        Symbol::Type(Type::Enum(enum_id)) => {
+                            let Some(idx) = self.state.types.enums[&enum_id]
+                                .variants
+                                .get_index_of(&member_name.0)
+                            else {
+                                return CodeError::UnknownVariant(
+                                    self.state.types.type_name(enum_id),
+                                    member_name.0.clone(),
+                                )
+                                .err(member_name.1);
+                            };
+                            let val = self.builder.ins().iconst(types::I32, idx as i64);
+                            return Ok(ExprValue::Ssa(val, Type::Enum(enum_id)));
+                        }
+                        Symbol::Type(Type::Struct(struct_id)) => {
+                            CodeError::TypeUsedAsValue(self.state.types.type_name(struct_id))
+                                .err(expr.1)
+                        }
+                        Symbol::Type(_) => {
+                            unreachable!("Only struct and enum types may be imported.")
+                        }
+                        Symbol::Variable(..) => {
+                            unreachable!("resolve_expr_as_symbol must not return variables.")
+                        }
+                        Symbol::Function(_, func_type) => {
+                            CodeError::FunctionUsedAsValue(func_type.name.clone()).err(expr.1)
+                        }
+                    };
+                }
+
+                let expr_value = self.build_expression(expr, None)?;
+                let expr_ty = match &expr_value {
+                    ExprValue::Never => return Ok(ExprValue::Never),
+                    ExprValue::Error => return Ok(ExprValue::Error),
+                    ExprValue::Void => Type::Void,
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => {
+                        ty.clone()
+                    }
+                };
+                let name = member_name;
+                let field = match &expr_ty {
+                    Type::Struct(struct_id) => self.state.types.structs[struct_id]
+                        .fields
+                        .get(&name.0)
+                        .cloned(),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    CodeError::UnknownField(expr_ty.to_string(), name.0.clone()).spanned(name.1)
+                })?;
+
+                let expr_value = self
+                    .get_value(expr_value)
+                    .expect("ssa or stack slot member base must produce a value");
+
+                if matches!(field.r#type, Type::Struct(_)) {
+                    let field_addr = self
+                        .builder
+                        .ins()
+                        .iadd_imm(expr_value.0, field.offset as i64);
+                    return Ok(ExprValue::Addr(field_addr, field.r#type));
+                }
+
+                let field_crane_type = self
+                    .state
+                    .get_crane_type(&field.r#type)
+                    .expect("Field type must be valid.");
+                let struct_value = self.builder.ins().load(
+                    field_crane_type,
+                    MemFlags::new(),
+                    expr_value.0,
+                    field.offset,
+                );
+
+                Ok(ExprValue::Ssa(struct_value, field.r#type))
+            }
+            _ => CodeError::ExpectedLValue.err(*span)?,
+        }
+    }
+
+    fn build_place(&mut self, expression: &Spanned<Expression>) -> Result<Place, ManyErrors> {
+        let Spanned(expression, span) = expression;
+        match expression {
+            Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
+                LookupResult::Found(Symbol::Variable(slot, ty)) => {
+                    let slot = *slot;
+                    let ty = ty.clone();
+                    let addr = self.stack_slot_addr(slot);
+
+                    if let Type::Ref(inner) = ty {
+                        let ptr = self.builder.ins().load(
+                            self.state.isa.pointer_type(),
+                            MemFlags::trusted(),
+                            addr,
+                            0,
+                        );
+                        return Ok(Place {
+                            addr: ptr,
+                            ty: *inner,
+                        });
+                    }
+
+                    Ok(Place { addr, ty })
+                }
+                // TODO: Add a dedicated diagnostic for non-addressable expressions used as places.
+                LookupResult::Found(Symbol::Function(_, func_type)) => {
+                    CodeError::FunctionUsedAsValue(func_type.name.clone()).err(*span)
+                }
+                LookupResult::Found(Symbol::Type(_)) => {
+                    CodeError::TypeUsedAsValue(name.clone()).err(*span)
+                }
+                LookupResult::Found(Symbol::Module(_)) => {
+                    CodeError::ModuleUsedAsValue(name.clone()).err(*span)
+                }
+                LookupResult::CaptureError => CodeError::Capture(name.clone()).err(*span),
+                LookupResult::NotFound => CodeError::UnknownVariable(name.clone()).err(*span),
+            },
+            Expression::MemberAccess(base, member_name) => {
+                let base_place = self.build_place(base)?;
+
+                let Type::Struct(struct_id) = &base_place.ty else {
+                    return CodeError::UnknownField(
+                        base_place.ty.to_string(),
+                        member_name.0.clone(),
+                    )
+                    .err(member_name.1);
+                };
+
+                let field = self.state.types.structs[struct_id]
+                    .fields
+                    .get(&member_name.0)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodeError::UnknownField(base_place.ty.to_string(), member_name.0.clone())
+                            .spanned(member_name.1)
+                    })?;
+
+                let field_addr = self
+                    .builder
+                    .ins()
+                    .iadd_imm(base_place.addr, field.offset as i64);
+
+                Ok(Place {
+                    addr: field_addr,
+                    ty: field.r#type,
+                })
+            }
+            _ => CodeError::ExpectedLValue.err(*span),
+        }
+    }
     fn build_expression(
         &mut self,
         expression: &Spanned<Expression>,
         try_into_type: Option<Type>,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         let Spanned(expression, span) = expression;
         match expression {
-            Expression::Float(value) => Ok((self.builder.ins().f32const(*value as f32), Type::F32)),
+            Expression::Float(value) => Ok(ExprValue::Ssa(
+                self.builder.ins().f32const(*value as f32),
+                Type::F32,
+            )),
             Expression::Integer(value) => {
                 let into_type = try_into_type.unwrap_or(Type::I32);
 
@@ -1136,7 +1458,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     if *value < min || *value > max {
                         CodeError::CoerseInt(out_type.to_string(), *value).err(*span)
                     } else {
-                        Ok((self.builder.ins().iconst(cranelift_type, *value), out_type))
+                        Ok(ExprValue::Ssa(
+                            self.builder.ins().iconst(cranelift_type, *value),
+                            out_type,
+                        ))
                     }
                 };
 
@@ -1155,12 +1480,18 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     Type::U32 => {
                         check_and_emit(u32::MIN as i64, u32::MAX as i64, types::I32, Type::U32)
                     }
-                    Type::I64 => Ok((self.builder.ins().iconst(types::I64, *value), Type::I64)),
+                    Type::I64 => Ok(ExprValue::Ssa(
+                        self.builder.ins().iconst(types::I64, *value),
+                        Type::I64,
+                    )),
                     Type::U64 => {
                         if *value < 0 {
                             CodeError::CoerseInt(Type::U64.to_string(), *value).err(*span)
                         } else {
-                            Ok((self.builder.ins().iconst(types::I64, *value), Type::U64))
+                            Ok(ExprValue::Ssa(
+                                self.builder.ins().iconst(types::I64, *value),
+                                Type::U64,
+                            ))
                         }
                     }
                     _ => unreachable!("Can't coerce into type {into_type}"),
@@ -1194,9 +1525,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     .ins()
                     .global_value(types::I64, format_string_ref);
 
-                Ok((value, Type::String))
+                Ok(ExprValue::Ssa(value, Type::String))
             }
-            Expression::Bool(value) => Ok((
+            Expression::Bool(value) => Ok(ExprValue::Ssa(
                 self.builder.ins().iconst(types::I8, i64::from(*value)),
                 Type::Bool,
             )),
@@ -1210,32 +1541,53 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 let x_value = self.build_expression(x.as_ref(), try_into_type.clone())?;
                 let y_value = self.build_expression(y.as_ref(), try_into_type)?;
 
-                if x_value.1 == Type::Never || y_value.1 == Type::Never {
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
-                }
+                let x_ty = match &x_value {
+                    ExprValue::Never => return Ok(ExprValue::Never),
+                    ExprValue::Error => return Ok(ExprValue::Error),
+                    ExprValue::Void => {
+                        return CodeError::InvalidBinOpType(*op, Type::Void.to_string()).err(*span);
+                    }
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                };
 
-                if x_value.1 == Type::Error || y_value.1 == Type::Error {
-                    let value = self.builder.ins().iconst(types::I32, 0);
-                    return Ok((value, Type::Error));
-                }
+                let y_ty = match &y_value {
+                    ExprValue::Never => return Ok(ExprValue::Never),
+                    ExprValue::Error => return Ok(ExprValue::Error),
+                    ExprValue::Void => {
+                        return CodeError::InvalidBinOpType(*op, Type::Void.to_string()).err(*span);
+                    }
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                };
 
-                if x_value.1 != y_value.1 {
+                if x_ty != y_ty {
                     return CodeError::IncompatipleBinOpTypes(
                         *op,
-                        x_value.1.to_string(),
-                        y_value.1.to_string(),
+                        x_ty.to_string(),
+                        y_ty.to_string(),
                     )
                     .err(*span);
                 }
 
-                let result = match x_value.1 {
-                    Type::I8 | Type::I32 | Type::I64 => {
-                        self.build_int_bin_op(*op, x_value.0, y_value.0, x_value.1)
-                    }
-                    Type::F32 | Type::F64 => {
-                        self.build_float_bin_op(*op, x_value.0, y_value.0, x_value.1)
-                    }
-                    Type::Bool => self.build_bool_bin_op(*op, x_value.0, y_value.0),
+                let x_ty = x_ty.clone();
+                let y_ty_for_error = y_ty.to_string();
+
+                let x_value = self
+                    .get_value(x_value)
+                    .expect("ssa or stack slot binary lhs must produce a value");
+                let y_value = self
+                    .get_value(y_value)
+                    .expect("ssa or stack slot binary rhs must produce a value");
+
+                let result = match x_ty {
+                    Type::I8 | Type::I32 | Type::I64 => self
+                        .build_int_bin_op(*op, x_value.0, y_value.0, x_ty)
+                        .map(|(value, ty)| ExprValue::Ssa(value, ty)),
+                    Type::F32 | Type::F64 => self
+                        .build_float_bin_op(*op, x_value.0, y_value.0, x_ty)
+                        .map(|(value, ty)| ExprValue::Ssa(value, ty)),
+                    Type::Bool => self
+                        .build_bool_bin_op(*op, x_value.0, y_value.0)
+                        .map(|(value, ty)| ExprValue::Ssa(value, ty)),
                     Type::Enum(enum_id) if matches!(*op, BinOp::Equal | BinOp::NotEqual) => {
                         let enum_type = &self.state.types.enums[&enum_id];
                         let result = if enum_type.variants.len() <= 1 {
@@ -1249,26 +1601,32 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                             };
                             self.builder.ins().icmp(cc, x_value.0, y_value.0)
                         };
-                        Some((result, Type::Bool))
+                        Some(ExprValue::Ssa(result, Type::Bool))
                     }
                     _ => None,
                 }
-                .ok_or_else(|| {
-                    CodeError::InvalidBinOpType(*op, y_value.1.to_string()).spanned(*span)
-                })?;
+                .ok_or_else(|| CodeError::InvalidBinOpType(*op, y_ty_for_error).spanned(*span))?;
+
                 Ok(result)
             }
             Expression::Unary(op, expr) => {
                 let value = self.build_expression(expr.as_ref(), try_into_type)?;
-                if matches!(value.1, Type::Never | Type::Error) {
-                    return Ok(value);
-                }
 
-                if value.1 == Type::Bool && *op == UnOp::Not {
+                let ty = match &value {
+                    ExprValue::Never => return Ok(ExprValue::Never),
+                    ExprValue::Error => return Ok(ExprValue::Error),
+                    ExprValue::Void => &Type::Void,
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                };
+
+                if ty == &Type::Bool && *op == UnOp::Not {
+                    let value = self
+                        .get_value(value)
+                        .expect("ssa or stack slot unary operand must produce a value");
                     let result = self.builder.ins().bxor_imm(value.0, 1);
-                    Ok((result, Type::Bool))
+                    Ok(ExprValue::Ssa(result, Type::Bool))
                 } else {
-                    CodeError::InvalidUnOpType(*op, value.1.to_string()).err(*span)
+                    CodeError::InvalidUnOpType(*op, ty.to_string()).err(*span)
                 }
             }
             Expression::Intrinsic(intrinsic, args) => match intrinsic {
@@ -1278,85 +1636,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Intrinsic::Exit => self.build_exit(span, args),
                 Intrinsic::EnumToInt => self.build_enum_to_int(span, args),
             },
-            Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
-                LookupResult::Found(Symbol::Variable(var, var_type)) => {
-                    Ok((self.builder.use_var(*var), var_type.clone()))
-                }
-                LookupResult::Found(Symbol::Function(..) | Symbol::Type(_)) => {
-                    CodeError::TypeUsedAsValue(name.clone()).err(*span)
-                }
-                LookupResult::Found(Symbol::Module(..)) => {
-                    CodeError::ModuleUsedAsValue(name.clone()).err(*span)
-                }
-                LookupResult::CaptureError => CodeError::Capture(name.clone()).err(*span),
-                LookupResult::NotFound => CodeError::UnknownVariable(name.clone()).err(*span),
-            },
+            Expression::Identifier(_) => {
+                self.build_place_value(&Spanned(expression.clone(), *span), try_into_type)
+            }
             Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
-            Expression::MemberAccess(expr, member_name) => {
-                if let Some(symbol) = self.resolve_expr_as_symbol(expr).cloned() {
-                    return match symbol {
-                        Symbol::Module(_) => {
-                            CodeError::ModuleUsedAsValue(member_name.0.clone()).err(member_name.1)
-                        }
-                        Symbol::Type(Type::Enum(enum_id)) => {
-                            let Some(idx) = self.state.types.enums[&enum_id]
-                                .variants
-                                .get_index_of(&member_name.0)
-                            else {
-                                return CodeError::UnknownVariant(
-                                    self.state.types.type_name(enum_id),
-                                    member_name.0.clone(),
-                                )
-                                .err(member_name.1);
-                            };
-                            let val = self.builder.ins().iconst(types::I32, idx as i64);
-                            return Ok((val, Type::Enum(enum_id)));
-                        }
-                        Symbol::Type(Type::Struct(struct_id)) => {
-                            CodeError::TypeUsedAsValue(self.state.types.type_name(struct_id))
-                                .err(expr.1)
-                        }
-                        Symbol::Type(_) => {
-                            unreachable!("Only struct and enum types may be imported.")
-                        }
-                        Symbol::Variable(..) => {
-                            unreachable!("resolve_expr_as_symbol must not return variables.")
-                        }
-                        Symbol::Function(_, func_type) => {
-                            CodeError::FunctionUsedAsValue(func_type.name.clone()).err(expr.1)
-                        }
-                    };
-                }
-
-                let expr_value = self.build_expression(expr, None)?;
-                if matches!(expr_value.1, Type::Never | Type::Error) {
-                    return Ok(expr_value);
-                }
-                let name = member_name;
-                let field = match &expr_value.1 {
-                    Type::Struct(struct_id) => {
-                        self.state.types.structs[struct_id].fields.get(&name.0)
-                    }
-                    _ => None,
-                }
-                .ok_or_else(|| {
-                    CodeError::UnknownField(expr_value.1.to_string(), name.0.clone())
-                        .spanned(name.1)
-                })?;
-
-                let field_crane_type = self
-                    .state
-                    .get_crane_type(&field.r#type)
-                    .expect("Field type must be valid.");
-
-                let struct_value = self.builder.ins().load(
-                    field_crane_type,
-                    MemFlags::new(),
-                    expr_value.0,
-                    field.offset,
-                );
-
-                Ok((struct_value, field.r#type.clone()))
+            Expression::MemberAccess(_, _) => {
+                self.build_place_value(&Spanned(expression.clone(), *span), try_into_type)
             }
             Expression::StructInit(struct_init) => {
                 let mut errors = ManyErrors::new();
@@ -1406,55 +1691,80 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 }
 
                 let struct_type = &self.state.types.structs[struct_id];
+                let struct_size = struct_type.size;
+                let struct_align_shift = struct_type.align_shift;
+                let struct_fields = struct_type.fields.clone();
 
                 let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    struct_type.size,
-                    struct_type.align_shift,
+                    struct_size,
+                    struct_align_shift,
                 ));
 
                 let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
-                let mut poison_type = None;
+                let mut poison_value = None;
 
-                for (name, field) in &struct_type.fields {
-                    let Some(value) = arg_values.get(name) else {
+                for (name, field) in &struct_fields {
+                    let Some(value) = arg_values.remove(name) else {
                         errors.push(CodeError::StructInitMissingArg(name.clone()).spanned(*span));
                         continue;
                     };
 
-                    if !can_coerce_type(&value.1, &field.r#type) {
+                    let ty = match &value {
+                        ExprValue::Never => {
+                            poison_value = Some(ExprValue::Never);
+                            continue;
+                        }
+                        ExprValue::Error => {
+                            poison_value = Some(ExprValue::Error);
+                            continue;
+                        }
+                        ExprValue::Void => &Type::Void,
+                        ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => {
+                            ty
+                        }
+                    };
+
+                    if !can_coerce_type(ty, &field.r#type) {
                         errors.push(
                             CodeError::StructInitInvalidType(
                                 field.r#type.to_string(),
-                                value.1.to_string(),
+                                ty.to_string(),
                             )
                             .spanned(*span),
                         );
                         continue;
                     }
 
-                    if matches!(value.1, Type::Never | Type::Error) {
-                        poison_type = Some(value.1.clone());
-                        continue;
-                    }
+                    let value = self
+                        .get_value(value)
+                        .expect("ssa or stack slot struct field value must produce a value");
 
-                    self.builder.ins().store(
-                        MemFlags::trusted(),
-                        value.0,
-                        struct_addr,
-                        field.offset,
-                    );
+                    if let Type::Struct(field_struct_id) = field.r#type {
+                        let field_dest = self
+                            .builder
+                            .ins()
+                            .iadd_imm(struct_addr, field.offset as i64);
+                        self.copy_struct_value(field_struct_id, value.0, field_dest);
+                    } else {
+                        self.builder.ins().store(
+                            MemFlags::trusted(),
+                            value.0,
+                            struct_addr,
+                            field.offset,
+                        );
+                    }
                 }
 
                 if !errors.is_empty() {
                     return Err(errors);
                 }
 
-                if let Some(poison_type) = poison_type {
-                    return Ok((Value::from_u32(u32::MAX - 1), poison_type));
+                if let Some(poison_value) = poison_value {
+                    return Ok(poison_value);
                 }
 
-                Ok((struct_addr, r#type))
+                Ok(ExprValue::Slot(stack_slot, r#type))
             }
         }
     }
@@ -1569,7 +1879,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         span: &SimpleSpan,
         args: &[Spanned<Expression>],
         new_line: bool,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         let Some((format_string_arg, other_args)) = args.split_first() else {
             return CodeError::IntrinsicTooFewArguments("print", 1, args.len()).err(*span);
         };
@@ -1585,52 +1895,82 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             return CodeError::ExpectedStringLiteral.err(format_string_arg.1);
         };
 
+        const PRINT_ARG_TYPES: [Type; 10] = [
+            Type::U8,
+            Type::I8,
+            Type::U16,
+            Type::I16,
+            Type::U32,
+            Type::I32,
+            Type::U64,
+            Type::I64,
+            Type::Bool,
+            Type::String,
+        ];
+        const PRINT_ARG_TYPE_NAMES: [&str; 10] = [
+            "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "bool", "string",
+        ];
+
         let arg_values = other_args
             .iter()
             .map(|expr| {
-                let result = self.build_expression(expr, None);
-                if let Ok(value) = &result {
-                    const PRINT_ARG_TYPES: [Type; 10] = [
-                        Type::U8,
-                        Type::I8,
-                        Type::U16,
-                        Type::I16,
-                        Type::U32,
-                        Type::I32,
-                        Type::U64,
-                        Type::I64,
-                        Type::Bool,
-                        Type::String,
-                    ];
-                    const PRINT_ARG_TYPE_NAMES: [&str; 10] = [
-                        "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "bool", "string",
-                    ];
-                    if matches!(value.1, Type::Never | Type::Error) {
-                        return Ok((value.0, value.1.clone()));
-                    }
-                    if !PRINT_ARG_TYPES.contains(&value.1) && !matches!(value.1, Type::Enum(_)) {
+                let value = self.build_expression(expr, None)?;
+
+                let ty = match &value {
+                    ExprValue::Never => return Ok(ExprValue::Never),
+                    ExprValue::Error => return Ok(ExprValue::Error),
+                    ExprValue::Void => {
                         return CodeError::IntrisicArgumentType(
                             "print",
                             &PRINT_ARG_TYPE_NAMES,
-                            value.1.to_string(),
+                            Type::Void.to_string(),
                         )
                         .err(expr.1);
                     }
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                };
+
+                if !PRINT_ARG_TYPES.contains(ty) && !matches!(ty, Type::Enum(_)) {
+                    return CodeError::IntrisicArgumentType(
+                        "print",
+                        &PRINT_ARG_TYPE_NAMES,
+                        ty.to_string(),
+                    )
+                    .err(expr.1);
                 }
-                result
+
+                let value = self
+                    .get_value(value)
+                    .expect("ssa or stack slot print argument must produce a value");
+
+                Ok(ExprValue::Ssa(value.0, value.1))
             })
             .collect_all()
             .map_err(|errors| errors.into_iter().flatten().collect::<ManyErrors>())?;
 
-        if arg_values.iter().any(|(_, ty)| *ty == Type::Never) {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+        if arg_values.iter().any(|value| *value == ExprValue::Never) {
+            return Ok(ExprValue::Never);
         }
 
-        if arg_values.iter().any(|(_, ty)| *ty == Type::Error) {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+        if arg_values.iter().any(|value| *value == ExprValue::Error) {
+            return Ok(ExprValue::Error);
         }
 
-        let format_string_value = self.build_expression(&format_string_arg, None)?;
+        let arg_values = arg_values
+            .into_iter()
+            .map(|value| match value {
+                ExprValue::Ssa(value, ty) => (value, ty),
+                ExprValue::Slot(..) | ExprValue::Addr(..) => {
+                    unreachable!("print args were materialized above")
+                }
+                ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+
+        let value = self.build_expression(&format_string_arg, None)?;
+        let format_string_value = self
+            .get_value(value)
+            .expect("string literal must produce a value");
         debug_assert_eq!(format_string_value.1, Type::String);
 
         // Because printf is a variadic function we have to change it's signature on the fly
@@ -1659,22 +1999,20 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         let value = self.builder.func.dfg.inst_results(result)[0];
         // TODO: Type::I32
-        Ok((value, Type::I32))
+        Ok(ExprValue::Ssa(value, Type::I32))
     }
 
-    fn new_var(&mut self, name: String, var: Variable, value: (Value, Type)) {
+    fn new_var(&mut self, name: String, slot: StackSlot, ty: Type) {
         self.state
             .current_scope
-            .insert_symbol(name, Symbol::Variable(var, value.1))
+            .insert_symbol(name, Symbol::Variable(slot, ty))
             .expect("Variable must not exist.");
         self.var_count += 1;
     }
 
     fn new_error_var(&mut self, name: String) {
-        let var = self.builder.declare_var(types::I32);
-        let value = self.builder.ins().iconst(types::I32, 0);
-        self.builder.def_var(var, value);
-        self.new_var(name, var, (value, Type::Error));
+        let slot = self.stack_slot_for_type(&Type::I32);
+        self.new_var(name, slot, Type::Error);
     }
 
     fn switch_to_recovery_block(&mut self) {
@@ -1687,11 +2025,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.builder
             .current_block()
             .and_then(|block| self.builder.func.layout.last_inst(block))
-            .is_some_and(|inst| {
-                self.builder.func.dfg.insts[inst]
-                    .opcode()
-                    .is_terminator()
-            })
+            .is_some_and(|inst| self.builder.func.dfg.insts[inst].opcode().is_terminator())
     }
 
     fn trap_if_current_block_open(&mut self) {
@@ -1706,7 +2040,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         if_expr: &If,
         span: SimpleSpan,
         try_into_type: Option<Type>,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         struct BranchExit {
             block: Block,
             r#type: Type,
@@ -1745,26 +2079,44 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             self.builder.switch_to_block(condition_block);
             // TODO: maybe set try_into_type to bool
             let condition_value = match self.build_expression(&conditional.condition, None) {
-                Ok((_, Type::Never)) => {
-                    // Diverging conditions have already terminated this block.
+                Ok(ExprValue::Never) => {
+                    self.builder.ins().jump(next_block, []);
                     continue;
                 }
-                Ok((_, Type::Error)) => {
+                Ok(ExprValue::Error) => {
                     condition_poisoned = true;
                     self.builder.ins().jump(next_block, []);
                     continue;
                 }
-                Ok(condition_value) if can_coerce_type(&condition_value.1, &Type::Bool) => {
-                    condition_value
-                }
-                Ok((_, r#type)) => {
+                Ok(ExprValue::Void) => {
                     condition_poisoned = true;
                     errors.push(
-                        CodeError::InvalidConditionType(r#type.to_string())
+                        CodeError::InvalidConditionType(Type::Void.to_string())
                             .spanned(conditional.condition.1),
                     );
                     self.builder.ins().jump(next_block, []);
                     continue;
+                }
+                Ok(condition_value) => {
+                    let ty = match &condition_value {
+                        ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => {
+                            ty
+                        }
+                        ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
+                    };
+
+                    if !can_coerce_type(ty, &Type::Bool) {
+                        condition_poisoned = true;
+                        errors.push(
+                            CodeError::InvalidConditionType(ty.to_string())
+                                .spanned(conditional.condition.1),
+                        );
+                        self.builder.ins().jump(next_block, []);
+                        continue;
+                    }
+
+                    self.get_value(condition_value)
+                        .expect("ssa or stack slot condition must produce a value")
                 }
                 Err(mut err) => {
                     condition_poisoned = true;
@@ -1782,19 +2134,28 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             self.builder.seal_block(then_block);
             self.builder.switch_to_block(then_block);
             match self.build_block_body(&conditional.block, try_into_type.clone()) {
-                Ok((block_value, block_type)) => {
+                Ok(ExprValue::Never) => {}
+                Ok(ExprValue::Error) => {
+                    self.trap_if_current_block_open();
+                }
+                Ok(block_value) => {
+                    let block_type = block_value.get_type();
                     if block_type != Type::Never {
                         let branch_exit_block = self.builder.create_block();
                         let mut emitted_branch_exit = true;
                         if block_type == Type::Void {
                             self.builder.ins().jump(branch_exit_block, []);
-                        } else if let Some(block_crane_type) = self.state.get_crane_type(&block_type)
+                        } else if let Some(block_crane_type) =
+                            self.state.get_crane_type(&block_type)
                         {
                             self.builder
                                 .append_block_param(branch_exit_block, block_crane_type);
+                            let block_value = self
+                                .get_value(block_value)
+                                .expect("ssa or stack slot branch result must produce a value");
                             self.builder
                                 .ins()
-                                .jump(branch_exit_block, [&block_value.into()]);
+                                .jump(branch_exit_block, [&block_value.0.into()]);
                         } else {
                             self.builder.ins().trap(UNREACHABLE);
                             emitted_branch_exit = false;
@@ -1827,19 +2188,28 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     .expect("Else branch must exist."),
                 try_into_type.clone(),
             ) {
-                Ok((block_value, block_type)) => {
+                Ok(ExprValue::Never) => {}
+                Ok(ExprValue::Error) => {
+                    self.trap_if_current_block_open();
+                }
+                Ok(block_value) => {
+                    let block_type = block_value.get_type();
                     if block_type != Type::Never {
                         let branch_exit_block = self.builder.create_block();
                         let mut emitted_branch_exit = true;
                         if block_type == Type::Void {
                             self.builder.ins().jump(branch_exit_block, []);
-                        } else if let Some(block_crane_type) = self.state.get_crane_type(&block_type)
+                        } else if let Some(block_crane_type) =
+                            self.state.get_crane_type(&block_type)
                         {
                             self.builder
                                 .append_block_param(branch_exit_block, block_crane_type);
+                            let block_value = self
+                                .get_value(block_value)
+                                .expect("ssa or stack slot branch result must produce a value");
                             self.builder
                                 .ins()
-                                .jump(branch_exit_block, [&block_value.into()]);
+                                .jump(branch_exit_block, [&block_value.0.into()]);
                         } else {
                             self.builder.ins().trap(UNREACHABLE);
                             emitted_branch_exit = false;
@@ -1905,13 +2275,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.builder.seal_block(exit_block);
         self.builder.switch_to_block(exit_block);
 
-        let expr_value = if expr_type != Type::Void && expr_type != Type::Never {
-            self.builder.block_params(exit_block)[0]
-        } else {
-            Value::from_u32(u32::MAX - 1)
-        };
-
-        Ok((expr_value, expr_type))
+        Ok(match expr_type {
+            Type::Never => ExprValue::Never,
+            Type::Void => ExprValue::Void,
+            Type::Struct(_) => ExprValue::Addr(self.builder.block_params(exit_block)[0], expr_type),
+            _ => ExprValue::Ssa(self.builder.block_params(exit_block)[0], expr_type),
+        })
     }
 
     fn build_while(&mut self, conditional: &Conditional) -> Result<bool, ManyErrors> {
@@ -1923,18 +2292,32 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.builder.ins().jump(condition_block, []);
         self.builder.switch_to_block(condition_block);
 
-        let condition_value = self.build_expression(condition, None)?;
-        if matches!(condition_value.1, Type::Never | Type::Error) {
-            self.builder.ins().jump(exit_block, []);
-            self.builder.switch_to_block(exit_block);
-            self.builder.seal_block(condition_block);
-            self.builder.seal_block(while_block);
-            self.builder.seal_block(exit_block);
-            return Ok(false);
-        }
-        if !can_coerce_type(&condition_value.1, &Type::Bool) {
-            return CodeError::InvalidConditionType(condition_value.1.to_string()).err(condition.1);
-        }
+        let condition_value = match self.build_expression(condition, None)? {
+            ExprValue::Never | ExprValue::Error => {
+                self.builder.ins().jump(exit_block, []);
+                self.builder.switch_to_block(exit_block);
+                self.builder.seal_block(condition_block);
+                self.builder.seal_block(while_block);
+                self.builder.seal_block(exit_block);
+                return Ok(false);
+            }
+            ExprValue::Void => {
+                return CodeError::InvalidConditionType(Type::Void.to_string()).err(condition.1);
+            }
+            condition_value => {
+                let ty = match &condition_value {
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
+                };
+
+                if !can_coerce_type(ty, &Type::Bool) {
+                    return CodeError::InvalidConditionType(ty.to_string()).err(condition.1);
+                }
+
+                self.get_value(condition_value)
+                    .expect("ssa or stack slot condition must produce a value")
+            }
+        };
 
         self.builder
             .ins()
@@ -1958,7 +2341,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         &mut self,
         body: &[Spanned<Statement>],
         try_into_type: Option<Type>,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         self.state.push_scope();
 
         let result = self.build_statements(body, try_into_type);
@@ -1967,29 +2350,48 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             unreachable!("Must always be able to pop scope after leaving block.");
         };
 
-        return result;
+        result
     }
 
     fn build_assert(
         &mut self,
         span: &SimpleSpan,
         args: &[Spanned<Expression>],
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         if args.len() != 1 {
             return CodeError::IntrinsicArgumentCount("assert", 1, args.len()).err(*span);
         }
 
-        let condition = self.build_expression(&args[0], None)?;
-        if condition.1 == Type::Never {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
-        }
-        if condition.1 == Type::Error {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
-        }
-        if !can_coerce_type(&condition.1, &Type::Bool) {
-            return CodeError::IntrisicArgumentType("assert", &["bool"], condition.1.to_string())
+        let condition = match self.build_expression(&args[0], None)? {
+            ExprValue::Never => {
+                return Ok(ExprValue::Never);
+            }
+            ExprValue::Error => {
+                return Ok(ExprValue::Error);
+            }
+            ExprValue::Void => {
+                return CodeError::IntrisicArgumentType(
+                    "assert",
+                    &["bool"],
+                    Type::Void.to_string(),
+                )
                 .err(args[0].1);
-        }
+            }
+            condition => {
+                let ty = match &condition {
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
+                };
+
+                if !can_coerce_type(ty, &Type::Bool) {
+                    return CodeError::IntrisicArgumentType("assert", &["bool"], ty.to_string())
+                        .err(args[0].1);
+                }
+
+                self.get_value(condition)
+                    .expect("ssa or stack slot condition must produce a value")
+            }
+        };
 
         let exit_code = self.builder.ins().iconst(types::I32, 1);
 
@@ -2015,29 +2417,40 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         self.builder.switch_to_block(continue_block);
 
-        Ok((Value::from_u32(u32::MAX - 1), Type::Void))
+        Ok(ExprValue::Void)
     }
 
     fn build_exit(
         &mut self,
         span: &SimpleSpan,
         args: &[Spanned<Expression>],
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         if args.len() != 1 {
             return CodeError::IntrinsicArgumentCount("exit", 1, args.len()).err(*span);
         }
 
-        let expr = self.build_expression(&args[0], Some(Type::I32))?;
-        if expr.1 == Type::Never {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
-        }
-        if expr.1 == Type::Error {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
-        }
-        if !can_coerce_type(&expr.1, &Type::I32) {
-            return CodeError::IntrisicArgumentType("exit", &["i32"], expr.1.to_string())
-                .err(args[0].1);
-        }
+        let expr = match self.build_expression(&args[0], Some(Type::I32))? {
+            ExprValue::Never => return Ok(ExprValue::Never),
+            ExprValue::Error => return Ok(ExprValue::Error),
+            ExprValue::Void => {
+                return CodeError::IntrisicArgumentType("exit", &["i32"], Type::Void.to_string())
+                    .err(args[0].1);
+            }
+            expr => {
+                let ty = match &expr {
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
+                };
+
+                if !can_coerce_type(ty, &Type::I32) {
+                    return CodeError::IntrisicArgumentType("exit", &["i32"], ty.to_string())
+                        .err(args[0].1);
+                }
+
+                self.get_value(expr)
+                    .expect("ssa or stack slot exit code must produce a value")
+            }
+        };
 
         let exit_ref = self
             .state
@@ -2046,31 +2459,42 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         self.builder.ins().call(exit_ref, &[expr.0]);
         self.builder.ins().trap(UNREACHABLE);
-        Ok((Value::from_u32(u32::MAX - 1), Type::Never))
+        Ok(ExprValue::Never)
     }
 
     fn build_enum_to_int(
         &mut self,
         span: &SimpleSpan,
         args: &[Spanned<Expression>],
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         if args.len() != 1 {
             return CodeError::IntrinsicArgumentCount("enumToInt", 1, args.len()).err(*span);
         }
 
-        let expr = self.build_expression(&args[0], None)?;
-        if expr.1 == Type::Never {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
-        }
-        if expr.1 == Type::Error {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
-        }
-        if !matches!(expr.1, Type::Enum(_)) {
-            return CodeError::IntrinsicExpectedEnum("enumToInt", expr.1.to_string())
-                .err(args[0].1);
-        }
+        let expr = match self.build_expression(&args[0], None)? {
+            ExprValue::Never => return Ok(ExprValue::Never),
+            ExprValue::Error => return Ok(ExprValue::Error),
+            ExprValue::Void => {
+                return CodeError::IntrinsicExpectedEnum("enumToInt", Type::Void.to_string())
+                    .err(args[0].1);
+            }
+            expr => {
+                let ty = match &expr {
+                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
+                };
 
-        Ok((expr.0, Type::I32))
+                if !matches!(ty, Type::Enum(_)) {
+                    return CodeError::IntrinsicExpectedEnum("enumToInt", ty.to_string())
+                        .err(args[0].1);
+                }
+
+                self.get_value(expr)
+                    .expect("ssa or stack slot enum value must produce a value")
+            }
+        };
+
+        Ok(ExprValue::Ssa(expr.0, Type::I32))
     }
 }
 
@@ -2121,11 +2545,21 @@ impl GeneratorState<'_> {
             errors.push(CodeError::MainHasParams.spanned(*span));
         }
 
-        for Param { name, type_name } in params {
-            let Some(r#type) = self.type_from_name(&type_name.0) else {
+        for Param {
+            name,
+            type_name,
+            is_ref,
+        } in params
+        {
+            let Some(r#type) = self.type_from_name(&type_name.0, *is_ref) else {
                 errors.push(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1));
                 continue;
             };
+
+            // TODO: support extern ref params
+            if *is_extern && *is_ref {
+                errors.push(CodeError::ExternParamIsRef.spanned(name.1))
+            }
 
             if fn_params
                 .iter()
@@ -2133,6 +2567,7 @@ impl GeneratorState<'_> {
             {
                 errors.push(CodeError::FunctionParamDuplicate(name.0.clone()).spanned(name.1));
             }
+
             param_types.push(r#type.clone());
             let purpose = if let Type::Struct(struct_id) = &r#type
                 && *is_extern
@@ -2151,7 +2586,7 @@ impl GeneratorState<'_> {
 
         let declared_return_type = match return_type {
             Some(type_name) => self
-                .type_from_name(&type_name.0)
+                .type_from_name(&type_name.0, false)
                 .ok_or(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1))?,
             None => Type::Void,
         };
@@ -2183,7 +2618,7 @@ impl GeneratorState<'_> {
             Type::Struct(_) => {
                 fn_params.push((
                     "@return_addr".to_owned(),
-                    return_type.clone(),
+                    return_type.clone(), // TODO: can we just use Type::Ref(Box::new(return_type))?
                     ArgumentPurpose::StructReturn,
                 ));
                 Vec::new()
@@ -2213,11 +2648,18 @@ impl GeneratorState<'_> {
                 .iter()
                 .map(|(_, r#type, purpose)| {
                     let mut abi_param: AbiParam = if *is_extern {
+                        debug_assert!(!r#type.is_ref());
                         self.get_extern_abi_param(r#type)
                     } else {
                         self.get_abi_param(r#type)
                     }
                     .expect("Param type must be valid.");
+                    // If we ever support ref parameter in extern we must change the purpose for those params
+                    debug_assert!(
+                        !(*is_extern
+                            && r#type.is_ref()
+                            && matches!(purpose, ArgumentPurpose::StructArgument(_)))
+                    );
                     abi_param.purpose = *purpose;
                     abi_param
                 })
@@ -2229,13 +2671,6 @@ impl GeneratorState<'_> {
             .module
             .declare_function(object_name, linkage, &signature)
             .expect("Function must be declarable.");
-
-        /* self.current_scope
-        .insert_symbol(
-            name.to_owned(),
-            Symbol::Function(func_id, func_type.clone()),
-        )
-        .expect("Must not overwrite symbol"); */
 
         Ok(Symbol::Function(func_id, func_type))
     }
@@ -2322,6 +2757,7 @@ impl GeneratorState<'_> {
         let FunctionDecl { params, body, .. } = decl;
 
         // Reconstruct fn_params from decl names + func_type resolved types.
+        // TODO: do we need to reconstruct or can we just pass is through?
         let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = params
             .iter()
             .zip(func_type.params.iter())
@@ -2395,18 +2831,18 @@ impl GeneratorState<'_> {
         for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
             let param_value = fn_generator.builder.block_params(entry_block)[i];
 
-            let var_type = fn_generator
-                .state
-                .get_abi_param(param_type)
-                .expect("Parameter type should be valid");
-
-            let var = fn_generator.builder.declare_var(var_type.value_type);
-            fn_generator.builder.def_var(var, param_value);
-            fn_generator.new_var(param_name.clone(), var, (param_value, param_type.clone()));
+            let storage_type = if *purpose == ArgumentPurpose::StructReturn {
+                Type::Ref(Box::new(param_type.clone()))
+            } else {
+                param_type.clone()
+            };
+            let slot = fn_generator.stack_slot_for_type(&storage_type);
+            fn_generator.store_to_slot(slot, &storage_type, param_value);
+            fn_generator.new_var(param_name.clone(), slot, storage_type);
 
             if *purpose == ArgumentPurpose::StructReturn {
                 debug_assert!(fn_generator.return_dest.is_none());
-                fn_generator.return_dest = Some(var);
+                fn_generator.return_dest = Some(slot);
             }
         }
 
@@ -2414,17 +2850,17 @@ impl GeneratorState<'_> {
             Err(mut new_errors) => {
                 errors.append(&mut new_errors);
             }
-            Ok((_, Type::Never)) => {}
-            Ok(value @ (_, Type::Void)) if *func_type.return_type == Type::Void => {
+            Ok(ExprValue::Never | ExprValue::Error) => {}
+            Ok(value @ ExprValue::Void) if *func_type.return_type == Type::Void => {
                 if let Err(mut new_errors) = fn_generator.build_return_value(value, *span) {
                     errors.append(&mut new_errors);
                 }
             }
-            Ok((_, Type::Void)) if main_implicit_zero => {
+            Ok(ExprValue::Void) if main_implicit_zero => {
                 let zero = fn_generator.builder.ins().iconst(types::I32, 0);
                 fn_generator.builder.ins().return_(&[zero]);
             }
-            Ok((_, Type::Void)) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
+            Ok(ExprValue::Void) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
             Ok(value) => {
                 if let Err(mut new_errors) = fn_generator.build_return_value(value, *span) {
                     errors.append(&mut new_errors);
@@ -2503,7 +2939,7 @@ impl GeneratorState<'_> {
 
     fn type_from_path(&self, path: &[Spanned<String>]) -> Option<Type> {
         if path.len() == 1 {
-            return self.type_from_name(&path[0].0);
+            return self.type_from_name(&path[0].0, false);
         }
         let LookupResult::Found(Symbol::Module(map)) = self.current_scope.get_symbol(&path[0].0)
         else {
@@ -2522,8 +2958,8 @@ impl GeneratorState<'_> {
         }
     }
 
-    fn type_from_name(&self, type_name: &str) -> Option<Type> {
-        Some(match type_name {
+    fn type_from_name(&self, type_name: &str, is_ref: bool) -> Option<Type> {
+        let r#type = match type_name {
             "i8" => Type::I8,
             "i16" => Type::I16,
             "i32" => Type::I32,
@@ -2537,7 +2973,12 @@ impl GeneratorState<'_> {
             "bool" => Type::Bool,
             "string" => Type::String,
             "void" => Type::Void,
-            name => return self.current_scope.get_type(name).cloned(),
+            name => self.current_scope.get_type(name).cloned()?,
+        };
+        Some(if is_ref {
+            Type::Ref(Box::new(r#type))
+        } else {
+            r#type
         })
     }
 }
@@ -2546,9 +2987,9 @@ impl FnGenerator<'_, '_> {
     fn build_fn_call(
         &mut self,
         callee: &Spanned<Expression>,
-        args: &[Spanned<Expression>],
+        args: &[Spanned<Arg>],
         span: &SimpleSpan,
-    ) -> Result<(Value, Type), ManyErrors> {
+    ) -> Result<ExprValue, ManyErrors> {
         let callee_name = expr_callee_name(&callee.0);
 
         let Some((func_id, func_type)) = (match self.resolve_expr_as_symbol(callee) {
@@ -2570,27 +3011,64 @@ impl FnGenerator<'_, '_> {
         let arg_values = args
             .iter()
             .zip(func_type.params.iter())
-            .map(|(expr, param_type)| {
-                let value = self.build_expression(expr, Some(param_type.clone()))?;
-                if !can_coerce_type(&value.1, param_type) {
-                    return CodeError::FunctionCallArgumentType(
-                        expr_callee_name(&callee.0),
-                        param_type.to_string(),
-                        value.1.to_string(),
-                    )
-                    .err(expr.1);
-                }
+            .map(|(arg, param_type)| {
+                if let Type::Ref(inner) = param_type {
+                    if !arg.0.is_ref {
+                        return CodeError::ExpectedRefArgument.err(arg.0.expr.1);
+                    }
 
-                Ok(value)
+                    let place = self.build_place(&arg.0.expr)?;
+
+                    if !can_coerce_type(&place.ty, inner.as_ref()) {
+                        return CodeError::FunctionCallArgumentType(
+                            expr_callee_name(&callee.0),
+                            inner.to_string(),
+                            place.ty.to_string(),
+                        )
+                        .err(arg.0.expr.1);
+                    }
+                    Ok((place.addr, param_type.clone()))
+                } else {
+                    if arg.0.is_ref {
+                        return CodeError::UnExpectedRefArgument.err(arg.0.expr.1);
+                    }
+                    let value = self.build_expression(&arg.0.expr, Some(param_type.clone()))?;
+
+                    let ty = match &value {
+                        ExprValue::Never => {
+                            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                        }
+                        ExprValue::Error => {
+                            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+                        }
+                        ExprValue::Void => &Type::Void,
+                        ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => {
+                            ty
+                        }
+                    };
+
+                    if !can_coerce_type(ty, param_type) {
+                        return CodeError::FunctionCallArgumentType(
+                            expr_callee_name(&callee.0),
+                            param_type.to_string(),
+                            ty.to_string(),
+                        )
+                        .err(arg.0.expr.1);
+                    }
+
+                    Ok(self
+                        .get_value(value)
+                        .expect("ssa or stack slot function argument must produce a value"))
+                }
             })
             .collect::<Result<Vec<(Value, Type)>, ManyErrors>>()?;
 
         if arg_values.iter().any(|(_, ty)| *ty == Type::Never) {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+            return Ok(ExprValue::Never);
         }
 
         if arg_values.iter().any(|(_, ty)| *ty == Type::Error) {
-            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+            return Ok(ExprValue::Error);
         }
 
         let mut arg_values = arg_values
@@ -2598,7 +3076,7 @@ impl FnGenerator<'_, '_> {
             .map(|(value, _)| value)
             .collect::<Vec<_>>();
 
-        if let Type::Struct(struct_id) = &*func_type.return_type {
+        let return_slot = if let Type::Struct(struct_id) = &*func_type.return_type {
             let (size, align_shift) = self.state.types.layout(&Type::Struct(*struct_id));
             if func_type.is_extern {
                 todo!("Extern return structs.");
@@ -2609,7 +3087,11 @@ impl FnGenerator<'_, '_> {
 
             let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
             arg_values.push(struct_addr);
-        }
+
+            Some(stack_slot)
+        } else {
+            None
+        };
 
         let func_ref = self
             .state
@@ -2618,15 +3100,12 @@ impl FnGenerator<'_, '_> {
         let inst = self.builder.ins().call(func_ref, &arg_values);
         match self.builder.inst_results(inst) {
             // Struct return
-            [] if *func_type.return_type != Type::Void => {
-                let return_dest = *arg_values
-                    .last()
-                    .expect("Return destination must be defined.");
-
-                Ok((return_dest, *func_type.return_type))
-            }
-            [] => Ok((Value::from_u32(u32::MAX - 1), Type::Void)),
-            [value] => Ok((*value, *func_type.return_type)),
+            [] if *func_type.return_type != Type::Void => Ok(ExprValue::Slot(
+                return_slot.expect("struct return slot must be defined"),
+                *func_type.return_type,
+            )),
+            [] => Ok(ExprValue::Void),
+            [value] => Ok(ExprValue::Ssa(*value, *func_type.return_type)),
             _ => panic!("Invalid number of return values. Must be 0 or 1."),
         }
     }
@@ -2652,7 +3131,7 @@ impl GeneratorState<'_> {
                 continue;
             }
 
-            let Some(field_type) = self.type_from_name(&type_name.0) else {
+            let Some(field_type) = self.type_from_name(&type_name.0, false) else {
                 errors.push(CodeError::UnknownType(type_name.0.clone()).spanned(type_name.1));
                 continue;
             };
@@ -2793,8 +3272,10 @@ impl GeneratorState<'_> {
             Type::F64 => types::F64,
             Type::String => self.isa.pointer_type(),
             Type::Bool => types::I8,
+            // FIXME: Structs are memory values; audit remaining callers that treat them as scalar pointer types.
             Type::Struct(_) => self.isa.pointer_type(),
             Type::Enum(_) => types::I32,
+            Type::Ref(_) => self.isa.pointer_type(),
             _ => return None,
         })
     }
@@ -2882,5 +3363,27 @@ fn main() {
         );
 
         assert!(!has_unreachable(&errors));
+    }
+
+    #[test]
+    fn poisoned_binding_can_be_used_without_panicking() {
+        let errors = generation_errors(
+            r#"
+fn needs_ref(ref value: i32) {
+}
+
+fn main() {
+    let value = 1;
+    let poisoned = needs_ref(value);
+    needs_ref(ref poisoned);
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|Spanned(error, _)| matches!(error, CodeError::ExpectedRefArgument))
+        );
     }
 }
