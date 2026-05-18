@@ -960,26 +960,6 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     return CodeError::UnknownVariable(name.clone()).err(statement.1);
                 }
             },
-            Statement::Block(statements) => {
-                let new_block = self.builder.create_block();
-                self.builder.ins().jump(new_block, []);
-                self.builder.switch_to_block(new_block);
-                self.builder.seal_block(new_block);
-                self.state.push_scope();
-
-                let result = self.build_statements(statements);
-
-                if self.state.pop_scope().is_none() {
-                    unreachable!("Must always be able to pop scope after leaving block.");
-                }
-
-                let new_block = self.builder.create_block();
-                self.builder.ins().jump(new_block, []);
-                self.builder.switch_to_block(new_block);
-                self.builder.seal_block(new_block);
-
-                return result;
-            }
             Statement::If(r#if) => {
                 return self.build_if(r#if);
             }
@@ -1166,6 +1146,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 self.builder.ins().iconst(types::I8, i64::from(*value)),
                 Type::Bool,
             )),
+            Expression::Block(statements) => {
+                return self.build_block_body(statements);
+            }
             Expression::Binary(op, x, y) => {
                 let x_value = self.build_expression(x.as_ref(), try_into_type.clone())?;
                 let y_value = self.build_expression(y.as_ref(), try_into_type)?;

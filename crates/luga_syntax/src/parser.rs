@@ -25,7 +25,6 @@ pub enum Statement {
     Binding(String, Spanned<Expression>),
     Assignment(String, Spanned<Expression>),
     Return(Spanned<Expression>),
-    Block(Vec<Spanned<Statement>>),
     If(If),
     While(Conditional),
     FunctionDecl(FunctionDecl),
@@ -88,6 +87,8 @@ pub enum Expression {
     Integer(i64), // TODO: allow u64
     String(String),
     Bool(bool),
+
+    Block(Vec<Spanned<Statement>>),
 
     Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
     Unary(UnOp, Box<Spanned<Expression>>),
@@ -220,6 +221,13 @@ where
     };
 
     let mut expression = Recursive::declare();
+    let mut statement = Recursive::declare();
+
+    let block = statement
+        .clone()
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
 
     let args = expression
         .clone()
@@ -273,6 +281,7 @@ where
         integer.map(Expression::Integer),
         string.map(Expression::String),
         bool,
+        block.clone().map(Expression::Block),
         expression
             .clone()
             .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
@@ -364,14 +373,6 @@ where
     );
 
     let binary = equality;
-
-    let mut statement = Recursive::declare();
-
-    let block = statement
-        .clone()
-        .repeated()
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
 
     let decl_params = (identifier_spanned
         .then_ignore(just(Token::Colon))
@@ -519,9 +520,14 @@ where
         ))
         .then_ignore(just(Token::Semicolon))
         .or(choice((
+            block.map(Expression::Block).map_with(|block_expr, extra| {
+                Spanned(
+                    Statement::Expression(Spanned(block_expr, extra.span())),
+                    extra.span(),
+                )
+            }),
             if_statement,
             while_statement,
-            block.map_with(|block, extra| Spanned(Statement::Block(block), extra.span())),
             function_decl
                 .clone()
                 .map_with(|decl, extra| Spanned(Statement::FunctionDecl(decl), extra.span())),
