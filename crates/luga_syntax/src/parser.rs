@@ -25,7 +25,6 @@ pub enum Statement {
     Binding(String, Spanned<Expression>),
     Assignment(String, Spanned<Expression>),
     Return(Spanned<Expression>),
-    If(If),
     While(Conditional),
     FunctionDecl(FunctionDecl),
     StructDecl(StructDecl),
@@ -90,6 +89,7 @@ pub enum Expression {
     Bool(bool),
 
     Block(Vec<Spanned<Statement>>),
+    If(If),
 
     Binary(BinOp, Box<Spanned<Expression>>, Box<Spanned<Expression>>),
     Unary(UnOp, Box<Spanned<Expression>>),
@@ -230,6 +230,31 @@ where
         .collect::<Vec<_>>()
         .delimited_by(just(Token::BraceOpen), just(Token::BraceClose));
 
+    let else_block = just(Token::Id("else")).ignore_then(block.clone());
+
+    let simple_if = just(Token::Id("if"))
+        .ignore_then(expression.clone())
+        .then_ignore(just(Token::Id("then")))
+        .then(block.clone())
+        .map(
+            |(condition, block): (Spanned<Expression>, Vec<Spanned<Statement>>)| Conditional {
+                condition: Box::new(condition),
+                block,
+            },
+        );
+
+    let if_expr = simple_if
+        .separated_by(just(Token::Id("else")))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then(else_block.or_not())
+        .map(|(if_branches, else_branch)| {
+            Expression::If(If {
+                if_branches,
+                else_branch,
+            })
+        });
+
     let args = expression
         .clone()
         .separated_by(just(Token::Comma))
@@ -283,6 +308,7 @@ where
         string.map(Expression::String),
         bool,
         block.clone().map(Expression::Block),
+        if_expr.clone(),
         expression
             .clone()
             .delimited_by(just(Token::ParenOpen), just(Token::ParenClose))
@@ -448,33 +474,6 @@ where
         )
         .map(|(name, variants)| EnumDecl { name, variants });
 
-    let else_block = just(Token::Id("else")).ignore_then(block.clone());
-
-    let simple_if = just(Token::Id("if"))
-        .ignore_then(expression.clone())
-        .then_ignore(just(Token::Id("then")))
-        .then(block.clone())
-        .map(|(condition, block)| Conditional {
-            condition: condition.into(),
-            block,
-        });
-
-    // TODO: If expression
-    let if_statement = simple_if
-        .separated_by(just(Token::Id("else")))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .then(else_block.or_not())
-        .map_with(|(if_branches, else_branch), extra| {
-            Spanned(
-                Statement::If(If {
-                    if_branches,
-                    else_branch,
-                }),
-                extra.span(),
-            )
-        });
-
     let while_statement = just(Token::Id("while"))
         .ignore_then(expression.clone())
         .then(block.clone())
@@ -532,7 +531,12 @@ where
                     extra.span(),
                 )
             }),
-            if_statement,
+            if_expr.map_with(|if_expr, extra| {
+                Spanned(
+                    Statement::Expression(Spanned(if_expr, extra.span())),
+                    extra.span(),
+                )
+            }),
             while_statement,
             function_decl
                 .clone()

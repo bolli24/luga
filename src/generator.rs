@@ -999,14 +999,6 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     return CodeError::UnknownVariable(name.clone()).err(statement.1);
                 }
             },
-            Statement::If(r#if) => {
-                if self.build_if(r#if)? {
-                    // TODO: if expresion value
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
-                } else {
-                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
-                }
-            }
             Statement::While(r#while) => {
                 if self.build_while(r#while)? {
                     // TODO: if expresion value
@@ -1210,6 +1202,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             )),
             Expression::Block(statements) => {
                 return self.build_block_body(statements, try_into_type);
+            }
+            Expression::If(r#if) => {
+                return self.build_if(r#if, *span, try_into_type);
             }
             Expression::Binary(op, x, y) => {
                 let x_value = self.build_expression(x.as_ref(), try_into_type.clone())?;
@@ -1682,16 +1677,48 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.new_var(name, var, (value, Type::Error));
     }
 
-    // TODO: if expression
+    fn switch_to_recovery_block(&mut self) {
+        let block = self.builder.create_block();
+        self.builder.switch_to_block(block);
+        self.builder.seal_block(block);
+    }
+
+    fn current_block_is_terminated(&self) -> bool {
+        self.builder
+            .current_block()
+            .and_then(|block| self.builder.func.layout.last_inst(block))
+            .is_some_and(|inst| {
+                self.builder.func.dfg.insts[inst]
+                    .opcode()
+                    .is_terminator()
+            })
+    }
+
+    fn trap_if_current_block_open(&mut self) {
+        if !self.current_block_is_terminated() {
+            self.builder.ins().trap(UNREACHABLE);
+        }
+    }
+
     // TODO: add clif comments to blocks
-    fn build_if(&mut self, if_statement: &If) -> Result<bool, ManyErrors> {
-        let condition_blocks: Vec<_> = if_statement
+    fn build_if(
+        &mut self,
+        if_expr: &If,
+        span: SimpleSpan,
+        try_into_type: Option<Type>,
+    ) -> Result<(Value, Type), ManyErrors> {
+        struct BranchExit {
+            block: Block,
+            r#type: Type,
+        }
+
+        let condition_blocks: Vec<_> = if_expr
             .if_branches
             .iter()
             .map(|_| self.builder.create_block())
             .collect();
 
-        let else_block = if_statement
+        let else_block = if_expr
             .else_branch
             .as_ref()
             .map(|_| self.builder.create_block());
@@ -1702,9 +1729,11 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         self.builder.ins().jump(condition_blocks[0], []);
 
-        let mut returned = else_block.is_some();
+        let mut block_types = Vec::new();
+        let mut branch_exits = Vec::new();
+        let mut condition_poisoned = false;
 
-        for (index, conditional) in if_statement.if_branches.iter().enumerate() {
+        for (index, conditional) in if_expr.if_branches.iter().enumerate() {
             let condition_block = condition_blocks[index];
             let next_block: Block = condition_blocks
                 .get(index + 1)
@@ -1714,13 +1743,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
             self.builder.seal_block(condition_block);
             self.builder.switch_to_block(condition_block);
+            // TODO: maybe set try_into_type to bool
             let condition_value = match self.build_expression(&conditional.condition, None) {
                 Ok((_, Type::Never)) => {
-                    self.builder.ins().jump(next_block, []);
+                    // Diverging conditions have already terminated this block.
                     continue;
                 }
                 Ok((_, Type::Error)) => {
-                    returned = false;
+                    condition_poisoned = true;
                     self.builder.ins().jump(next_block, []);
                     continue;
                 }
@@ -1728,6 +1758,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     condition_value
                 }
                 Ok((_, r#type)) => {
+                    condition_poisoned = true;
                     errors.push(
                         CodeError::InvalidConditionType(r#type.to_string())
                             .spanned(conditional.condition.1),
@@ -1736,6 +1767,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     continue;
                 }
                 Err(mut err) => {
+                    condition_poisoned = true;
                     errors.append(&mut err);
                     self.builder.ins().jump(next_block, []);
                     continue;
@@ -1749,18 +1781,36 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
             self.builder.seal_block(then_block);
             self.builder.switch_to_block(then_block);
-            // TODO: pass try_into_type
-            match self.build_block_body(&conditional.block, None) {
-                Ok((_, block_type)) => {
-                    assert!(block_type == Type::Void || block_type == Type::Never); // TODO: if expression
+            match self.build_block_body(&conditional.block, try_into_type.clone()) {
+                Ok((block_value, block_type)) => {
                     if block_type != Type::Never {
-                        self.builder.ins().jump(exit_block, []);
-                        returned = false;
+                        let branch_exit_block = self.builder.create_block();
+                        let mut emitted_branch_exit = true;
+                        if block_type == Type::Void {
+                            self.builder.ins().jump(branch_exit_block, []);
+                        } else if let Some(block_crane_type) = self.state.get_crane_type(&block_type)
+                        {
+                            self.builder
+                                .append_block_param(branch_exit_block, block_crane_type);
+                            self.builder
+                                .ins()
+                                .jump(branch_exit_block, [&block_value.into()]);
+                        } else {
+                            self.builder.ins().trap(UNREACHABLE);
+                            emitted_branch_exit = false;
+                        }
+                        if emitted_branch_exit {
+                            branch_exits.push(BranchExit {
+                                block: branch_exit_block,
+                                r#type: block_type.clone(),
+                            });
+                        }
+                        block_types.push(block_type.clone());
                     }
                 }
                 Err(mut err) => {
                     errors.append(&mut err);
-                    self.builder.ins().jump(exit_block, []);
+                    self.trap_if_current_block_open();
                 }
             }
         }
@@ -1771,34 +1821,97 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
             // TODO: pass try_into_type
             match self.build_block_body(
-                if_statement
+                if_expr
                     .else_branch
                     .as_ref()
                     .expect("Else branch must exist."),
-                None,
+                try_into_type.clone(),
             ) {
-                Ok((_, block_type)) => {
-                    assert!(block_type == Type::Void || block_type == Type::Never); // TODO: if expression
+                Ok((block_value, block_type)) => {
                     if block_type != Type::Never {
-                        self.builder.ins().jump(exit_block, []);
-                        returned = false;
+                        let branch_exit_block = self.builder.create_block();
+                        let mut emitted_branch_exit = true;
+                        if block_type == Type::Void {
+                            self.builder.ins().jump(branch_exit_block, []);
+                        } else if let Some(block_crane_type) = self.state.get_crane_type(&block_type)
+                        {
+                            self.builder
+                                .append_block_param(branch_exit_block, block_crane_type);
+                            self.builder
+                                .ins()
+                                .jump(branch_exit_block, [&block_value.into()]);
+                        } else {
+                            self.builder.ins().trap(UNREACHABLE);
+                            emitted_branch_exit = false;
+                        }
+                        if emitted_branch_exit {
+                            branch_exits.push(BranchExit {
+                                block: branch_exit_block,
+                                r#type: block_type.clone(),
+                            });
+                        }
+                        block_types.push(block_type.clone());
                     }
                 }
                 Err(mut err) => {
                     errors.append(&mut err);
-                    self.builder.ins().jump(exit_block, []);
+                    self.trap_if_current_block_open();
                 }
+            }
+        } else if try_into_type.is_some() || block_types.iter().any(|t| *t != Type::Void) {
+            errors.push(CodeError::MissingElseBranch.spanned(span));
+        }
+
+        let expr_type = try_into_type
+            .clone()
+            .or_else(|| block_types.iter().find(|t| **t != Type::Void).cloned())
+            .unwrap_or_else(|| {
+                block_types.first().cloned().unwrap_or_else(|| {
+                    if else_block.is_some() && !condition_poisoned {
+                        Type::Never
+                    } else {
+                        Type::Void
+                    }
+                })
+            });
+
+        if block_types
+            .iter()
+            .any(|branch_type| !can_coerce_type(branch_type, &expr_type))
+        {
+            errors.push(CodeError::IfExpressionType.spanned(span));
+        }
+
+        if !errors.is_empty() {
+            self.switch_to_recovery_block();
+            return Err(errors);
+        }
+
+        if let Some(expr_crane_type) = self.state.get_crane_type(&expr_type) {
+            self.builder.append_block_param(exit_block, expr_crane_type);
+        }
+
+        for branch_exit in branch_exits {
+            self.builder.seal_block(branch_exit.block);
+            self.builder.switch_to_block(branch_exit.block);
+            if branch_exit.r#type == Type::Void {
+                self.builder.ins().jump(exit_block, []);
+            } else {
+                let value = self.builder.block_params(branch_exit.block)[0];
+                self.builder.ins().jump(exit_block, [&value.into()]);
             }
         }
 
         self.builder.seal_block(exit_block);
         self.builder.switch_to_block(exit_block);
 
-        if !errors.is_empty() {
-            return Err(errors);
-        }
+        let expr_value = if expr_type != Type::Void && expr_type != Type::Never {
+            self.builder.block_params(exit_block)[0]
+        } else {
+            Value::from_u32(u32::MAX - 1)
+        };
 
-        Ok(returned)
+        Ok((expr_value, expr_type))
     }
 
     fn build_while(&mut self, conditional: &Conditional) -> Result<bool, ManyErrors> {

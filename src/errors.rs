@@ -50,6 +50,8 @@ pub enum CodeError {
     InvalidConditionType(String),
     #[error("All branches of an if expression must have same type.")]
     IfExpressionType,
+    #[error("Non-void if expression must have else branch.")]
+    MissingElseBranch,
 
     #[error("Unknown type '{}'.", .0)]
     UnknownType(String),

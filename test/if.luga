@@ -1,3 +1,6 @@
+fn takes_i8(value: i8) : void {
+}
+
 fn main() {
     let a = 5;
     let b = 2;
@@ -35,4 +38,26 @@ fn main() {
             @print("Else Nested: b = %d\n", b);
         }
     }
+
+    let expr = if a > 6 then {
+        = "good";
+    } else {
+        = "bad";
+    };
+
+    @println("%s", expr);
+
+    let amount = if a > 6 then {
+        = 7;
+    } else {
+        @exit(-1); // Unreachable
+    };
+
+    @println("%d", amount);
+
+    takes_i8(if a > 6 then {
+        = 1;
+    } else {
+        = 2;
+    });
 }
