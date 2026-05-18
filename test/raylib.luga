@@ -33,7 +33,7 @@ fn main() {
 
     @println("%hhu, %hhu, %hhu, %hhu", col.r, col.g, col.b, col.a);
 
-    while (!WindowShouldClose()) {
+    while !WindowShouldClose() {
         BeginDrawing();
 
         ClearBackground(0);

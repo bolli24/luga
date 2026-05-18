@@ -163,9 +163,9 @@ impl Intrinsic {
     }
 }
 
-const KEY_WORDS: [&str; 14] = [
-    "let", "return", "if", "else", "while", "true", "false", "fn", "struct", "enum", "extern",
-    "import", "as", "self",
+const KEY_WORDS: [&str; 15] = [
+    "let", "return", "if", "else", "then", "while", "true", "false", "fn", "struct", "enum",
+    "extern", "import", "as", "self",
 ];
 
 pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
@@ -449,11 +449,8 @@ where
     let else_block = just(Token::Id("else")).ignore_then(block.clone());
 
     let simple_if = just(Token::Id("if"))
-        .ignore_then(
-            expression
-                .clone()
-                .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
-        )
+        .ignore_then(expression.clone())
+        .then_ignore(just(Token::Id("then")))
         .then(block.clone())
         .map(|(condition, block)| Conditional {
             condition: condition.into(),
@@ -477,11 +474,7 @@ where
         });
 
     let while_statement = just(Token::Id("while"))
-        .ignore_then(
-            expression
-                .clone()
-                .delimited_by(just(Token::ParenOpen), just(Token::ParenClose)),
-        )
+        .ignore_then(expression.clone())
         .then(block.clone())
         .map_with(|(condition, block), extra| {
             Spanned(

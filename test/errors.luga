@@ -8,16 +8,16 @@ fn main() {
     let d = !test;
     let e = (d == c) == (b == test);
 
-    if (c == b + test) {
+    if c == b + test then {
         @println(test);
     }
 
-    if (!d) {
+    if !d then {
         let nested = e + 1;
         @println(nested);
     }
 
-    while (test) {
+    while test {
         @println("unreachable");
     }
 

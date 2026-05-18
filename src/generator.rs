@@ -2705,7 +2705,7 @@ fn main() {
             r#"
 fn main() {
     let bad = "x" + 1;
-    if (bad) {
+    if bad then {
         @println("then");
     } else {
         return 0;

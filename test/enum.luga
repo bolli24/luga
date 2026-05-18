@@ -11,9 +11,9 @@ fn isRed(c: Color) : bool {
 }
 
 fn dirName(d: Direction) : string {
-    if (d == Direction.Up)   { return "up"; }
-    if (d == Direction.Down) { return "down"; }
-    if (d == Direction.Left) { return "left"; }
+    if d == Direction.Up then   { return "up"; }
+    if d == Direction.Down then { return "down"; }
+    if d == Direction.Left then { return "left"; }
     return "right";
 }
 
@@ -21,7 +21,7 @@ fn dirName(d: Direction) : string {
 fn classifyColor(c: Color) : i32 {
     enum Warmth { Cool, Warm, }
     let w = Warmth.Warm;
-    if (c == Color.Blue) { w = Warmth.Cool; }
+    if c == Color.Blue then { w = Warmth.Cool; }
     return @enumToInt(w);
 }
 
