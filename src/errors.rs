@@ -71,6 +71,8 @@ pub enum CodeError {
 
     #[error("Unreachable statement.")]
     UnreachableStatement,
+    #[error("Result statement must be the last statement of a block.")]
+    ResultStatementNotLast,
     #[error("Function does not return on all code paths.")]
     MissingReturnStatement,
 

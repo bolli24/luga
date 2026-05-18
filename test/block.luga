@@ -1,0 +1,21 @@
+/// EXIT_CODE=42
+
+fn takes_i8(value: i8) : void {
+}
+
+fn main() : i32 {
+    let from_block = {
+        let base = 20;
+        let extra = {
+            = 17;
+        };
+
+        = base + extra;
+    };
+
+    takes_i8({
+        = 0;
+    });
+
+    = from_block + 5;
+}

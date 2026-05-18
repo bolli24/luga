@@ -875,23 +875,45 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_statements(
         &mut self,
         statements: &[Spanned<Statement>],
+        try_into_type: Option<Type>,
     ) -> Result<(Value, Type), ManyErrors> {
         let mut errors = ManyErrors::new();
         let mut iter = statements.iter().peekable();
         let mut block_value = (Value::from_u32(u32::MAX - 1), Type::Void);
         while let Some(statement) = iter.next() {
-            match self.build_statement(statement) {
+            let is_result = matches!(statement.0, Statement::Result(_));
+
+            match self.build_statement(
+                statement,
+                if is_result {
+                    try_into_type.clone()
+                } else {
+                    None
+                },
+            ) {
                 Err(mut error) => {
                     errors.append(&mut error);
                 }
                 Ok(value @ (_, Type::Never)) => {
                     if let Some(next) = iter.peek() {
-                        errors.push(CodeError::UnreachableStatement.spanned(next.1))
+                        if is_result {
+                            errors.push(CodeError::ResultStatementNotLast.spanned(statement.1));
+                        } else {
+                            errors.push(CodeError::UnreachableStatement.spanned(next.1));
+                        }
                     }
                     block_value = value;
                     break;
                 }
-                Ok(value) => block_value = value,
+                Ok(value) => {
+                    if is_result && iter.peek().is_some() {
+                        errors.push(CodeError::ResultStatementNotLast.spanned(statement.1));
+                        block_value = value;
+                        break;
+                    }
+
+                    block_value = value;
+                }
             }
         }
 
@@ -902,10 +924,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         Ok(block_value)
     }
 
-    /// Returns Ok(true) if all paths return from the function
     fn build_statement(
         &mut self,
         statement: &Spanned<Statement>,
+        try_into_type: Option<Type>,
     ) -> Result<(Value, Type), ManyErrors> {
         match &statement.0 {
             Statement::Return(expr) => {
@@ -916,7 +938,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 }
             }
             Statement::Expression(expr) => {
-                self.build_expression(expr, None)?;
+                let value = self.build_expression(expr, try_into_type)?;
+                if value.1 == Type::Never {
+                    return Ok(value);
+                }
             }
             Statement::Binding(name, expr) => {
                 if self.state.current_scope.symbols.contains_key(name) {
@@ -930,6 +955,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         return Err(errors);
                     }
                 };
+
+                if value.1 == Type::Never {
+                    return Ok(value);
+                }
 
                 if value.1 == Type::Error {
                     self.new_error_var(name.to_owned());
@@ -996,8 +1025,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 self.state.build_enum_decl(decl)?;
             }
             Statement::Result(expr) => {
-                // TODO: pass try_into_type
-                return self.build_expression(expr, None);
+                return self.build_expression(expr, try_into_type);
             }
         }
 
@@ -1181,7 +1209,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Type::Bool,
             )),
             Expression::Block(statements) => {
-                return self.build_block_body(statements);
+                return self.build_block_body(statements, try_into_type);
             }
             Expression::Binary(op, x, y) => {
                 let x_value = self.build_expression(x.as_ref(), try_into_type.clone())?;
@@ -1721,7 +1749,8 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
             self.builder.seal_block(then_block);
             self.builder.switch_to_block(then_block);
-            match self.build_block_body(&conditional.block) {
+            // TODO: pass try_into_type
+            match self.build_block_body(&conditional.block, None) {
                 Ok((_, block_type)) => {
                     assert!(block_type == Type::Void || block_type == Type::Never); // TODO: if expression
                     if block_type != Type::Never {
@@ -1740,11 +1769,13 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             self.builder.seal_block(else_block);
             self.builder.switch_to_block(else_block);
 
+            // TODO: pass try_into_type
             match self.build_block_body(
                 if_statement
                     .else_branch
                     .as_ref()
                     .expect("Else branch must exist."),
+                None,
             ) {
                 Ok((_, block_type)) => {
                     assert!(block_type == Type::Void || block_type == Type::Never); // TODO: if expression
@@ -1798,7 +1829,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         self.builder.switch_to_block(while_block);
 
-        self.build_block_body(block)?;
+        self.build_block_body(block, None)?;
 
         self.builder.ins().jump(condition_block, []);
 
@@ -1813,10 +1844,11 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_block_body(
         &mut self,
         body: &[Spanned<Statement>],
+        try_into_type: Option<Type>,
     ) -> Result<(Value, Type), ManyErrors> {
         self.state.push_scope();
 
-        let result = self.build_statements(body);
+        let result = self.build_statements(body, try_into_type);
 
         let Some(_) = self.state.pop_scope() else {
             unreachable!("Must always be able to pop scope after leaving block.");
@@ -1900,6 +1932,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             .declare_func_in_func(self.state.exit_id, self.builder.func);
 
         self.builder.ins().call(exit_ref, &[expr.0]);
+        self.builder.ins().trap(UNREACHABLE);
         Ok((Value::from_u32(u32::MAX - 1), Type::Never))
     }
 
@@ -2264,7 +2297,7 @@ impl GeneratorState<'_> {
             }
         }
 
-        match fn_generator.build_statements(body) {
+        match fn_generator.build_statements(body, Some(*func_type.return_type.clone())) {
             Err(mut new_errors) => {
                 errors.append(&mut new_errors);
             }
