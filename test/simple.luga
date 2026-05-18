@@ -15,6 +15,12 @@ fn main(): i32 {
             let x = pi + tau;
             @print("x: %d\n", x);
         }
+
+        let test = {
+            =pi + tau;
+        };
+
+        @print("test: %d\n", test);
     }
 
     return 3 * (4 * 4 + 4) + 3 * 3;

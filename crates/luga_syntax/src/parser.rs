@@ -30,6 +30,7 @@ pub enum Statement {
     FunctionDecl(FunctionDecl),
     StructDecl(StructDecl),
     EnumDecl(EnumDecl),
+    Result(Spanned<Expression>),
 }
 
 #[derive(Clone, Debug)]
@@ -509,11 +510,16 @@ where
             Spanned(Statement::Return(expr), extra.span())
         });
 
+    let result = just(Token::Equal).ignore_then(expression.clone()).map_with(
+        |expr, extra| -> Spanned<Statement> { Spanned(Statement::Result(expr), extra.span()) },
+    );
+
     statement.define(
         choice((
             r#return,
             binding,
             assignment,
+            result,
             expression.map_with(|expr: Spanned<Expression>, extra| {
                 Spanned(Statement::Expression(expr), extra.span())
             }),

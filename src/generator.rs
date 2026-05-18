@@ -995,6 +995,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             Statement::EnumDecl(decl) => {
                 self.state.build_enum_decl(decl)?;
             }
+            Statement::Result(expr) => {
+                // TODO: pass try_into_type
+                return self.build_expression(expr, None);
+            }
         }
 
         return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
