@@ -872,23 +872,26 @@ fn module_prefix(canonical_path: &Path, module_index: usize) -> String {
 }
 
 impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
-    fn build_statements(&mut self, statements: &[Spanned<Statement>]) -> Result<bool, ManyErrors> {
+    fn build_statements(
+        &mut self,
+        statements: &[Spanned<Statement>],
+    ) -> Result<(Value, Type), ManyErrors> {
         let mut errors = ManyErrors::new();
         let mut iter = statements.iter().peekable();
-        let mut returned = false;
+        let mut block_value = (Value::from_u32(u32::MAX - 1), Type::Void);
         while let Some(statement) = iter.next() {
             match self.build_statement(statement) {
                 Err(mut error) => {
                     errors.append(&mut error);
                 }
-                Ok(true) => {
+                Ok(value @ (_, Type::Never)) => {
                     if let Some(next) = iter.peek() {
                         errors.push(CodeError::UnreachableStatement.spanned(next.1))
                     }
-                    returned = true;
+                    block_value = value;
                     break;
                 }
-                Ok(false) => {}
+                Ok(value) => block_value = value,
             }
         }
 
@@ -896,14 +899,21 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             return Err(errors);
         }
 
-        Ok(returned)
+        Ok(block_value)
     }
 
     /// Returns Ok(true) if all paths return from the function
-    fn build_statement(&mut self, statement: &Spanned<Statement>) -> Result<bool, ManyErrors> {
+    fn build_statement(
+        &mut self,
+        statement: &Spanned<Statement>,
+    ) -> Result<(Value, Type), ManyErrors> {
         match &statement.0 {
             Statement::Return(expr) => {
-                return self.build_return(expr);
+                if self.build_return(expr)? {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                } else {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
+                }
             }
             Statement::Expression(expr) => {
                 self.build_expression(expr, None)?;
@@ -923,7 +933,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
                 if value.1 == Type::Error {
                     self.new_error_var(name.to_owned());
-                    return Ok(false);
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void)); // TODO: should this return Type::Error?
                 }
 
                 let Some(var_type) = self.state.get_crane_type(&value.1) else {
@@ -948,7 +958,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     }
 
                     if matches!(value.1, Type::Never | Type::Error) {
-                        return Ok(value.1 == Type::Never);
+                        return Ok(value);
                     }
 
                     self.builder.def_var(var, value.0);
@@ -961,21 +971,33 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 }
             },
             Statement::If(r#if) => {
-                return self.build_if(r#if);
+                if self.build_if(r#if)? {
+                    // TODO: if expresion value
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                } else {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
+                }
             }
-            Statement::While(r#while) => return self.build_while(r#while),
+            Statement::While(r#while) => {
+                if self.build_while(r#while)? {
+                    // TODO: if expresion value
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                } else {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
+                }
+            }
             Statement::FunctionDecl(decl) => {
-                return self.state.build_fn_decl(decl, &statement.1).map(|_| false);
+                self.state.build_fn_decl(decl, &statement.1)?;
             }
             Statement::StructDecl(decl) => {
-                return self.state.build_struct_decl(decl).map(|_| false);
+                self.state.build_struct_decl(decl)?;
             }
             Statement::EnumDecl(decl) => {
-                return self.state.build_enum_decl(decl).map(|_| false);
+                self.state.build_enum_decl(decl)?;
             }
         }
 
-        Ok(false)
+        return Ok((Value::from_u32(u32::MAX - 1), Type::Void));
     }
 
     fn build_return_field_copy(
@@ -1028,6 +1050,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_return(&mut self, expr: &Spanned<Expression>) -> Result<bool, ManyErrors> {
         let value =
             self.build_expression(expr, Some(*self.current_func_type.return_type.clone()))?;
+        self.build_return_value(value, expr.1)
+    }
+
+    fn build_return_value(
+        &mut self,
+        value: (Value, Type),
+        span: SimpleSpan,
+    ) -> Result<bool, ManyErrors> {
         if value.1 == Type::Error {
             return Ok(false);
         }
@@ -1036,7 +1066,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 self.current_func_type.return_type.to_string(),
                 value.1.to_string(),
             )
-            .err(expr.1);
+            .err(span);
         }
         match value.1 {
             // Diverging expression already terminated the block — nothing to emit.
@@ -1788,11 +1818,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             unreachable!("Must always be able to pop scope after leaving block.");
         };
 
-        match result {
-            Ok(true) => Ok((Value::new((u32::MAX - 1) as usize), Type::Never)),
-            Ok(false) => Ok((Value::new((u32::MAX - 1) as usize), Type::Void)),
-            Err(errors) => Err(errors),
-        }
+        return result;
     }
 
     fn build_assert(
@@ -2238,15 +2264,22 @@ impl GeneratorState<'_> {
             Err(mut new_errors) => {
                 errors.append(&mut new_errors);
             }
-            Ok(false) if *func_type.return_type == Type::Void => {
-                fn_generator.builder.ins().return_(&[]);
+            Ok((_, Type::Never)) => {}
+            Ok(value @ (_, Type::Void)) if *func_type.return_type == Type::Void => {
+                if let Err(mut new_errors) = fn_generator.build_return_value(value, *span) {
+                    errors.append(&mut new_errors);
+                }
             }
-            Ok(false) if main_implicit_zero => {
+            Ok((_, Type::Void)) if main_implicit_zero => {
                 let zero = fn_generator.builder.ins().iconst(types::I32, 0);
                 fn_generator.builder.ins().return_(&[zero]);
             }
-            Ok(false) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
-            Ok(true) => {}
+            Ok((_, Type::Void)) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
+            Ok(value) => {
+                if let Err(mut new_errors) = fn_generator.build_return_value(value, *span) {
+                    errors.append(&mut new_errors);
+                }
+            }
         }
 
         if fn_generator.state.verbose {
