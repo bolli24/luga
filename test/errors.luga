@@ -1,19 +1,19 @@
 /// SKIP_TEST
 
 fn main() {
-    let test = "error" + 2;
+    var test = "error" + 2;
 
-    let b = test;
-    let c = 2 * test;
-    let d = !test;
-    let e = (d == c) == (b == test);
+    var b = test;
+    var c = 2 * test;
+    var d = !test;
+    var e = (d == c) == (b == test);
 
     if c == b + test then {
         @println(test);
     }
 
     if !d then {
-        let nested = e + 1;
+        var nested = e + 1;
         @println(nested);
     }
 
@@ -29,6 +29,6 @@ fn takes_i32(value: i32) {
 }
 
 fn returns_i32() : i32 {
-    let broken = "error" + 2;
+    var broken = "error" + 2;
     return broken;
 }

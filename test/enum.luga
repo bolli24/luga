@@ -20,17 +20,17 @@ fn dirName(d: Direction) : string {
 // enum declared inside a function scope
 fn classifyColor(c: Color) : i32 {
     enum Warmth { Cool, Warm, }
-    let w = Warmth.Warm;
+    var w = Warmth.Warm;
     if c == Color.Blue then { w = Warmth.Cool; }
     return @enumToInt(w);
 }
 
 fn main() {
     // index values are 0-based in declaration order
-    let up    = Direction.Up;
-    let down  = Direction.Down;
-    let left  = Direction.Left;
-    let right = Direction.Right;
+    var up    = Direction.Up;
+    var down  = Direction.Down;
+    var left  = Direction.Left;
+    var right = Direction.Right;
 
     @assert(@enumToInt(up)    == 0);
     @assert(@enumToInt(down)  == 1);
@@ -48,7 +48,7 @@ fn main() {
     @assert(!(up != up));
 
     // assignment and reassignment
-    let dir = Direction.Left;
+    var dir = Direction.Left;
     @assert(dir == Direction.Left);
     dir = Direction.Right;
     @assert(dir == Direction.Right);

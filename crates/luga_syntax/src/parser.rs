@@ -173,7 +173,7 @@ impl Intrinsic {
 }
 
 const KEY_WORDS: [&str; 16] = [
-    "let", "return", "if", "else", "then", "while", "true", "false", "fn", "struct", "enum",
+    "var", "return", "if", "else", "then", "while", "true", "false", "fn", "struct", "enum",
     "extern", "import", "as", "self", "ref",
 ];
 
@@ -518,7 +518,7 @@ where
         });
 
     expression.define(binary.labelled("expression"));
-    let binding = just(Token::Id("let"))
+    let binding = just(Token::Id("var"))
         .ignore_then(identifier)
         .then_ignore(just(Token::Equal))
         .then(expression.clone())

@@ -2,11 +2,11 @@ fn takes_i8(value: i8) : void {
 }
 
 fn main() {
-    let a = 5;
-    let b = 2;
-    let c = a + b * 3;   // c = 5 + 6 = 11
-    let d = c - a;       // d = 11 - 5 = 6
-    let e = d / b;       // e = 6 / 2 = 3
+    var a = 5;
+    var b = 2;
+    var c = a + b * 3;   // c = 5 + 6 = 11
+    var d = c - a;       // d = 11 - 5 = 6
+    var e = d / b;       // e = 6 / 2 = 3
 
     if c == 11 then {
         a = a * 2;       // a = 10
@@ -39,7 +39,7 @@ fn main() {
         }
     }
 
-    let expr = if a > 6 then {
+    var expr = if a > 6 then {
         = "good";
     } else {
         = "bad";
@@ -47,7 +47,7 @@ fn main() {
 
     @println("%s", expr);
 
-    let amount = if a > 6 then {
+    var amount = if a > 6 then {
         = 7;
     } else {
         @exit(-1); // Unreachable

@@ -32,7 +32,7 @@ fn setPairRight(ref right: i32, next: i32) {
 }
 
 fn main() {
-    let value = 1;
+    var value = 1;
     @assert(1 == get(ref value));
 
     set(ref value, 2);
@@ -41,11 +41,11 @@ fn main() {
     forward(ref value, 3);
     @assert(3 == value);
 
-    let box = Box {value: 4};
+    var box = Box {value: 4};
     setBox(ref box, 5);
     @assert(5 == box.value);
 
-    let pair = Pair {left: 6, right: 7};
+    var pair = Pair {left: 6, right: 7};
     setPairLeft(ref pair, 8);
     @assert(8 == pair.left);
     @assert(7 == pair.right);

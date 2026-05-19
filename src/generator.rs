@@ -3336,7 +3336,7 @@ mod tests {
         let errors = generation_errors(
             r#"
 fn main() {
-    let bad = "x" + 1;
+    var bad = "x" + 1;
     return bad;
     @println("after");
 }
@@ -3351,7 +3351,7 @@ fn main() {
         let errors = generation_errors(
             r#"
 fn main() {
-    let bad = "x" + 1;
+    var bad = "x" + 1;
     if bad then {
         @println("then");
     } else {
@@ -3373,8 +3373,8 @@ fn needs_ref(ref value: i32) {
 }
 
 fn main() {
-    let value = 1;
-    let poisoned = needs_ref(value);
+    var value = 1;
+    var poisoned = needs_ref(value);
     needs_ref(ref poisoned);
 }
 "#,

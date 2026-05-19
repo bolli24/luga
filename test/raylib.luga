@@ -22,14 +22,14 @@ extern fn DrawText(text: string, x: i32, y: i32, size: i32, color: Color);
 extern fn DrawFPS(x: i32, y: i32);
 
 fn main() {
-    let screenWidth = 800;
-    let screenHeight = 600;
+    var screenWidth = 800;
+    var screenHeight = 600;
 
     InitWindow(screenWidth, screenHeight, "luga x raylib");
 
     SetTargetFPS(60);
 
-    let col = color(74, 255, 122);
+    var col = color(74, 255, 122);
 
     @println("%hhu, %hhu, %hhu, %hhu", col.r, col.g, col.b, col.a);
 
