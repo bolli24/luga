@@ -1,0 +1,140 @@
+import modules.vec as vec_type;
+import modules.dir;
+
+extern fn abs(number: i32) : i32;
+
+// Struct fields are declared with semicolons.
+struct Point {
+    x: i32;
+    y: i32;
+} {
+    // Struct functions are called through the type name.
+    fn new(x: i32, y: i32) : Point {
+        return Point {x: x, y: y};
+    }
+
+    // Ref parameters allow mutation of the caller's value.
+    fn translate(ref point: Point, dx: i32, dy: i32) {
+        point.x = point.x + dx;
+        point.y = point.y + dy;
+    }
+}
+
+struct Box {
+    value: i32;
+}
+
+enum Status {
+    Ready, Running, Done,
+}
+
+fn is_done(status: Status) : bool {
+    return status == Status.Done;
+}
+
+fn sum_to(limit: i32) : i32 {
+    var total = 0;
+    var i = 1;
+
+    // While loops run while their condition is true.
+    while i <= limit {
+        total = total + i;
+        i = i + 1;
+    }
+
+    return total;
+}
+
+fn mutate(ref value: i32) {
+    value = value + 1;
+}
+
+fn main() {
+    // Variables are introduced with var and can be reassigned.
+    var number = 40;
+    number = number + 2;
+    @assert(number == 42);
+
+    // Numeric expressions support arithmetic and comparisons.
+    var arithmetic = 2 + 3 * 4 - 6 / 2;
+    @assert(arithmetic == 11);
+    @assert(arithmetic >= 11);
+    @assert(arithmetic != 10);
+
+    // Bools, strings, and unary ! are first-class expressions.
+    var message = "language tour";
+    var ok = true;
+    @assert(ok);
+    @assert(!false);
+    @println("%s", message);
+
+    // Blocks can produce a value with = expression;.
+    var block_value = {
+        var base = 10;
+        var extra = {
+            = 5;
+        };
+        = base + extra;
+    };
+    @assert(block_value == 15);
+
+    // If can be a statement with else-if branches.
+    if block_value > 20 then {
+        @assert(false);
+    } else if block_value == 15 then {
+        @assert(true);
+    } else {
+        @assert(false);
+    }
+
+    // If can also be an expression when all branches produce a value of the same type.
+    var label = if number == 42 then {
+        = "answer";
+    } else {
+        = "other";
+    };
+    @println("%s", label);
+
+    // Functions can contain nested functions.
+    fn double(value: i32) : i32 {
+        return value * 2;
+    }
+    @assert(double(21) == 42);
+    @assert(sum_to(5) == 15);
+
+    // Extern declarations call functions provided by the platform/runtime.
+    @assert(abs(-7) == 7);
+
+    // Struct literals, field access, and associated functions.
+    var point = Point.new(3, 4);
+    @assert(point.x == 3);
+    @assert(point.y == 4);
+    Point.translate(ref point, 2, -1);
+    @assert(point.x == 5);
+    @assert(point.y == 3);
+
+    // Ref can target a local variable or a field place.
+    mutate(ref number);
+    @assert(number == 43);
+
+    var box = Box {value: 1};
+    mutate(ref box.value);
+    @assert(box.value == 2);
+
+    // Enums use Type.Variant names and can be converted to integers.
+    var status = Status.Ready;
+    @assert(@enumToInt(status) == 0);
+    status = Status.Done;
+    @assert(is_done(status));
+    @assert(status != Status.Running);
+
+    // Imported modules are accessed through their name or alias.
+    var imported_a = vec_type.iVec{x: 1, y: 2};
+    var imported_b = vec_type.iVec{x: 3, y: 4};
+    var imported_sum = vec_type.add(imported_a, imported_b);
+    @assert(imported_sum.x == 4);
+    @assert(imported_sum.y == 6);
+    @println("%s", dir.dirName(dir.Direction.Left));
+
+    @println("tour complete");
+}
