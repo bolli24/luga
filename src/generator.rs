@@ -1026,7 +1026,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Type::F32,
             )),
             Expression::Integer(value) => {
-                let into_type = try_into_type.unwrap_or(Type::I32);
+                let into_type = match try_into_type {
+                    Some(ty) if ty.is_int() => ty,
+                    _ => Type::I32,
+                };
 
                 let mut check_and_emit = |min: i64, max: i64, cranelift_type, out_type: Type| {
                     if *value < min || *value > max {
