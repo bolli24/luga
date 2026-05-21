@@ -9,12 +9,12 @@ impl Display for QualifiedName {
 }
 
 impl Type {
-    fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayType<'a> {
+    pub fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayType<'a> {
         DisplayType { ty: self, types }
     }
 }
 
-struct DisplayType<'a> {
+pub struct DisplayType<'a> {
     ty: &'a Type,
     types: &'a TypeContext,
 }
@@ -62,12 +62,12 @@ impl Display for Type {
 }
 
 impl FuncType {
-    fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayFuncType<'a> {
+    pub fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayFuncType<'a> {
         DisplayFuncType { func: self, types }
     }
 }
 
-struct DisplayFuncType<'a> {
+pub struct DisplayFuncType<'a> {
     func: &'a FuncType,
     types: &'a TypeContext,
 }
@@ -108,7 +108,7 @@ impl Display for FuncType {
 }
 
 impl StructType {
-    fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayStructType<'a> {
+    pub fn display<'a>(&'a self, types: &'a TypeContext) -> DisplayStructType<'a> {
         DisplayStructType {
             struct_type: self,
             types,
@@ -116,7 +116,7 @@ impl StructType {
     }
 }
 
-struct DisplayStructType<'a> {
+pub struct DisplayStructType<'a> {
     struct_type: &'a StructType,
     types: &'a TypeContext,
 }
@@ -160,12 +160,12 @@ impl Display for StructType {
 }
 
 impl EnumType {
-    fn display<'a>(&'a self, _types: &'a TypeContext) -> DisplayEnumType<'a> {
+    pub fn display<'a>(&'a self, _types: &'a TypeContext) -> DisplayEnumType<'a> {
         DisplayEnumType { enum_type: self }
     }
 }
 
-struct DisplayEnumType<'a> {
+pub struct DisplayEnumType<'a> {
     enum_type: &'a EnumType,
 }
 

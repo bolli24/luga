@@ -290,6 +290,7 @@ struct FnGenerator<'a, 'ctx> {
     var_count: usize,
     current_func_type: FuncType,
     return_dest: Option<StackSlot>,
+    result_span: Option<SimpleSpan>,
 }
 
 impl GeneratorState<'_> {
@@ -686,6 +687,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 self.state.build_enum_decl(decl)?;
             }
             Statement::Result(expr) => {
+                self.result_span = Some(expr.1);
                 return self.build_expression(expr, try_into_type);
             }
         }
@@ -795,8 +797,11 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         if !can_coerce_type(&ty, &self.current_func_type.return_type) {
             return CodeError::InvalidReturnType(
-                self.current_func_type.return_type.to_string(),
-                ty.to_string(),
+                self.current_func_type
+                    .return_type
+                    .display(&self.state.types)
+                    .to_string(),
+                ty.display(&self.state.types).to_string(),
             )
             .err(span);
         }
@@ -2459,6 +2464,7 @@ impl GeneratorState<'_> {
             var_count: 0,
             current_func_type: func_type.clone(),
             return_dest: None,
+            result_span: None,
         };
 
         for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
@@ -2495,7 +2501,8 @@ impl GeneratorState<'_> {
             }
             Ok(ExprValue::Void) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
             Ok(value) => {
-                if let Err(mut new_errors) = fn_generator.build_return_value(value, *span) {
+                let result_span = fn_generator.result_span.unwrap_or(*span);
+                if let Err(mut new_errors) = fn_generator.build_return_value(value, result_span) {
                     errors.append(&mut new_errors);
                 }
             }
