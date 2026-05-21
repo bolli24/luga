@@ -181,7 +181,7 @@ struct Scope {
     is_function_boundary: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Symbol {
     Variable(StackSlot, Type),
     Function(FuncId, FuncType),
@@ -1361,6 +1361,62 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     .get(&member.0),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    fn resolve_method_receiver_type(&self, receiver_expr: &Spanned<Expression>) -> Option<Type> {
+        match &receiver_expr.0 {
+            Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
+                LookupResult::Found(Symbol::Variable(_, ty)) => Some(ty.clone()),
+                _ => None,
+            },
+            Expression::MemberAccess(base, member) => {
+                let base_type = self.resolve_method_receiver_type(base)?;
+                let base_type = match &base_type {
+                    Type::Ref(inner) => inner.as_ref(),
+                    _ => &base_type,
+                };
+
+                match base_type {
+                    Type::Struct(type_id) => self
+                        .state
+                        .types
+                        .structs
+                        .get(type_id)?
+                        .fields
+                        .get(&member.0)
+                        .map(|field| field.r#type.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_method_call(
+        &self,
+        receiver_expr: &Spanned<Expression>,
+        method_name: &str,
+    ) -> Option<(FuncId, FuncType)> {
+        let receiver_type = self.resolve_method_receiver_type(receiver_expr)?;
+        let type_id = match &receiver_type {
+            Type::Struct(type_id) | Type::Enum(type_id) => *type_id,
+            Type::Ref(inner) => match inner.as_ref() {
+                Type::Struct(type_id) | Type::Enum(type_id) => *type_id,
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        match self
+            .state
+            .types
+            .associated_functions
+            .get(&type_id)?
+            .get(method_name)?
+        {
+            Symbol::Function(func_id, func_type) => Some((*func_id, func_type.clone())),
             _ => None,
         }
     }
@@ -2558,6 +2614,60 @@ impl GeneratorState<'_> {
 }
 
 impl FnGenerator<'_, '_> {
+    fn build_call_arg(
+        &mut self,
+        callee_name: &str,
+        arg: &Spanned<Arg>,
+        param_type: &Type,
+    ) -> Result<(Value, Type), ManyErrors> {
+        if let Type::Ref(inner) = param_type {
+            if !arg.0.is_ref {
+                return CodeError::ExpectedRefArgument.err(arg.0.expr.1);
+            }
+
+            let place = self.build_place(&arg.0.expr)?;
+
+            if !can_coerce_type(&place.ty, inner.as_ref()) {
+                return CodeError::FunctionCallArgumentType(
+                    callee_name.to_owned(),
+                    inner.to_string(),
+                    place.ty.to_string(),
+                )
+                .err(arg.0.expr.1);
+            }
+            Ok((place.addr, param_type.clone()))
+        } else {
+            if arg.0.is_ref {
+                return CodeError::UnExpectedRefArgument.err(arg.0.expr.1);
+            }
+            let value = self.build_expression(&arg.0.expr, Some(param_type.clone()))?;
+
+            let ty = match &value {
+                ExprValue::Never => {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
+                }
+                ExprValue::Error => {
+                    return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
+                }
+                ExprValue::Void => &Type::Void,
+                ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
+            };
+
+            if !can_coerce_type(ty, param_type) {
+                return CodeError::FunctionCallArgumentType(
+                    callee_name.to_owned(),
+                    param_type.to_string(),
+                    ty.to_string(),
+                )
+                .err(arg.0.expr.1);
+            }
+
+            Ok(self
+                .get_value(value)
+                .expect("ssa or stack slot function argument must produce a value"))
+        }
+    }
+
     fn build_fn_call(
         &mut self,
         callee: &Spanned<Expression>,
@@ -2566,76 +2676,77 @@ impl FnGenerator<'_, '_> {
     ) -> Result<ExprValue, ManyErrors> {
         let callee_name = expr_callee_name(&callee.0);
 
-        let Some((func_id, func_type)) = (match self.resolve_expr_as_symbol(callee) {
-            Some(Symbol::Function(id, ft)) => Some((*id, ft.clone())),
-            _ => None,
-        }) else {
-            return CodeError::UnknownFunction(callee_name).err(*span);
+        let (func_id, func_type, receiver) = match self.resolve_expr_as_symbol(callee) {
+            Some(Symbol::Function(id, ft)) => (*id, ft.clone(), None),
+            _ => match &callee.0 {
+                Expression::MemberAccess(receiver, method_name) => {
+                    let receiver_place = self.build_place(receiver)?;
+                    let Some((id, ft)) = self.resolve_method_call(receiver, &method_name.0) else {
+                        return CodeError::UnknownFunction(callee_name).err(*span);
+                    };
+                    (id, ft, Some(receiver_place))
+                }
+                _ => return CodeError::UnknownFunction(callee_name).err(*span),
+            },
         };
 
-        if args.len() != func_type.params.len() {
+        let explicit_param_count = if receiver.is_some() {
+            func_type.params.len().checked_sub(1).ok_or_else(|| {
+                CodeError::FunctionCallArgumentCount(callee_name.clone(), 1, 0).spanned(*span)
+            })?
+        } else {
+            func_type.params.len()
+        };
+
+        if args.len() != explicit_param_count {
             return CodeError::FunctionCallArgumentCount(
-                callee_name,
-                func_type.params.len(),
+                callee_name.clone(),
+                explicit_param_count,
                 args.len(),
             )
             .err(*span);
         }
 
-        let arg_values = args
-            .iter()
-            .zip(func_type.params.iter())
-            .map(|(arg, param_type)| {
-                if let Type::Ref(inner) = param_type {
-                    if !arg.0.is_ref {
-                        return CodeError::ExpectedRefArgument.err(arg.0.expr.1);
-                    }
-
-                    let place = self.build_place(&arg.0.expr)?;
-
-                    if !can_coerce_type(&place.ty, inner.as_ref()) {
-                        return CodeError::FunctionCallArgumentType(
-                            expr_callee_name(&callee.0),
-                            inner.to_string(),
-                            place.ty.to_string(),
-                        )
-                        .err(arg.0.expr.1);
-                    }
-                    Ok((place.addr, param_type.clone()))
-                } else {
-                    if arg.0.is_ref {
-                        return CodeError::UnExpectedRefArgument.err(arg.0.expr.1);
-                    }
-                    let value = self.build_expression(&arg.0.expr, Some(param_type.clone()))?;
-
-                    let ty = match &value {
-                        ExprValue::Never => {
-                            return Ok((Value::from_u32(u32::MAX - 1), Type::Never));
-                        }
-                        ExprValue::Error => {
-                            return Ok((Value::from_u32(u32::MAX - 1), Type::Error));
-                        }
-                        ExprValue::Void => &Type::Void,
-                        ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => {
-                            ty
-                        }
-                    };
-
-                    if !can_coerce_type(ty, param_type) {
-                        return CodeError::FunctionCallArgumentType(
-                            expr_callee_name(&callee.0),
-                            param_type.to_string(),
-                            ty.to_string(),
-                        )
-                        .err(arg.0.expr.1);
-                    }
-
-                    Ok(self
-                        .get_value(value)
-                        .expect("ssa or stack slot function argument must produce a value"))
+        let mut arg_values = Vec::new();
+        let param_offset = if let Some(receiver) = receiver {
+            let param_type = &func_type.params[0];
+            if let Type::Ref(inner) = param_type {
+                if !can_coerce_type(&receiver.ty, inner.as_ref()) {
+                    return CodeError::FunctionCallArgumentType(
+                        callee_name.clone(),
+                        inner.to_string(),
+                        receiver.ty.to_string(),
+                    )
+                    .err(callee.1);
                 }
-            })
-            .collect::<Result<Vec<(Value, Type)>, ManyErrors>>()?;
+
+                arg_values.push((receiver.addr, param_type.clone()));
+            } else {
+                if !can_coerce_type(&receiver.ty, param_type) {
+                    return CodeError::FunctionCallArgumentType(
+                        callee_name.clone(),
+                        param_type.to_string(),
+                        receiver.ty.to_string(),
+                    )
+                    .err(callee.1);
+                }
+
+                arg_values.push(
+                    self.get_value(ExprValue::Addr(receiver.addr, receiver.ty))
+                        .expect("method receiver must produce a value"),
+                );
+            }
+            1
+        } else {
+            0
+        };
+
+        arg_values.extend(
+            args.iter()
+                .zip(func_type.params[param_offset..].iter())
+                .map(|(arg, param_type)| self.build_call_arg(&callee_name, arg, param_type))
+                .collect::<Result<Vec<_>, ManyErrors>>()?,
+        );
 
         if arg_values.iter().any(|(_, ty)| *ty == Type::Never) {
             return Ok(ExprValue::Never);

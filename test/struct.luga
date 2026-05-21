@@ -58,6 +58,10 @@ fn main() {
     @assert(0 == c.x);
     @assert(-4 == c.y);
 
+    var d = a.add(b);
+    @assert(0 == d.x);
+    @assert(-4 == d.y);
+
     @assert(sumComponents() == 42);
 
     var zero = iVec.zero();

@@ -105,11 +105,11 @@ fn main() {
     // Extern declarations call functions provided by the platform/runtime.
     @assert(abs(-7) == 7);
 
-    // Struct literals, field access, and associated functions.
+    // Struct literals, field access, associated functions, and method syntax.
     var point = Point.new(3, 4);
     @assert(point.x == 3);
     @assert(point.y == 4);
-    Point.translate(ref point, 2, -1);
+    point.translate(2, -1);
     @assert(point.x == 5);
     @assert(point.y == 3);
 
