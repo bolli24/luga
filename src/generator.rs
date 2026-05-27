@@ -19,22 +19,22 @@ use indexmap::{IndexMap, IndexSet};
 use luga_syntax::{SimpleSpan, Span, parser::Arg};
 use luga_syntax::{
     parser::{
-        BinOp, Conditional, EnumDecl, Expression, FunctionDecl, If, Intrinsic, Param, Program,
-        Spanned, Statement, StructDecl, TopLevelItem, UnOp,
+        Ast, BinOp, Conditional, EnumDecl, Expression, FunctionDecl, If, Intrinsic, Param, Spanned,
+        Statement, StructDecl, TopLevelItem, UnOp,
     },
     parsing::parse_source,
 };
 
 use crate::errors::*;
+use crate::lower_scope::{LowerScope, LowerSymbol};
+use crate::mir::MirProgram;
 use crate::types::{Type, *};
 use crate::util::ResultCollectAll;
 
 const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct ModuleId(usize);
 
-fn can_coerce_type(actual: &Type, expected: &Type) -> bool {
+pub fn can_coerce_type(actual: &Type, expected: &Type) -> bool {
     matches!(actual, Type::Never | Type::Error)
         || actual == expected
         || matches!(actual, Type::Ref(inner) if inner.as_ref() == expected)
@@ -68,7 +68,7 @@ pub struct Place {
 }
 
 pub fn generate(
-    program: Program,
+    program: MirProgram,
     file_path: Option<&Path>,
     src: &str,
     verbose: bool,
@@ -80,7 +80,9 @@ pub fn generate(
     #[cfg(target_os = "windows")]
     const TARGET_TRIPLE: &str = "x86_64-pc-windows-gnu";
 
-    let isa = {
+    todo!();
+
+    /* let isa = {
         let mut builder = settings::builder();
 
         builder
@@ -144,6 +146,7 @@ pub fn generate(
         exit_id,
         verbose,
         current_scope: Scope::new(),
+        lower_scope: LowerScope::new(),
         dir: file_path
             .and_then(Path::parent)
             .unwrap_or(Path::new("."))
@@ -172,12 +175,12 @@ pub fn generate(
         Ok(_) => {}
     }
 
-    Ok(module.finish())
+    Ok(module.finish()) */
 }
 
-struct Scope {
+pub struct Scope {
     symbols: HashMap<String, Symbol>,
-    parent: Option<Box<Scope>>,
+    pub(crate) parent: Option<Box<Scope>>,
     is_function_boundary: bool,
 }
 
@@ -214,6 +217,10 @@ impl Scope {
 
     pub fn get_symbol(&self, name: &str) -> LookupResult<'_> {
         self.get_symbol_inner(name, false)
+    }
+
+    pub(crate) fn contains_symbol_in_current_scope(&self, name: &str) -> bool {
+        self.symbols.contains_key(name)
     }
 
     fn get_symbol_inner(&self, name: &str, crossed_boundary: bool) -> LookupResult<'_> {
@@ -268,7 +275,7 @@ impl Scope {
     }
 }
 
-struct GeneratorState<'a> {
+pub struct GeneratorState<'a> {
     isa: std::sync::Arc<dyn isa::TargetIsa>,
     module: &'a mut ObjectModule,
     current_module: ModuleId,
@@ -277,11 +284,12 @@ struct GeneratorState<'a> {
     exit_id: FuncId,
     verbose: bool,
     current_scope: Scope,
+    pub lower_scope: LowerScope,
     dir: PathBuf,
     fn_name_prefix: String,
     compiling_imports: HashSet<PathBuf>,
     compiled_imports: HashMap<PathBuf, HashMap<String, Symbol>>,
-    types: TypeContext,
+    pub types: TypeContext,
 }
 
 struct FnGenerator<'a, 'ctx> {
@@ -296,7 +304,7 @@ struct FnGenerator<'a, 'ctx> {
 impl GeneratorState<'_> {
     fn build_main_module(
         mut self,
-        program: Program,
+        program: Ast,
         mod_errors: &mut Vec<ModuleErrors>,
     ) -> Result<HashMap<String, Symbol>, MainModuleError> {
         let found_main = self
@@ -309,18 +317,22 @@ impl GeneratorState<'_> {
 
         let mut errors = ManyErrors::new();
 
-        self.pass2(&program, &mut errors);
+        /* let mir_functions = self.lower_mir_functions(&program, &mut errors);
 
         if !errors.is_empty() {
             return Err(MainModuleError::CodeErrors(errors));
         }
 
-        Ok(self.current_scope.symbols)
+        for mir_function in mir_functions {
+            println!("{mir_function}");
+        }*/
+
+        std::process::exit(0)
     }
 
     fn pass1(
         &mut self,
-        program: &Program,
+        program: &Ast,
         mod_errors: &mut Vec<ModuleErrors>,
         is_entry: bool,
     ) -> Result<bool, ManyErrors> {
@@ -339,12 +351,12 @@ impl GeneratorState<'_> {
                     }
                 }
                 TopLevelItem::StructDecl(decl) => {
-                    if let Err(mut e) = self.build_struct_decl(decl) {
+                    if let Err(mut e) = self.declare_struct(decl) {
                         errors.append(&mut e);
                     }
                 }
                 TopLevelItem::EnumDecl(decl) => {
-                    if let Err(mut e) = self.build_enum_decl(decl) {
+                    if let Err(mut e) = self.declare_enum(decl) {
                         errors.append(&mut e);
                     }
                 }
@@ -365,7 +377,7 @@ impl GeneratorState<'_> {
         }
     }
 
-    fn pass2(&mut self, program: &Program, errors: &mut ManyErrors) {
+    fn pass2(&mut self, program: &Ast, errors: &mut ManyErrors) {
         for item in &program.items {
             if let TopLevelItem::FunctionDecl(decl) = &item.0 {
                 if let Err(mut e) = self.build_fn_body(decl, &item.1, true) {
@@ -453,7 +465,7 @@ impl GeneratorState<'_> {
 
     fn compile_import(
         &mut self,
-        program: Program,
+        program: Ast,
         dir: &Path,
         canonical: &Path,
         mod_errors: &mut Vec<ModuleErrors>,
@@ -465,8 +477,6 @@ impl GeneratorState<'_> {
         let new_prefix = module_prefix(canonical, self.compiled_imports.len());
         let saved_prefix = std::mem::replace(&mut self.fn_name_prefix, new_prefix);
 
-        let mut errors = ManyErrors::new();
-
         if let Err(errors) = self.pass1(&program, mod_errors, false) {
             self.current_module = saved_module;
             self.current_scope = saved_scope;
@@ -475,16 +485,10 @@ impl GeneratorState<'_> {
             return Err(errors);
         }
 
-        self.pass2(&program, &mut errors);
-
         let module_symbols = std::mem::replace(&mut self.current_scope, saved_scope).symbols;
         self.current_module = saved_module;
         self.dir = saved_dir;
         self.fn_name_prefix = saved_prefix;
-
-        if !errors.is_empty() {
-            return Err(errors);
-        }
 
         Ok(module_symbols)
     }
@@ -1361,12 +1365,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             },
             Expression::MemberAccess(base, member) => match self.resolve_expr_as_symbol(base)? {
                 Symbol::Module(map) => map.get(&member.0),
-                Symbol::Type(Type::Struct(type_id) | Type::Enum(type_id)) => self
+                Symbol::Type(Type::Struct(_type_id) | Type::Enum(_type_id)) => unreachable!() /* self
                     .state
                     .types
                     .associated_functions
                     .get(type_id)?
-                    .get(&member.0),
+                    .get(&member.0)*/ ,
                 _ => None,
             },
             _ => None,
@@ -1424,7 +1428,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             .get(&type_id)?
             .get(method_name)?
         {
-            Symbol::Function(func_id, func_type) => Some((*func_id, func_type.clone())),
+            LowerSymbol::Function(func_id, func_type) => {
+                Some((unreachable!("*func_id"), func_type.clone()))
+            }
             _ => None,
         }
     }
@@ -2137,12 +2143,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 }
 
 impl GeneratorState<'_> {
-    fn push_scope(&mut self) {
+    pub(crate) fn push_scope(&mut self) {
         let old_scope = std::mem::replace(&mut self.current_scope, Scope::new());
         self.current_scope.parent = Some(Box::new(old_scope));
     }
 
-    fn pop_scope(&mut self) -> Option<Scope> {
+    pub(crate) fn pop_scope(&mut self) -> Option<Scope> {
         if let Some(mut parent) = self.current_scope.parent.take() {
             std::mem::swap(&mut self.current_scope, &mut *parent);
             Some(*parent)
@@ -2313,7 +2319,7 @@ impl GeneratorState<'_> {
         Ok(Symbol::Function(func_id, func_type))
     }
 
-    fn pre_declare_fn(
+    pub(crate) fn pre_declare_fn(
         &mut self,
         decl: &FunctionDecl,
         span: &SimpleSpan,
@@ -2368,7 +2374,12 @@ impl GeneratorState<'_> {
 
         let object_name = format!("{}{}${}", self.fn_name_prefix, owner_name, decl.name);
 
-        let symbol = self.make_function_symbol(decl, span, &object_name, Linkage::Local, false)?;
+        let Symbol::Function(f_id, f_type) =
+            self.make_function_symbol(decl, span, &object_name, Linkage::Local, false)?
+        else {
+            unreachable!()
+        };
+        let symbol = LowerSymbol::Function(unreachable!("f_id"), f_type);
 
         self.types
             .associated_functions
@@ -2557,7 +2568,7 @@ impl GeneratorState<'_> {
         decl: &FunctionDecl,
         span: &SimpleSpan,
     ) -> Result<(), ManyErrors> {
-        let Symbol::Function(func_id, func_type) = self
+        let LowerSymbol::Function(func_id, func_type) = self
             .types
             .associated_functions
             .get(&owner)
@@ -2568,7 +2579,7 @@ impl GeneratorState<'_> {
             unreachable!("associated function table must only contain functions");
         };
 
-        self.build_fn_body_with_symbol(decl, func_id, func_type, span, false)
+        self.build_fn_body_with_symbol(decl, unreachable!("func_id"), func_type, span, false)
     }
 
     // Used for nested function declarations inside function bodies (single-pass is fine there).
@@ -2807,7 +2818,7 @@ impl FnGenerator<'_, '_> {
 }
 
 impl GeneratorState<'_> {
-    fn build_struct_decl(&mut self, decl: &StructDecl) -> Result<(), ManyErrors> {
+    pub fn declare_struct(&mut self, decl: &StructDecl) -> Result<TypeId, ManyErrors> {
         let mut errors = ManyErrors::new();
 
         if matches!(
@@ -2872,6 +2883,13 @@ impl GeneratorState<'_> {
             return Err(errors);
         }
 
+        Ok(struct_id)
+    }
+
+    fn build_struct_decl(&mut self, decl: &StructDecl) -> Result<(), ManyErrors> {
+        let struct_id = self.declare_struct(decl)?;
+
+        let mut errors = ManyErrors::new();
         for func_decl in &decl.functions {
             if let Err(mut e) = self.build_assoc_fn_body(struct_id, &func_decl.0, &func_decl.1) {
                 errors.append(&mut e);
@@ -2884,7 +2902,7 @@ impl GeneratorState<'_> {
         Ok(())
     }
 
-    fn build_enum_decl(&mut self, decl: &EnumDecl) -> Result<(), ManyErrors> {
+    pub fn declare_enum(&mut self, decl: &EnumDecl) -> Result<TypeId, ManyErrors> {
         let mut errors = ManyErrors::new();
 
         if matches!(
@@ -2922,6 +2940,11 @@ impl GeneratorState<'_> {
             .insert_symbol(decl.name.0.clone(), Symbol::Type(Type::Enum(enum_id)))
             .expect("Must not overwrite symbol");
 
+        Ok(enum_id)
+    }
+
+    fn build_enum_decl(&mut self, decl: &EnumDecl) -> Result<(), ManyErrors> {
+        self.declare_enum(decl)?;
         Ok(())
     }
 
@@ -3002,7 +3025,7 @@ mod tests {
         let path = Path::new("test.luga");
         let program = parse_source(src, false)
             .unwrap_or_else(|err| panic!("test source must parse: {}", err.short_reason()));
-
+        todo!();
         match generate(program, Some(path), src, false, false) {
             Err(GeneratorErrors::ModuleErrors(modules)) => modules
                 .into_iter()

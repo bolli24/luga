@@ -7,7 +7,7 @@ use chumsky::{input::ValueInput, prelude::*};
 pub struct Spanned<T: std::fmt::Debug + Clone>(pub T, pub SimpleSpan);
 
 #[derive(Clone, Debug)]
-pub struct Program {
+pub struct Ast {
     pub items: Vec<Spanned<TopLevelItem>>,
 }
 
@@ -177,7 +177,7 @@ const KEY_WORDS: [&str; 16] = [
     "extern", "import", "as", "self", "ref",
 ];
 
-pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, Token<'a>>>> + Clone
+pub fn luga_parser<'a, I>() -> impl Parser<'a, I, Ast, extra::Err<Rich<'a, Token<'a>>>> + Clone
 where
     I: ValueInput<'a, Token = Token<'a>, Span = SimpleSpan>,
 {
@@ -617,5 +617,5 @@ where
     top_level_item
         .repeated()
         .collect::<Vec<_>>()
-        .map(|items| Program { items })
+        .map(|items| Ast { items })
 }

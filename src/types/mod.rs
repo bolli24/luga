@@ -5,7 +5,7 @@ pub use context::TypeContext;
 
 use indexmap::{IndexMap, IndexSet};
 
-use crate::generator::ModuleId;
+use crate::lower::ModuleId;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct TypeId {

@@ -2,12 +2,12 @@
 
 use ariadne::Source;
 use luga::errors::report_compile_errors;
-use luga::generator::generate;
-use luga::{GeneratorErrors, check_file, diagnostic_path};
+use luga::{LowerErrors, check_file, diagnostic_path};
 use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
 
 use colored::Colorize;
+use luga::lower_state::lower_ast;
 use std::fs::{self, File, create_dir_all, remove_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -314,17 +314,17 @@ fn build_file(
     file_path: &Path,
     output_dir: &Path,
     verbose: bool,
-    release: bool,
-    linker_args: &str,
-    runtime_lib: &Path,
+    _release: bool,
+    _linker_args: &str,
+    _runtime_lib: &Path,
 ) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
-    let output_file = output_dir.join(base_name);
+    let _output_file = output_dir.join(base_name);
 
     let src = fs::read_to_string(file_path)
         .map_err(|err| BuildError::Io(file_path.to_path_buf(), err))?;
 
-    let program = parse_source(&src, verbose).map_err(|err| {
+    let ast = parse_source(&src, verbose).map_err(|err| {
         let diagnostic_path = diagnostic_path(file_path);
         let src_report = Source::from(src.as_str());
         err.report(Some(&diagnostic_path), &src_report);
@@ -338,7 +338,39 @@ fn build_file(
         println!();
     }
 
-    let product = match generate(program, Some(file_path), &src, verbose, release) {
+    let mir_program = match lower_ast(ast, Some(file_path), &src, verbose) {
+        Ok(product) => product,
+        Err(errors) => match errors {
+            LowerErrors::ModuleErrors(modules) => {
+                for module_errors in modules {
+                    let diagnostic_path = module_errors.path.as_deref().map(diagnostic_path);
+                    let src_report = Source::from(module_errors.src.as_str());
+                    report_compile_errors(
+                        diagnostic_path.as_deref(),
+                        &src_report,
+                        module_errors.errors,
+                    );
+                }
+
+                return Err(BuildError::Generator(file_path.into()));
+            }
+            LowerErrors::MissingMain => {
+                eprintln!("error: program has no `fn main()` entry point");
+                return Err(BuildError::Generator(file_path.into()));
+            }
+        },
+    };
+
+    if verbose {
+        for func in &mir_program.0 {
+            println!("{func}");
+        }
+    }
+
+    println!("Lowered program to MIR. Exiting");
+    std::process::exit(0);
+
+    /* let product = match generate(mir_program, Some(file_path), &src, verbose, release) {
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::ModuleErrors(modules) => {
@@ -413,7 +445,8 @@ fn build_file(
         println!("Saved executable to '{}'", exe_file.display());
     }
 
-    Ok(exe_file)
+
+    Ok(exe_file)*/
 }
 
 fn clean() -> Result<(), ()> {

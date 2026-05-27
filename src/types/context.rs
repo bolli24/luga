@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use crate::{generator::Symbol, types::*};
+use crate::lower_scope::LowerSymbol;
+use crate::types::*;
 
 pub struct TypeContext {
     pub structs: HashMap<TypeId, StructType>,
     pub enums: HashMap<TypeId, EnumType>,
-    pub associated_functions: HashMap<TypeId, HashMap<String, Symbol>>,
+    pub associated_functions: HashMap<TypeId, HashMap<String, LowerSymbol>>,
     next_type_id: usize,
 }
 

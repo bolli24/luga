@@ -1,5 +1,5 @@
 use crate::lexer::{LexingError, Token};
-use crate::parser::{Program, Spanned, luga_parser};
+use crate::parser::{Ast, Spanned, luga_parser};
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::span::SimpleSpan;
 use chumsky::{
@@ -29,7 +29,7 @@ impl ParseFailure {
     }
 }
 
-pub fn parse_source(src: &str, verbose: bool) -> Result<Program, ParseFailure> {
+pub fn parse_source(src: &str, verbose: bool) -> Result<Ast, ParseFailure> {
     let mut tokens: Vec<(Token, SimpleSpan)> = Vec::new();
     let mut lex_errors: Vec<Spanned<LexingError>> = Vec::new();
     for (tok, span) in Token::lexer(src).spanned() {

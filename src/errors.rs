@@ -57,7 +57,7 @@ pub enum CodeError {
     UnknownType(String),
     #[error("Type '{}' already declared.", .0)]
     TypeRedeclaration(String),
-    #[error("Can't coerse integer literal of value '{}' into integer type '{}'", .0, .0)]
+    #[error("Can't coerse integer literal of value '{}' into integer type '{}'", .1, .0)]
     CoerseInt(String, i64),
 
     #[error("Duplicate function parameter '{}'", .0)]
@@ -190,6 +190,11 @@ impl std::ops::DerefMut for ManyErrors {
 pub enum GeneratorErrors {
     ModuleErrors(Vec<ModuleErrors>),
     VerifierErrors(Vec<VerifierError>),
+    MissingMain,
+}
+
+pub enum LowerErrors {
+    ModuleErrors(Vec<ModuleErrors>),
     MissingMain,
 }
 

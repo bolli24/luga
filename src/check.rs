@@ -6,9 +6,8 @@ use std::{
 use ariadne::Source;
 use luga_syntax::parse_source;
 
-use crate::{
-    CompileError, GeneratorErrors, ModuleErrors, generator::generate, report_compile_errors,
-};
+use crate::lower_state::lower_ast;
+use crate::{CompileError, LowerErrors, ModuleErrors, report_compile_errors};
 
 pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
     let src = fs::read_to_string(file_path)
@@ -31,11 +30,7 @@ pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
         );
     }
 
-    if errored {
-        return Err(());
-    } else {
-        return Ok(());
-    }
+    if errored { Err(()) } else { Ok(()) }
 }
 
 pub fn check_source(
@@ -43,7 +38,7 @@ pub fn check_source(
     src: &str,
     verbose: bool,
 ) -> Option<Vec<ModuleErrors>> {
-    let program = match parse_source(&src, verbose) {
+    let ast = match parse_source(&src, verbose) {
         Ok(program) => program,
         Err(failure) => {
             let module_error = ModuleErrors {
@@ -59,22 +54,13 @@ pub fn check_source(
         println!();
     }
 
-    match generate(program, file_path.as_deref(), &src, verbose, false) {
+    match lower_ast(ast, file_path.as_deref(), &src, verbose) {
         Ok(_) => return Some(Vec::new()),
         Err(errors) => match errors {
-            GeneratorErrors::ModuleErrors(modules) => {
-                return Some(modules);
-            }
-            GeneratorErrors::VerifierErrors(verifier_errors) => {
-                for error in verifier_errors {
-                    // TODO: make this printing nice
-                    eprintln!("{error}");
-                }
-                return None;
-            }
-            GeneratorErrors::MissingMain => return Some(Vec::new()),
+            LowerErrors::ModuleErrors(modules) => Some(modules),
+            LowerErrors::MissingMain => Some(Vec::new()),
         },
-    };
+    }
 }
 
 /// Return a path that is relative to the current working directory
