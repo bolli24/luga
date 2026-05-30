@@ -105,7 +105,7 @@ impl StructType {
     ) -> Self {
         let align_shift = fields
             .values()
-            .map(|f| type_context.align_shift(&f.r#type))
+            .map(|f| type_context.align_shift(&f.ty))
             .max()
             .unwrap_or(0);
 
@@ -126,10 +126,10 @@ impl StructType {
     ) -> u32 {
         let mut offset = 0;
         for field in fields.values() {
-            let align = 1 << type_context.align_shift(&field.r#type);
+            let align = 1 << type_context.align_shift(&field.ty);
             let padding = (align - (offset % align)) % align;
             offset += padding;
-            offset += type_context.size(&field.r#type)
+            offset += type_context.size(&field.ty)
         }
 
         // Final padding so total size is a multiple of the struct's alignment
@@ -150,7 +150,7 @@ impl StructType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructField {
-    pub r#type: Type,
+    pub ty: Type,
     pub offset: i32,
 }
 

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::lower_scope::LowerSymbol;
 use crate::types::*;
 
+#[derive(Debug, Clone)]
 pub struct TypeContext {
     pub structs: HashMap<TypeId, StructType>,
     pub enums: HashMap<TypeId, EnumType>,

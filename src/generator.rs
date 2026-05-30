@@ -1,38 +1,28 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    hash::Hash,
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
+use cranelift::codegen::Context;
 use cranelift::{
-    codegen::{
-        Context,
-        ir::{ArgumentPurpose, StackSlot},
-    },
+    codegen::ir::{ArgumentPurpose, StackSlot},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::{isa::CallConv, *},
 };
-use indexmap::{IndexMap, IndexSet};
-
-use luga_syntax::{SimpleSpan, Span, parser::Arg};
-use luga_syntax::{
-    parser::{
-        Ast, BinOp, Conditional, EnumDecl, Expression, FunctionDecl, If, Intrinsic, Param, Spanned,
-        Statement, StructDecl, TopLevelItem, UnOp,
-    },
-    parsing::parse_source,
-};
+use indexmap::IndexMap;
+use luga_syntax::parser::{BinOp, Intrinsic, UnOp};
 
 use crate::errors::*;
-use crate::lower_scope::{LowerScope, LowerSymbol};
-use crate::mir::MirProgram;
+use crate::lower::ModuleId;
+use crate::lower_state::LowerFuncId;
+use crate::mir::{
+    BasicBlock, FieldId, LocalId, MirCallee, MirConst, MirFunction, MirProgram, MirStatement,
+    MirTerminator, Operand, Place as MirPlace, Rvalue,
+};
 use crate::types::{Type, *};
-use crate::util::ResultCollectAll;
 
 const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
-
 
 pub fn can_coerce_type(actual: &Type, expected: &Type) -> bool {
     matches!(actual, Type::Never | Type::Error)
@@ -48,6 +38,26 @@ pub enum ExprValue {
     Never,
     Void,
     Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GenValue {
+    Ssa(Value, Type),
+    Addr(Value, Type),
+}
+
+impl GenValue {
+    pub fn ty(&self) -> &Type {
+        match self {
+            GenValue::Ssa(_, ty) | GenValue::Addr(_, ty) => ty,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalStore {
+    Ssa(Value),
+    Slot(StackSlot),
 }
 
 impl ExprValue {
@@ -70,9 +80,8 @@ pub struct Place {
 pub fn generate(
     program: MirProgram,
     file_path: Option<&Path>,
-    src: &str,
-    verbose: bool,
     release: bool,
+    verbose: bool,
 ) -> Result<ObjectProduct, GeneratorErrors> {
     #[cfg(target_os = "linux")]
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux";
@@ -80,9 +89,7 @@ pub fn generate(
     #[cfg(target_os = "windows")]
     const TARGET_TRIPLE: &str = "x86_64-pc-windows-gnu";
 
-    todo!();
-
-    /* let isa = {
+    let isa = {
         let mut builder = settings::builder();
 
         builder
@@ -137,45 +144,41 @@ pub fn generate(
         .declare_function("exit", Linkage::Import, &exit_signature)
         .unwrap();
 
-    let state = GeneratorState {
+    let mut state = GeneratorState {
         isa,
+        functions: &program.functions,
+        function_types: &program.function_types,
+        crane_functions: HashMap::new(),
         module: &mut module,
         current_module: ModuleId(0),
         strings: 0,
         printf_id,
         exit_id,
-        verbose,
-        current_scope: Scope::new(),
-        lower_scope: LowerScope::new(),
         dir: file_path
             .and_then(Path::parent)
             .unwrap_or(Path::new("."))
             .to_path_buf(),
         fn_name_prefix: String::new(),
-        compiling_imports: HashSet::new(),
-        compiled_imports: HashMap::new(),
-        types: TypeContext::new(),
+        types: &program.types,
+        verbose,
     };
 
-    let mut mod_errors = Vec::new();
+    let crane_functions: HashMap<LowerFuncId, FuncId> = program
+        .function_types
+        .iter()
+        .map(|(lower_func_id, func_type)| {
+            (
+                *lower_func_id,
+                state.declare_function(func_type, *lower_func_id == program.main_func_id),
+            )
+        })
+        .collect();
 
-    match state.build_main_module(program, &mut mod_errors) {
-        Err(MainModuleError::MissingMain) => return Err(GeneratorErrors::MissingMain),
-        Err(MainModuleError::CodeErrors(errors)) => {
-            mod_errors.push(ModuleErrors {
-                path: file_path.map(Path::to_path_buf),
-                src: src.to_owned(),
-                errors: errors
-                    .into_iter()
-                    .map(|err| CompileError::Code(err))
-                    .collect(),
-            });
-            return Err(GeneratorErrors::ModuleErrors(mod_errors));
-        }
-        Ok(_) => {}
-    }
+    state.crane_functions = crane_functions;
 
-    Ok(module.finish()) */
+    state.build_program(&program)?;
+
+    Ok(module.finish())
 }
 
 pub struct Scope {
@@ -277,19 +280,96 @@ impl Scope {
 
 pub struct GeneratorState<'a> {
     isa: std::sync::Arc<dyn isa::TargetIsa>,
+    functions: &'a IndexMap<LowerFuncId, MirFunction>,
+    function_types: &'a IndexMap<LowerFuncId, FuncType>,
+    crane_functions: HashMap<LowerFuncId, FuncId>,
     module: &'a mut ObjectModule,
     current_module: ModuleId,
     strings: usize,
     printf_id: FuncId,
     exit_id: FuncId,
-    verbose: bool,
-    current_scope: Scope,
-    pub lower_scope: LowerScope,
     dir: PathBuf,
     fn_name_prefix: String,
-    compiling_imports: HashSet<PathBuf>,
-    compiled_imports: HashMap<PathBuf, HashMap<String, Symbol>>,
-    pub types: TypeContext,
+    types: &'a TypeContext,
+    verbose: bool,
+}
+
+impl<'a> GeneratorState<'a> {
+    pub fn build_program(&mut self, program: &MirProgram) -> Result<(), GeneratorErrors> {
+        for (lower_func_id, function) in &program.functions {
+            self.build_fn_body(*lower_func_id, function)?;
+        }
+
+        Ok(())
+    }
+
+    fn declare_function(&mut self, func_type: &FuncType, is_main: bool) -> FuncId {
+        let linkage = if func_type.is_extern {
+            Linkage::Import
+        } else if is_main {
+            Linkage::Export
+        } else {
+            Linkage::Local
+        };
+
+        let mut params: Vec<AbiParam> = func_type
+            .params
+            .iter()
+            .map(|param_type| {
+                // TODO: support extern ref params
+                debug_assert!(!(func_type.is_extern && param_type.is_ref()));
+
+                let mut abi_param: AbiParam = if func_type.is_extern {
+                    self.get_extern_abi_param(param_type)
+                } else {
+                    self.get_abi_param(param_type)
+                }
+                .expect("Param type must be valid.");
+
+                abi_param.purpose = if let Type::Struct(struct_id) = &param_type
+                    && func_type.is_extern
+                {
+                    let struct_type = &self.types.structs[struct_id];
+                    ArgumentPurpose::StructArgument(struct_type.size_pad_8())
+                } else {
+                    ArgumentPurpose::Normal
+                };
+                abi_param
+            })
+            .collect();
+
+        let return_type = &func_type.return_type;
+        if self.types.size(return_type) > 8 {
+            todo!("Return values larger than 8 bytes.")
+        }
+
+        let returns = match return_type.as_ref() {
+            Type::Void | Type::Never => Vec::new(),
+
+            Type::Struct(_) => {
+                params.push(AbiParam::special(
+                    self.isa.pointer_type(),
+                    ArgumentPurpose::StructReturn,
+                ));
+                Vec::new()
+            }
+
+            return_type => vec![
+                self.get_extern_abi_param(return_type)
+                    .expect("Return type must be valid."),
+            ],
+        };
+
+        let signature = Signature {
+            call_conv: self.isa.default_call_conv(),
+            params,
+            returns,
+        };
+
+        self.module
+            .declare_function(&func_type.name, linkage, &signature)
+            .expect("Function must be valid")
+    }
 }
 
 struct FnGenerator<'a, 'ctx> {
@@ -298,200 +378,8 @@ struct FnGenerator<'a, 'ctx> {
     var_count: usize,
     current_func_type: FuncType,
     return_dest: Option<StackSlot>,
-    result_span: Option<SimpleSpan>,
-}
-
-impl GeneratorState<'_> {
-    fn build_main_module(
-        mut self,
-        program: Ast,
-        mod_errors: &mut Vec<ModuleErrors>,
-    ) -> Result<HashMap<String, Symbol>, MainModuleError> {
-        let found_main = self
-            .pass1(&program, mod_errors, true)
-            .map_err(|errors| MainModuleError::CodeErrors(errors))?;
-
-        if !found_main {
-            return Err(MainModuleError::MissingMain);
-        }
-
-        let mut errors = ManyErrors::new();
-
-        /* let mir_functions = self.lower_mir_functions(&program, &mut errors);
-
-        if !errors.is_empty() {
-            return Err(MainModuleError::CodeErrors(errors));
-        }
-
-        for mir_function in mir_functions {
-            println!("{mir_function}");
-        }*/
-
-        std::process::exit(0)
-    }
-
-    fn pass1(
-        &mut self,
-        program: &Ast,
-        mod_errors: &mut Vec<ModuleErrors>,
-        is_entry: bool,
-    ) -> Result<bool, ManyErrors> {
-        let mut errors = ManyErrors::new();
-
-        let mut found_main = false;
-        for item in &program.items {
-            match &item.0 {
-                TopLevelItem::FunctionDecl(decl) => {
-                    if is_entry && decl.name == "main" && !decl.r#extern {
-                        found_main = true;
-                    }
-
-                    if let Err(mut e) = self.pre_declare_fn(decl, &item.1, is_entry) {
-                        errors.append(&mut e);
-                    }
-                }
-                TopLevelItem::StructDecl(decl) => {
-                    if let Err(mut e) = self.declare_struct(decl) {
-                        errors.append(&mut e);
-                    }
-                }
-                TopLevelItem::EnumDecl(decl) => {
-                    if let Err(mut e) = self.declare_enum(decl) {
-                        errors.append(&mut e);
-                    }
-                }
-                TopLevelItem::Import(path, rename) => {
-                    if let Err(CompileError::Code(e)) =
-                        self.process_import(path, rename.as_ref(), item.1, mod_errors)
-                    {
-                        errors.push(e);
-                    }
-                }
-            }
-        }
-
-        if !errors.is_empty() {
-            Err(errors)
-        } else {
-            Ok(found_main)
-        }
-    }
-
-    fn pass2(&mut self, program: &Ast, errors: &mut ManyErrors) {
-        for item in &program.items {
-            if let TopLevelItem::FunctionDecl(decl) = &item.0 {
-                if let Err(mut e) = self.build_fn_body(decl, &item.1, true) {
-                    errors.append(&mut e);
-                }
-            }
-        }
-    }
-
-    fn process_import(
-        &mut self,
-        path: &[Spanned<String>],
-        rename: Option<&Spanned<String>>,
-        import_span: SimpleSpan,
-        mod_errors: &mut Vec<ModuleErrors>,
-    ) -> Result<(), CompileError> {
-        let module_name = rename
-            .map(|r| r.0.clone())
-            .unwrap_or_else(|| path.last().unwrap().0.clone());
-        let module_name_span = rename
-            .map(|r| r.1)
-            .unwrap_or_else(|| path.last().unwrap().1);
-        let joined_path: PathBuf = path
-            .iter()
-            .fold(self.dir.clone(), |acc, seg| acc.join(&seg.0))
-            .with_extension("luga");
-
-        let path_str = joined_path.display().to_string();
-        let canonical = std::fs::canonicalize(&joined_path).map_err(|_| {
-            CompileError::Code(CodeError::ImportNotFound(path_str.clone()).spanned(import_span))
-        })?;
-
-        if self.compiling_imports.contains(&canonical) {
-            return Err(CodeError::CircularImport(path_str)
-                .spanned(import_span)
-                .into());
-        }
-        // Now we start compiling the module itself.
-        let symbols = if let Some(cached) = self.compiled_imports.get(&canonical) {
-            cached.clone()
-        } else {
-            let src = fs::read_to_string(&canonical).map_err(|err| {
-                CodeError::ImportError(path_str.clone(), err.to_string()).spanned(import_span)
-            })?;
-
-            let program = match parse_source(&src, self.verbose) {
-                Ok(program) => program,
-                Err(failure) => {
-                    mod_errors.push(ModuleErrors {
-                        path: Some(canonical),
-                        src: src.to_owned(),
-                        errors: CompileError::from_parse_failure(failure),
-                    });
-                    return Err(CompileError::ModuleInner);
-                }
-            };
-            let dir = joined_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-
-            self.compiling_imports.insert(canonical.clone());
-            let symbols = match self.compile_import(program, &dir, &canonical, mod_errors) {
-                Ok(compiled) => compiled,
-                Err(errors) => {
-                    mod_errors.push(ModuleErrors {
-                        path: Some(canonical),
-                        src: src.to_owned(),
-                        errors: errors.into_iter().map(CompileError::Code).collect(),
-                    });
-                    return Err(CompileError::ModuleInner);
-                }
-            };
-            self.compiling_imports.remove(&canonical);
-            self.compiled_imports
-                .insert(canonical.clone(), symbols.clone());
-            symbols
-        };
-
-        self.current_scope
-            .insert_symbol(module_name.clone(), Symbol::Module(symbols))
-            .map_err(|_| {
-                CodeError::NameAlreadyDefined(module_name)
-                    .spanned(module_name_span)
-                    .into()
-            })
-    }
-
-    fn compile_import(
-        &mut self,
-        program: Ast,
-        dir: &Path,
-        canonical: &Path,
-        mod_errors: &mut Vec<ModuleErrors>,
-    ) -> Result<HashMap<String, Symbol>, ManyErrors> {
-        let new_module = ModuleId(self.current_module.0 + 1);
-        let saved_module = std::mem::replace(&mut self.current_module, new_module);
-        let saved_scope = std::mem::replace(&mut self.current_scope, Scope::new());
-        let saved_dir = std::mem::replace(&mut self.dir, dir.to_path_buf());
-        let new_prefix = module_prefix(canonical, self.compiled_imports.len());
-        let saved_prefix = std::mem::replace(&mut self.fn_name_prefix, new_prefix);
-
-        if let Err(errors) = self.pass1(&program, mod_errors, false) {
-            self.current_module = saved_module;
-            self.current_scope = saved_scope;
-            self.dir = saved_dir;
-            self.fn_name_prefix = saved_prefix;
-            return Err(errors);
-        }
-
-        let module_symbols = std::mem::replace(&mut self.current_scope, saved_scope).symbols;
-        self.current_module = saved_module;
-        self.dir = saved_dir;
-        self.fn_name_prefix = saved_prefix;
-
-        Ok(module_symbols)
-    }
+    local_storage: HashMap<LocalId, StackSlot>,
+    crane_blocks: Vec<Block>,
 }
 
 fn module_prefix(canonical_path: &Path, module_index: usize) -> String {
@@ -538,7 +426,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
     }
 
-    fn build_statements(
+    /*fn build_statements(
         &mut self,
         statements: &[Spanned<Statement>],
         try_into_type: Option<Type>,
@@ -588,115 +476,401 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
 
         Ok(block_value)
-    }
+    }*/
 
-    fn build_statement(
-        &mut self,
-        statement: &Spanned<Statement>,
-        try_into_type: Option<Type>,
-    ) -> Result<ExprValue, ManyErrors> {
-        match &statement.0 {
-            Statement::Return(expr) => {
-                if self.build_return(expr)? {
-                    return Ok(ExprValue::Never);
-                } else {
-                    return Ok(ExprValue::Void);
-                }
+    fn build_statement(&mut self, statement: &MirStatement) {
+        if self.state.verbose {
+            println!("statement: {statement}");
+        }
+        match statement {
+            MirStatement::Assign(place, rvalue) => {
+                let value = self.build_value(rvalue);
+                self.build_assign(place, value);
             }
-            Statement::Expression(expr) => {
-                let value = self.build_expression(expr, try_into_type)?;
-                if matches!(value, ExprValue::Never) {
-                    return Ok(value);
-                }
+            MirStatement::Eval(Rvalue::Intrinsic { intrinsic, args }) => {
+                self.build_eval_intrinsic(intrinsic, args);
             }
-            Statement::Binding(name, expr) => {
-                if self.state.current_scope.symbols.contains_key(name) {
-                    return CodeError::VariableRedefinition(name.clone()).err(statement.1);
-                }
-
-                let value = match self.build_expression(expr, None) {
-                    Ok(value) => value,
-                    Err(errors) => {
-                        self.new_error_var(name.to_owned());
-                        return Err(errors);
-                    }
-                };
-
-                let ty = match &value {
-                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
-                    ExprValue::Error => {
-                        self.new_error_var(name.to_owned());
-                        return Ok(ExprValue::Void);
-                    }
-                    ExprValue::Never => {
-                        return Ok(ExprValue::Never);
-                    }
-                    ExprValue::Void => {
-                        return CodeError::BindingType(Type::Void.to_string()).err(expr.1);
-                    }
-                };
-
-                if self.state.get_crane_type(ty).is_none() {
-                    return CodeError::BindingType(ty.to_string()).err(expr.1);
-                }
-
-                let value = self
-                    .get_value(value)
-                    .expect("ssa or stack slot expression must produce a value");
-
-                let slot = self.stack_slot_for_type(&value.1);
-                self.store_to_slot(slot, &value.1, value.0);
-                self.new_var(name.to_owned(), slot, value.1);
+            MirStatement::Eval(Rvalue::Call { callee, args }) => {
+                self.build_fn_call(callee, args);
             }
-            Statement::Assignment(target, expr) => {
-                let place = self.build_place(target)?;
-
-                let value = self.build_expression(expr, Some(place.ty.clone()))?;
-
-                let ty = match &value {
-                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
-                    ExprValue::Never => return Ok(ExprValue::Never),
-                    ExprValue::Error => return Ok(ExprValue::Void),
-                    ExprValue::Void => &Type::Void,
-                };
-
-                if !can_coerce_type(ty, &place.ty) {
-                    return CodeError::AssignmentIncompatibleTypes(
-                        place.ty.to_string(),
-                        ty.to_string(),
-                    )
-                    .err(statement.1);
-                }
-
-                let value = self
-                    .get_value(value)
-                    .expect("ssa or stack slot expression must produce a value");
-
-                self.store_to_addr(place.addr, &place.ty, value.0);
-            }
-            Statement::While(r#while) => {
-                if self.build_while(r#while)? {
-                    return Ok(ExprValue::Never);
-                } else {
-                    return Ok(ExprValue::Void);
-                }
-            }
-            Statement::FunctionDecl(decl) => {
-                self.state.build_fn_decl(decl, &statement.1)?;
-            }
-            Statement::StructDecl(decl) => {
-                self.state.build_struct_decl(decl)?;
-            }
-            Statement::EnumDecl(decl) => {
-                self.state.build_enum_decl(decl)?;
-            }
-            Statement::Result(expr) => {
-                self.result_span = Some(expr.1);
-                return self.build_expression(expr, try_into_type);
+            MirStatement::Eval(rvalue) => {
+                self.build_value(rvalue);
             }
         }
+    }
 
-        Ok(ExprValue::Void)
+    fn build_value(&mut self, rvalue: &Rvalue) -> GenValue {
+        let value = match rvalue {
+            Rvalue::Use(operand) => self.build_use_operand(operand),
+            Rvalue::Binary { op, left, right } => self.build_binary_op(op, left, right),
+            Rvalue::Unary { op, operand } => self.build_unary_op(op, operand),
+            Rvalue::Call { callee, args } => self
+                .build_fn_call(callee, args)
+                .expect("function must return non-void value"),
+            Rvalue::Intrinsic { intrinsic, args } => self.build_value_intrinsic(intrinsic, args),
+            Rvalue::StructInit { ty, fields } => self.build_struct_init(*ty, fields),
+            Rvalue::EnumVariant { ty, value } => GenValue::Ssa(
+                self.builder.ins().iconst(types::I32, *value as i64),
+                Type::Enum(*ty),
+            ),
+        };
+
+        debug_assert!(!matches!(
+            value.ty(),
+            Type::Void | Type::Never | Type::Error
+        ));
+
+        value
+    }
+
+    fn build_value_intrinsic(&mut self, intrinsic: &Intrinsic, args: &[Operand]) -> GenValue {
+        let args = args
+            .iter()
+            .map(|arg| self.build_use_operand(arg))
+            .collect::<Vec<_>>();
+
+        match intrinsic {
+            Intrinsic::Print | Intrinsic::Println => self.build_printf(args),
+            Intrinsic::EnumToInt => self.build_enum_to_int(args),
+            Intrinsic::Assert | Intrinsic::Exit => unreachable!("intrinsic cannot be rvalue"),
+        }
+    }
+
+    fn build_eval_intrinsic(&mut self, intrinsic: &Intrinsic, args: &[Operand]) {
+        match intrinsic {
+            Intrinsic::Assert => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.build_use_operand(arg))
+                    .collect::<Vec<_>>();
+                self.build_assert(args);
+            }
+            Intrinsic::Exit => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.build_use_operand(arg))
+                    .collect::<Vec<_>>();
+                self.build_exit(args);
+            }
+            Intrinsic::Print | Intrinsic::Println | Intrinsic::EnumToInt => {
+                let _ = self.build_value_intrinsic(intrinsic, args);
+            }
+        }
+    }
+
+    fn build_use_operand(&mut self, operand: &Operand) -> GenValue {
+        match operand {
+            Operand::Place(place) => self.build_place_load(place),
+            Operand::Const(constant, ty) => match constant {
+                MirConst::Bool(value) => GenValue::Ssa(
+                    self.builder.ins().iconst(types::I8, i64::from(*value)),
+                    Type::Bool,
+                ),
+                MirConst::Float(value) => {
+                    GenValue::Ssa(self.builder.ins().f32const(*value), Type::F32)
+                }
+                MirConst::Integer(value) => GenValue::Ssa(
+                    self.builder.ins().iconst(
+                        self.state
+                            .get_crane_type(ty)
+                            .expect("Integer must have cranelift type"),
+                        *value,
+                    ),
+                    ty.clone(),
+                ),
+                MirConst::String(value) => {
+                    let mut data_desc = DataDescription::new();
+                    let mut string_data = value.as_bytes().to_vec();
+                    string_data.push(0);
+                    data_desc.define(string_data.into_boxed_slice());
+
+                    let string_id = self.state.strings;
+                    self.state.strings += 1;
+                    let string_data_id = self
+                        .state
+                        .module
+                        .declare_data(&format!("string_{string_id}"), Linkage::Local, true, false)
+                        .expect("Failed to declare string data");
+
+                    self.state
+                        .module
+                        .define_data(string_data_id, &data_desc)
+                        .expect("Failed to define string data");
+
+                    let format_string_ref = self
+                        .state
+                        .module
+                        .declare_data_in_func(string_data_id, self.builder.func);
+                    let value = self
+                        .builder
+                        .ins()
+                        .global_value(types::I64, format_string_ref);
+
+                    GenValue::Ssa(value, Type::String)
+                }
+            },
+        }
+    }
+
+    fn build_place_load(&mut self, place: &MirPlace) -> GenValue {
+        let place = self.build_place_addr(place);
+
+        match &place.ty {
+            Type::Struct(_) => GenValue::Addr(place.addr, place.ty),
+            ty => {
+                let clif_ty = self
+                    .state
+                    .get_crane_type(ty)
+                    .expect("place type must have a Cranelift type");
+
+                let value = self
+                    .builder
+                    .ins()
+                    .load(clif_ty, MemFlags::trusted(), place.addr, 0);
+
+                GenValue::Ssa(value, place.ty)
+            }
+        }
+    }
+
+    fn build_place_addr(&mut self, place: &MirPlace) -> Place {
+        match place {
+            MirPlace::Local(local_id, ty) => {
+                let stack_slot = self
+                    .local_storage
+                    .get(local_id)
+                    .expect("Stack slot must exist.");
+                let addr = self.stack_slot_addr(*stack_slot);
+                Place {
+                    addr,
+                    ty: ty.clone(),
+                }
+            }
+            MirPlace::Field {
+                base,
+                field_id,
+                ty: _,
+            } => {
+                let base_place = self.build_place_addr(base);
+
+                let Type::Struct(struct_id) = &base_place.ty else {
+                    unreachable!("field access only valid for struct types")
+                };
+
+                let (_, field) = self.state.types.structs[struct_id]
+                    .fields
+                    .get_index(field_id.0)
+                    .expect("field must exist");
+
+                let field_addr = self
+                    .builder
+                    .ins()
+                    .iadd_imm(base_place.addr, field.offset as i64);
+
+                Place {
+                    addr: field_addr,
+                    ty: field.ty.clone(),
+                }
+            }
+            MirPlace::Deref { pointer, ty } => {
+                let pointer_place = self.build_place_addr(pointer);
+                let ptr = self.builder.ins().load(
+                    self.state.isa.pointer_type(),
+                    MemFlags::trusted(),
+                    pointer_place.addr,
+                    0,
+                );
+
+                Place {
+                    addr: ptr,
+                    ty: ty.clone(),
+                }
+            }
+        }
+    }
+
+    fn abi_value(&mut self, value: GenValue) -> (Value, Type) {
+        match value {
+            GenValue::Ssa(value, ty) => (value, ty),
+            GenValue::Addr(addr, ty @ Type::Struct(_)) => (addr, ty),
+            GenValue::Addr(addr, ty) => {
+                let clif_ty = self
+                    .state
+                    .get_crane_type(&ty)
+                    .expect("address value must be loadable as scalar");
+
+                let value = self
+                    .builder
+                    .ins()
+                    .load(clif_ty, MemFlags::trusted(), addr, 0);
+
+                (value, ty)
+            }
+        }
+    }
+
+    fn scalar_value(&mut self, value: GenValue) -> (Value, Type) {
+        match value {
+            GenValue::Ssa(value, ty) => (value, ty),
+            GenValue::Addr(addr, ty) => {
+                let clif_ty = self
+                    .state
+                    .get_crane_type(&ty)
+                    .expect("address value must be loadable as scalar");
+
+                let value = self
+                    .builder
+                    .ins()
+                    .load(clif_ty, MemFlags::trusted(), addr, 0);
+
+                (value, ty)
+            }
+        }
+    }
+
+    fn build_operand(&mut self, operand: &Operand) -> (Value, Type) {
+        let value = self.build_use_operand(operand);
+        self.abi_value(value)
+    }
+
+    fn build_scalar_operand(&mut self, operand: &Operand) -> (Value, Type) {
+        let value = self.build_use_operand(operand);
+        let (value, ty) = self.abi_value(value);
+
+        debug_assert!(
+            !matches!(
+                ty,
+                Type::Struct(_) | Type::Void | Type::Never | Type::Error | Type::Ref(_)
+            ),
+            "invalid scalar operand type {ty}"
+        );
+
+        (value, ty)
+    }
+
+    fn build_binary_op(&mut self, op: &BinOp, left: &Operand, right: &Operand) -> GenValue {
+        let (left_value, left_type) = self.build_scalar_operand(left);
+        let (right_value, right_type) = self.build_scalar_operand(right);
+        debug_assert_eq!(left_type, right_type);
+
+        let (value, ty) = match left_type {
+            Type::I8 | Type::I32 | Type::I64 => {
+                self.build_int_bin_op(*op, left_value, right_value, left_type)
+            }
+            Type::F32 | Type::F64 => {
+                self.build_float_bin_op(*op, left_value, right_value, left_type)
+            }
+            Type::Bool => self.build_bool_bin_op(*op, left_value, right_value),
+            Type::Enum(enum_id) if matches!(*op, BinOp::Equal | BinOp::NotEqual) => {
+                let enum_type = &self.state.types.enums[&enum_id];
+                let result = if enum_type.variants.len() <= 1 {
+                    let always = if *op == BinOp::Equal { 1 } else { 0 };
+                    self.builder.ins().iconst(types::I8, always)
+                } else {
+                    let cc = if *op == BinOp::Equal {
+                        IntCC::Equal
+                    } else {
+                        IntCC::NotEqual
+                    };
+                    self.builder.ins().icmp(cc, left_value, right_value)
+                };
+                (result, Type::Bool)
+            }
+            _ => unreachable!(),
+        };
+
+        GenValue::Ssa(value, ty)
+    }
+
+    fn build_unary_op(&mut self, op: &UnOp, operand: &Operand) -> GenValue {
+        let (value, ty) = self.build_scalar_operand(operand);
+
+        if ty == Type::Bool && *op == UnOp::Not {
+            let result = self.builder.ins().bxor_imm(value, 1);
+            GenValue::Ssa(result, Type::Bool)
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn build_struct_init(
+        &mut self,
+        type_id: TypeId,
+        field_operands: &[(FieldId, Operand)],
+    ) -> GenValue {
+        let field_values: Vec<_> = field_operands
+            .iter()
+            .map(|(field_id, operand)| (*field_id, self.build_use_operand(operand)))
+            .collect();
+
+        let struct_type = &self.state.types.structs[&type_id];
+        let struct_size = struct_type.size;
+        let struct_align_shift = struct_type.align_shift;
+        let struct_fields = struct_type.fields.clone();
+        debug_assert_eq!(struct_fields.len(), field_values.len());
+
+        let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            struct_size,
+            struct_align_shift,
+        ));
+
+        let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
+
+        for ((_, struct_field), (_, value)) in struct_fields.iter().zip(field_values) {
+            let field_dest = self
+                .builder
+                .ins()
+                .iadd_imm(struct_addr, struct_field.offset as i64);
+            self.store_gen_value_to_addr(field_dest, &struct_field.ty, value);
+        }
+
+        GenValue::Addr(struct_addr, Type::Struct(type_id))
+    }
+
+    fn build_assign(&mut self, place: &MirPlace, value: GenValue) {
+        let dst = self.build_place_addr(place).addr;
+        let dst_ty = place.ty().clone();
+
+        self.store_gen_value_to_addr(dst, &dst_ty, value);
+    }
+
+    fn build_call_arg(&mut self, arg: &Operand, param_ty: &Type) -> Value {
+        match param_ty {
+            Type::Ref(_) => {
+                let Operand::Place(place) = arg else {
+                    unreachable!("ref argument must be a place")
+                };
+                self.build_place_addr(place).addr
+            }
+            Type::Struct(_) => {
+                let (value, ty) = self.build_operand(arg);
+                debug_assert!(matches!(ty, Type::Struct(_)));
+                value
+            }
+            _ => self.build_scalar_operand(arg).0,
+        }
+    }
+
+    fn store_gen_value_to_addr(&mut self, dst: Value, dst_ty: &Type, value: GenValue) {
+        match (dst_ty, value) {
+            (Type::Struct(_), GenValue::Addr(src, src_ty)) => {
+                debug_assert_eq!(&src_ty, dst_ty);
+                self.copy_memory(src, dst, self.state.types.size(dst_ty));
+            }
+            (Type::Struct(_), GenValue::Ssa(_, src_ty)) => {
+                unreachable!("struct value must be address-backed: {src_ty}")
+            }
+            (_, GenValue::Ssa(value, src_ty)) => {
+                debug_assert_eq!(&src_ty, dst_ty);
+                self.store_to_addr(dst, dst_ty, value);
+            }
+            (_, GenValue::Addr(src, ty)) => {
+                debug_assert_eq!(&ty, dst_ty);
+                let (value, _) = self.scalar_value(GenValue::Addr(src, ty));
+                self.store_to_addr(dst, dst_ty, value);
+            }
+        }
     }
 
     fn copy_memory(&mut self, src: Value, dest: Value, size: u32) {
@@ -717,13 +891,16 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.copy_memory(src, dest, size);
     }
 
-    fn stack_slot_for_type(&mut self, ty: &Type) -> StackSlot {
+    fn new_stack_slot_for_local(&mut self, local_id: LocalId, ty: &Type) -> StackSlot {
         let (size, align_shift) = self.state.types.layout(ty);
-        self.builder.create_sized_stack_slot(StackSlotData::new(
+        let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             size,
             align_shift,
-        ))
+        ));
+
+        self.local_storage.insert(local_id, stack_slot);
+        stack_slot
     }
 
     fn stack_slot_addr(&mut self, slot: StackSlot) -> Value {
@@ -747,33 +924,27 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
     }
 
-    fn read_slot(&mut self, slot: StackSlot, ty: Type) -> ExprValue {
+    /* fn read_slot(&mut self, slot: StackSlot, ty: Type) -> GenValue {
+        debug_assert!(!matches!(ty, Type::Void | Type::Never | Type::Error));
+
         let addr = self.stack_slot_addr(slot);
         match ty {
-            Type::Error => ExprValue::Error,
-            Type::Struct(_) => ExprValue::Addr(addr, ty),
-            Type::Ref(inner) => {
-                let ptr = self.builder.ins().load(
-                    self.state.isa.pointer_type(),
-                    MemFlags::trusted(),
-                    addr,
-                    0,
-                );
-                ExprValue::Addr(ptr, *inner)
-            }
+            Type::Struct(_) => GenValue::Addr(addr, ty),
             ty => {
                 let crane_ty = self
                     .state
                     .get_crane_type(&ty)
-                    .expect("Variable type must have a Cranelift type.");
+                    .expect("slot value type must have a Cranelift type");
+
                 let value = self
                     .builder
                     .ins()
                     .load(crane_ty, MemFlags::trusted(), addr, 0);
-                ExprValue::Ssa(value, ty)
+
+                GenValue::Ssa(value, ty)
             }
         }
-    }
+    }*/
 
     // Helper function for alignment
     fn align_to(offset: i32, align_shift: u8) -> i32 {
@@ -781,7 +952,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         (offset + align - 1) & !(align - 1)
     }
 
-    fn build_return(&mut self, expr: &Spanned<Expression>) -> Result<bool, ManyErrors> {
+    /* fn build_return(&mut self, expr: &Spanned<Expression>) -> Result<bool, ManyErrors> {
         let value =
             self.build_expression(expr, Some(*self.current_func_type.return_type.clone()))?;
         self.build_return_value(value, expr.1)
@@ -844,9 +1015,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
 
         Ok(true)
-    }
+    } */
 
-    fn build_place_value(
+    /*fn build_place_value(
         &mut self,
         expression: &Spanned<Expression>,
         _try_into_type: Option<Type>,
@@ -928,17 +1099,17 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     .get_value(expr_value)
                     .expect("ssa or stack slot member base must produce a value");
 
-                if matches!(field.r#type, Type::Struct(_)) {
+                if matches!(field.ty, Type::Struct(_)) {
                     let field_addr = self
                         .builder
                         .ins()
                         .iadd_imm(expr_value.0, field.offset as i64);
-                    return Ok(ExprValue::Addr(field_addr, field.r#type));
+                    return Ok(ExprValue::Addr(field_addr, field.ty));
                 }
 
                 let field_crane_type = self
                     .state
-                    .get_crane_type(&field.r#type)
+                    .get_crane_type(&field.ty)
                     .expect("Field type must be valid.");
                 let struct_value = self.builder.ins().load(
                     field_crane_type,
@@ -947,13 +1118,13 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     field.offset,
                 );
 
-                Ok(ExprValue::Ssa(struct_value, field.r#type))
+                Ok(ExprValue::Ssa(struct_value, field.ty))
             }
             _ => CodeError::ExpectedLValue.err(*span)?,
         }
-    }
+    }*/
 
-    fn build_place(&mut self, expression: &Spanned<Expression>) -> Result<Place, ManyErrors> {
+    /*fn build_place(&mut self, expression: &Spanned<Expression>) -> Result<Place, ManyErrors> {
         let Spanned(expression, span) = expression;
         match expression {
             Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
@@ -1017,13 +1188,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
                 Ok(Place {
                     addr: field_addr,
-                    ty: field.r#type,
+                    ty: field.ty,
                 })
             }
             _ => CodeError::ExpectedLValue.err(*span),
         }
-    }
-    fn build_expression(
+    }*/
+
+    /*fn build_expression(
         &mut self,
         expression: &Spanned<Expression>,
         try_into_type: Option<Type>,
@@ -1225,7 +1397,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             Expression::Identifier(_) => {
                 self.build_place_value(&Spanned(expression.clone(), *span), try_into_type)
             }
-            Expression::FunctionCall(name, args) => self.build_fn_call(name, args, span),
+            Expression::FunctionCall(name, args) => self.build_fn_call_old(name, args, span),
             Expression::MemberAccess(_, _) => {
                 self.build_place_value(&Spanned(expression.clone(), *span), try_into_type)
             }
@@ -1242,7 +1414,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         .as_ref()
                         .and_then(|r#type| self.state.types.struct_type(r#type))
                         .and_then(|struct_type| struct_type.fields.get(&arg.0.0).cloned())
-                        .map(|struct_field| struct_field.r#type);
+                        .map(|struct_field| struct_field.ty);
 
                     match self.build_expression(&arg.1, maybe_type) {
                         Ok(value) => {
@@ -1311,13 +1483,10 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         }
                     };
 
-                    if !can_coerce_type(ty, &field.r#type) {
+                    if !can_coerce_type(ty, &field.ty) {
                         errors.push(
-                            CodeError::StructInitInvalidType(
-                                field.r#type.to_string(),
-                                ty.to_string(),
-                            )
-                            .spanned(*span),
+                            CodeError::StructInitInvalidType(field.ty.to_string(), ty.to_string())
+                                .spanned(*span),
                         );
                         continue;
                     }
@@ -1326,7 +1495,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         .get_value(value)
                         .expect("ssa or stack slot struct field value must produce a value");
 
-                    if let Type::Struct(field_struct_id) = field.r#type {
+                    if let Type::Struct(field_struct_id) = field.ty {
                         let field_dest = self
                             .builder
                             .ins()
@@ -1353,9 +1522,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 Ok(ExprValue::Slot(stack_slot, r#type))
             }
         }
-    }
+    }*/
 
-    fn resolve_expr_as_symbol(&self, expr: &Spanned<Expression>) -> Option<&Symbol> {
+    /*fn resolve_expr_as_symbol(&self, expr: &Spanned<Expression>) -> Option<&Symbol> {
         match &expr.0 {
             Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
                 LookupResult::Found(
@@ -1370,14 +1539,14 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                     .types
                     .associated_functions
                     .get(type_id)?
-                    .get(&member.0)*/ ,
+                    .get(&member.0)*/,
                 _ => None,
             },
             _ => None,
         }
-    }
+    }*/
 
-    fn resolve_method_receiver_type(&self, receiver_expr: &Spanned<Expression>) -> Option<Type> {
+    /*fn resolve_method_receiver_type(&self, receiver_expr: &Spanned<Expression>) -> Option<Type> {
         match &receiver_expr.0 {
             Expression::Identifier(name) => match self.state.current_scope.get_symbol(name) {
                 LookupResult::Found(Symbol::Variable(_, ty)) => Some(ty.clone()),
@@ -1398,15 +1567,15 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                         .get(type_id)?
                         .fields
                         .get(&member.0)
-                        .map(|field| field.r#type.clone()),
+                        .map(|field| field.ty.clone()),
                     _ => None,
                 }
             }
             _ => None,
         }
-    }
+    }*/
 
-    fn resolve_method_call(
+    /*fn resolve_method_call(
         &self,
         receiver_expr: &Spanned<Expression>,
         method_name: &str,
@@ -1433,22 +1602,16 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             }
             _ => None,
         }
-    }
+    }*/
 
     #[must_use]
-    fn build_int_bin_op(
-        &mut self,
-        op: BinOp,
-        x: Value,
-        y: Value,
-        r#type: Type,
-    ) -> Option<(Value, Type)> {
+    fn build_int_bin_op(&mut self, op: BinOp, x: Value, y: Value, r#type: Type) -> (Value, Type) {
         if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte) && r#type.is_unsigned_int()
         {
             todo!("Comparision of unsigned integer types.")
         };
 
-        Some((
+        (
             match op {
                 BinOp::Add => self.builder.ins().iadd(x, y),
                 BinOp::Sub => self.builder.ins().isub(x, y),
@@ -1473,18 +1636,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 | BinOp::Lte
                 | BinOp::Gte => Type::Bool,
             },
-        ))
+        )
     }
 
     #[must_use]
-    fn build_float_bin_op(
-        &mut self,
-        op: BinOp,
-        x: Value,
-        y: Value,
-        r#type: Type,
-    ) -> Option<(Value, Type)> {
-        Some((
+    fn build_float_bin_op(&mut self, op: BinOp, x: Value, y: Value, r#type: Type) -> (Value, Type) {
+        (
             match op {
                 BinOp::Add => self.builder.ins().fadd(x, y),
                 BinOp::Sub => self.builder.ins().fsub(x, y),
@@ -1506,116 +1663,31 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
                 | BinOp::Lte
                 | BinOp::Gte => Type::Bool,
             },
-        ))
+        )
     }
 
     #[must_use]
-    fn build_bool_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> Option<(Value, Type)> {
-        Some(match op {
+    fn build_bool_bin_op(&mut self, op: BinOp, x: Value, y: Value) -> (Value, Type) {
+        match op {
             BinOp::Equal => (self.builder.ins().icmp(IntCC::Equal, x, y), Type::Bool),
             BinOp::NotEqual => (self.builder.ins().icmp(IntCC::NotEqual, x, y), Type::Bool),
-            _ => return None,
-        })
+            _ => unreachable!(),
+        }
     }
 
-    fn build_printf(
-        &mut self,
-        span: &SimpleSpan,
-        args: &[Spanned<Expression>],
-        new_line: bool,
-    ) -> Result<ExprValue, ManyErrors> {
+    fn build_printf(&mut self, args: Vec<GenValue>) -> GenValue {
         let Some((format_string_arg, other_args)) = args.split_first() else {
-            return CodeError::IntrinsicTooFewArguments("print", 1, args.len()).err(*span);
+            unreachable!()
         };
 
-        let mut format_string_arg = format_string_arg.clone();
-
-        // TODO: validate format string/generate own format string
-        if let Expression::String(format_string) = &mut format_string_arg.0 {
-            if new_line {
-                format_string.push('\n');
-            }
-        } else {
-            return CodeError::ExpectedStringLiteral.err(format_string_arg.1);
-        };
-
-        const PRINT_ARG_TYPES: [Type; 10] = [
-            Type::U8,
-            Type::I8,
-            Type::U16,
-            Type::I16,
-            Type::U32,
-            Type::I32,
-            Type::U64,
-            Type::I64,
-            Type::Bool,
-            Type::String,
-        ];
-        const PRINT_ARG_TYPE_NAMES: [&str; 10] = [
-            "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "bool", "string",
-        ];
+        let format_string_value = self.abi_value(format_string_arg.clone());
+        debug_assert_eq!(format_string_value.1, Type::String);
 
         let arg_values = other_args
             .iter()
-            .map(|expr| {
-                let value = self.build_expression(expr, None)?;
-
-                let ty = match &value {
-                    ExprValue::Never => return Ok(ExprValue::Never),
-                    ExprValue::Error => return Ok(ExprValue::Error),
-                    ExprValue::Void => {
-                        return CodeError::IntrisicArgumentType(
-                            "print",
-                            &PRINT_ARG_TYPE_NAMES,
-                            Type::Void.to_string(),
-                        )
-                        .err(expr.1);
-                    }
-                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
-                };
-
-                if !PRINT_ARG_TYPES.contains(ty) && !matches!(ty, Type::Enum(_)) {
-                    return CodeError::IntrisicArgumentType(
-                        "print",
-                        &PRINT_ARG_TYPE_NAMES,
-                        ty.to_string(),
-                    )
-                    .err(expr.1);
-                }
-
-                let value = self
-                    .get_value(value)
-                    .expect("ssa or stack slot print argument must produce a value");
-
-                Ok(ExprValue::Ssa(value.0, value.1))
-            })
-            .collect_all()
-            .map_err(|errors| errors.into_iter().flatten().collect::<ManyErrors>())?;
-
-        if arg_values.iter().any(|value| *value == ExprValue::Never) {
-            return Ok(ExprValue::Never);
-        }
-
-        if arg_values.iter().any(|value| *value == ExprValue::Error) {
-            return Ok(ExprValue::Error);
-        }
-
-        let arg_values = arg_values
-            .into_iter()
-            .map(|value| match value {
-                ExprValue::Ssa(value, ty) => (value, ty),
-                ExprValue::Slot(..) | ExprValue::Addr(..) => {
-                    unreachable!("print args were materialized above")
-                }
-                ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
-            })
+            .cloned()
+            .map(|arg| self.abi_value(arg))
             .collect::<Vec<_>>();
-
-        let value = self.build_expression(&format_string_arg, None)?;
-        let format_string_value = self
-            .get_value(value)
-            .expect("string literal must produce a value");
-        debug_assert_eq!(format_string_value.1, Type::String);
 
         // Because printf is a variadic function we have to change it's signature on the fly
         // See: adjust_call_for_c_variadic() in rustc_codegen_cranelift
@@ -1642,22 +1714,25 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         let result = self.builder.ins().call(printf_ref, &call_args);
 
         let value = self.builder.func.dfg.inst_results(result)[0];
-        // TODO: Type::I32
-        Ok(ExprValue::Ssa(value, Type::I32))
+        GenValue::Ssa(value, Type::I32)
     }
 
-    fn new_var(&mut self, name: String, slot: StackSlot, ty: Type) {
+    fn new_stack_slot(&mut self, local_id: LocalId, slot: StackSlot) {
+        self.local_storage.insert(local_id, slot);
+    }
+
+    /*fn new_var(&mut self, name: String, slot: StackSlot, ty: Type) {
         self.state
             .current_scope
             .insert_symbol(name, Symbol::Variable(slot, ty))
             .expect("Variable must not exist.");
         self.var_count += 1;
-    }
+    }*/
 
-    fn new_error_var(&mut self, name: String) {
-        let slot = self.stack_slot_for_type(&Type::I32);
+    /*fn new_error_var(&mut self, name: String) {
+        let slot = self.new_stack_slot_for_local(&Type::I32);
         self.new_var(name, slot, Type::Error);
-    }
+    }*/
 
     fn switch_to_recovery_block(&mut self) {
         let block = self.builder.create_block();
@@ -1678,7 +1753,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         }
     }
 
-    // TODO: add clif comments to blocks
+    /* // TODO: add clif comments to blocks
     fn build_if(
         &mut self,
         if_expr: &If,
@@ -1925,9 +2000,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
             Type::Struct(_) => ExprValue::Addr(self.builder.block_params(exit_block)[0], expr_type),
             _ => ExprValue::Ssa(self.builder.block_params(exit_block)[0], expr_type),
         })
-    }
+    }*/
 
-    fn build_while(&mut self, conditional: &Conditional) -> Result<bool, ManyErrors> {
+    /* fn build_while(&mut self, conditional: &Conditional) -> Result<bool, ManyErrors> {
         let Conditional { condition, block } = conditional;
 
         let while_block = self.builder.create_block();
@@ -1979,9 +2054,9 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.builder.seal_block(exit_block);
 
         Ok(false)
-    }
+    }*/
 
-    fn build_block_body(
+    /* fn build_block_body(
         &mut self,
         body: &[Spanned<Statement>],
         try_into_type: Option<Type>,
@@ -1995,47 +2070,12 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         };
 
         result
-    }
+    }*/
 
-    fn build_assert(
-        &mut self,
-        span: &SimpleSpan,
-        args: &[Spanned<Expression>],
-    ) -> Result<ExprValue, ManyErrors> {
-        if args.len() != 1 {
-            return CodeError::IntrinsicArgumentCount("assert", 1, args.len()).err(*span);
-        }
-
-        let condition = match self.build_expression(&args[0], None)? {
-            ExprValue::Never => {
-                return Ok(ExprValue::Never);
-            }
-            ExprValue::Error => {
-                return Ok(ExprValue::Error);
-            }
-            ExprValue::Void => {
-                return CodeError::IntrisicArgumentType(
-                    "assert",
-                    &["bool"],
-                    Type::Void.to_string(),
-                )
-                .err(args[0].1);
-            }
-            condition => {
-                let ty = match &condition {
-                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
-                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
-                };
-
-                if !can_coerce_type(ty, &Type::Bool) {
-                    return CodeError::IntrisicArgumentType("assert", &["bool"], ty.to_string())
-                        .err(args[0].1);
-                }
-
-                self.get_value(condition)
-                    .expect("ssa or stack slot condition must produce a value")
-            }
-        };
+    fn build_assert(&mut self, mut args: Vec<GenValue>) {
+        debug_assert_eq!(args.len(), 1);
+        let value = self.scalar_value(args.pop().expect("must have value"));
+        debug_assert_eq!(value.1, Type::Bool);
 
         let exit_code = self.builder.ins().iconst(types::I32, 1);
 
@@ -2050,7 +2090,7 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
 
         self.builder
             .ins()
-            .brif(condition.0, continue_block, [], exit_block, []);
+            .brif(value.0, continue_block, [], exit_block, []);
 
         self.builder.seal_block(exit_block);
         self.builder.seal_block(continue_block);
@@ -2060,90 +2100,32 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
         self.builder.ins().trap(UNREACHABLE);
 
         self.builder.switch_to_block(continue_block);
-
-        Ok(ExprValue::Void)
     }
 
-    fn build_exit(
-        &mut self,
-        span: &SimpleSpan,
-        args: &[Spanned<Expression>],
-    ) -> Result<ExprValue, ManyErrors> {
-        if args.len() != 1 {
-            return CodeError::IntrinsicArgumentCount("exit", 1, args.len()).err(*span);
-        }
-
-        let expr = match self.build_expression(&args[0], Some(Type::I32))? {
-            ExprValue::Never => return Ok(ExprValue::Never),
-            ExprValue::Error => return Ok(ExprValue::Error),
-            ExprValue::Void => {
-                return CodeError::IntrisicArgumentType("exit", &["i32"], Type::Void.to_string())
-                    .err(args[0].1);
-            }
-            expr => {
-                let ty = match &expr {
-                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
-                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
-                };
-
-                if !can_coerce_type(ty, &Type::I32) {
-                    return CodeError::IntrisicArgumentType("exit", &["i32"], ty.to_string())
-                        .err(args[0].1);
-                }
-
-                self.get_value(expr)
-                    .expect("ssa or stack slot exit code must produce a value")
-            }
-        };
+    fn build_exit(&mut self, mut args: Vec<GenValue>) {
+        debug_assert_eq!(args.len(), 1);
+        let value = self.scalar_value(args.pop().expect("must have value"));
+        debug_assert_eq!(value.1, Type::I32);
 
         let exit_ref = self
             .state
             .module
             .declare_func_in_func(self.state.exit_id, self.builder.func);
 
-        self.builder.ins().call(exit_ref, &[expr.0]);
-        self.builder.ins().trap(UNREACHABLE);
-        Ok(ExprValue::Never)
+        self.builder.ins().call(exit_ref, &[value.0]);
     }
 
-    fn build_enum_to_int(
-        &mut self,
-        span: &SimpleSpan,
-        args: &[Spanned<Expression>],
-    ) -> Result<ExprValue, ManyErrors> {
-        if args.len() != 1 {
-            return CodeError::IntrinsicArgumentCount("enumToInt", 1, args.len()).err(*span);
-        }
+    fn build_enum_to_int(&mut self, mut args: Vec<GenValue>) -> GenValue {
+        debug_assert_eq!(args.len(), 1);
+        let value = self.scalar_value(args.pop().expect("must have value"));
+        debug_assert!(matches!(value.1, Type::Enum(_)));
 
-        let expr = match self.build_expression(&args[0], None)? {
-            ExprValue::Never => return Ok(ExprValue::Never),
-            ExprValue::Error => return Ok(ExprValue::Error),
-            ExprValue::Void => {
-                return CodeError::IntrinsicExpectedEnum("enumToInt", Type::Void.to_string())
-                    .err(args[0].1);
-            }
-            expr => {
-                let ty = match &expr {
-                    ExprValue::Ssa(_, ty) | ExprValue::Slot(_, ty) | ExprValue::Addr(_, ty) => ty,
-                    ExprValue::Never | ExprValue::Error | ExprValue::Void => unreachable!(),
-                };
-
-                if !matches!(ty, Type::Enum(_)) {
-                    return CodeError::IntrinsicExpectedEnum("enumToInt", ty.to_string())
-                        .err(args[0].1);
-                }
-
-                self.get_value(expr)
-                    .expect("ssa or stack slot enum value must produce a value")
-            }
-        };
-
-        Ok(ExprValue::Ssa(expr.0, Type::I32))
+        GenValue::Ssa(value.0, Type::I32)
     }
 }
 
 impl GeneratorState<'_> {
-    pub(crate) fn push_scope(&mut self) {
+    /* pub(crate) fn push_scope(&mut self) {
         let old_scope = std::mem::replace(&mut self.current_scope, Scope::new());
         self.current_scope.parent = Some(Box::new(old_scope));
     }
@@ -2155,11 +2137,11 @@ impl GeneratorState<'_> {
         } else {
             None
         }
-    }
+    }*/
 
     // Declare a function's signature in the module
     // Does not build the body — call build_fn_body separately for that.
-    fn make_function_symbol(
+    /*fn make_function_symbol(
         &mut self,
         decl: &FunctionDecl,
         span: &SimpleSpan,
@@ -2317,9 +2299,9 @@ impl GeneratorState<'_> {
             .expect("Function must be declarable.");
 
         Ok(Symbol::Function(func_id, func_type))
-    }
+    }*/
 
-    pub(crate) fn pre_declare_fn(
+    /*pub(crate) fn pre_declare_fn(
         &mut self,
         decl: &FunctionDecl,
         span: &SimpleSpan,
@@ -2352,9 +2334,9 @@ impl GeneratorState<'_> {
             .expect("Must not overwrite symbol");
 
         Ok(())
-    }
+    }*/
 
-    fn pre_declare_assoc_fn(
+    /*fn pre_declare_assoc_fn(
         &mut self,
         owner: TypeId,
         owner_name: &str,
@@ -2388,49 +2370,30 @@ impl GeneratorState<'_> {
             .insert(decl.name.clone(), symbol);
 
         Ok(())
-    }
+    }*/
 
-    // Build a function's body. The function must already be pre-declared in scope via pre_declare_fn.
-    fn build_fn_body_with_symbol(
+    fn build_fn_body(
         &mut self,
-        decl: &FunctionDecl,
-        func_id: FuncId,
-        func_type: FuncType,
-        span: &SimpleSpan,
-        main_implicit_zero: bool,
-    ) -> Result<(), ManyErrors> {
-        if decl.r#extern {
-            return Ok(());
-        }
-
-        let FunctionDecl { params, body, .. } = decl;
-
-        // Reconstruct fn_params from decl names + func_type resolved types.
-        // TODO: do we need to reconstruct or can we just pass is through?
-        let mut fn_params: Vec<(String, Type, ArgumentPurpose)> = params
+        lower_func_id: LowerFuncId,
+        function: &MirFunction,
+    ) -> Result<(), GeneratorErrors> {
+        let mut fn_params: Vec<(LocalId, Type, ArgumentPurpose)> = function
+            .params
             .iter()
-            .zip(func_type.params.iter())
-            .map(|(param, param_type)| {
-                // is_extern is always false here, so purpose is always Normal
-                (
-                    param.name.0.clone(),
-                    param_type.clone(),
-                    ArgumentPurpose::Normal,
-                )
-            })
+            .zip(function.ty.params.iter())
+            .map(|(local, param_type)| (*local, param_type.clone(), ArgumentPurpose::Normal))
             .collect();
 
         // Add implicit @return_addr parameter for struct return values.
-        if let Type::Struct(_) = &*func_type.return_type {
+        if let return_type @ Type::Struct(_) = &*function.ty.return_type {
             fn_params.push((
-                "@return_addr".to_owned(),
-                (*func_type.return_type).clone(),
+                LocalId(usize::MAX),
+                return_type.clone(),
                 ArgumentPurpose::StructReturn,
-            ));
+            )); // TODO: usize::MAX is not very clean
         }
 
-        // Reconstruct the signature (must match what was declared in pre_declare_fn).
-        let returns = match &*func_type.return_type {
+        let returns = match &*function.ty.return_type {
             Type::Void | Type::Never | Type::Struct(_) => Vec::new(),
             return_type => vec![
                 self.get_extern_abi_param(return_type)
@@ -2441,10 +2404,9 @@ impl GeneratorState<'_> {
             call_conv: self.isa.default_call_conv(),
             params: fn_params
                 .iter()
-                .map(|(_, r#type, purpose)| {
-                    let mut abi_param: AbiParam = self
-                        .get_abi_param(r#type)
-                        .expect("Param type must be valid.");
+                .map(|(_, ty, purpose)| {
+                    let mut abi_param: AbiParam =
+                        self.get_abi_param(ty).expect("Param type must be valid.");
                     abi_param.purpose = *purpose;
                     abi_param
                 })
@@ -2458,27 +2420,30 @@ impl GeneratorState<'_> {
 
         fn_builder.func.signature = signature;
 
-        let entry_block = fn_builder.create_block();
+        let crane_blocks: Vec<Block> = function
+            .blocks
+            .iter()
+            .map(|_| fn_builder.create_block())
+            .collect();
+        let entry_block = crane_blocks[function.entry.0];
         fn_builder.append_block_params_for_function_params(entry_block);
         fn_builder.switch_to_block(entry_block);
-        fn_builder.seal_block(entry_block);
-
-        let mut errors = ManyErrors::new();
-
-        // Move current scope into a child function scope.
-        let outer_scope = std::mem::replace(&mut self.current_scope, Scope::new());
-        self.current_scope = outer_scope.function_scope();
 
         let mut fn_generator = FnGenerator {
             state: self,
             builder: fn_builder,
             var_count: 0,
-            current_func_type: func_type.clone(),
+            current_func_type: function.ty.clone(),
             return_dest: None,
-            result_span: None,
+            local_storage: HashMap::new(),
+            crane_blocks,
         };
 
-        for (i, (param_name, param_type, purpose)) in fn_params.iter().enumerate() {
+        for (idx, local) in function.locals.iter().enumerate() {
+            fn_generator.new_stack_slot_for_local(LocalId(idx), &local.ty);
+        }
+
+        for (i, (local_id, param_type, purpose)) in fn_params.iter().enumerate() {
             let param_value = fn_generator.builder.block_params(entry_block)[i];
 
             let storage_type = if *purpose == ArgumentPurpose::StructReturn {
@@ -2486,82 +2451,33 @@ impl GeneratorState<'_> {
             } else {
                 param_type.clone()
             };
-            let slot = fn_generator.stack_slot_for_type(&storage_type);
-            fn_generator.store_to_slot(slot, &storage_type, param_value);
-            fn_generator.new_var(param_name.clone(), slot, storage_type);
 
-            if *purpose == ArgumentPurpose::StructReturn {
+            let slot = if *purpose == ArgumentPurpose::StructReturn {
+                let slot = fn_generator.new_stack_slot_for_local(*local_id, &storage_type);
                 debug_assert!(fn_generator.return_dest.is_none());
                 fn_generator.return_dest = Some(slot);
-            }
+                slot
+            } else {
+                *fn_generator
+                    .local_storage
+                    .get(local_id)
+                    .expect("param local must have stack slot")
+            };
+
+            fn_generator.store_to_slot(slot, &storage_type, param_value);
         }
 
-        match fn_generator.build_statements(body, Some(*func_type.return_type.clone())) {
-            Err(mut new_errors) => {
-                errors.append(&mut new_errors);
-            }
-            Ok(ExprValue::Never | ExprValue::Error) => {}
-            Ok(value @ ExprValue::Void) if *func_type.return_type == Type::Void => {
-                if let Err(mut new_errors) = fn_generator.build_return_value(value, *span) {
-                    errors.append(&mut new_errors);
-                }
-            }
-            Ok(ExprValue::Void) if main_implicit_zero => {
-                let zero = fn_generator.builder.ins().iconst(types::I32, 0);
-                fn_generator.builder.ins().return_(&[zero]);
-            }
-            Ok(ExprValue::Void) => errors.push(CodeError::MissingReturnStatement.spanned(*span)),
-            Ok(value) => {
-                let result_span = fn_generator.result_span.unwrap_or(*span);
-                if let Err(mut new_errors) = fn_generator.build_return_value(value, result_span) {
-                    errors.append(&mut new_errors);
-                }
-            }
-        }
+        fn_generator.build_blocks(&function);
 
-        if fn_generator.state.verbose {
-            println!("{}", fn_generator.builder.func.display());
-        }
-
-        // fn_generator dropped here, releasing the &mut self borrow.
-        drop(fn_generator);
-
-        // Restore the outer scope from the function scope's parent.
-        self.current_scope = *self
-            .current_scope
-            .parent
-            .take()
-            .expect("fn scope must have parent");
-
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-
+        fn_generator.builder.finalize();
         self.module
-            .define_function(func_id, &mut fn_context)
-            .unwrap();
+            .define_function(self.crane_functions[&lower_func_id], &mut fn_context)
+            .map_err(|err| GeneratorErrors::ModuleErrors(vec![err]))?;
+        self.module.clear_context(&mut fn_context);
 
         Ok(())
     }
-
-    fn build_fn_body(
-        &mut self,
-        decl: &FunctionDecl,
-        span: &SimpleSpan,
-        is_top_level: bool,
-    ) -> Result<(), ManyErrors> {
-        let (func_id, func_type) = self
-            .current_scope
-            .get_function(&decl.name)
-            .map(|(id, ft)| (id, ft.clone()))
-            .expect("Function must be pre-declared before building its body");
-
-        let main_implicit_zero =
-            is_top_level && !decl.r#extern && decl.name == "main" && decl.return_type.is_none();
-
-        self.build_fn_body_with_symbol(decl, func_id, func_type, span, main_implicit_zero)
-    }
-
+    /*
     fn build_assoc_fn_body(
         &mut self,
         owner: TypeId,
@@ -2580,15 +2496,15 @@ impl GeneratorState<'_> {
         };
 
         self.build_fn_body_with_symbol(decl, unreachable!("func_id"), func_type, span, false)
-    }
+    }*/
 
     // Used for nested function declarations inside function bodies (single-pass is fine there).
-    fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
+    /*fn build_fn_decl(&mut self, decl: &FunctionDecl, span: &SimpleSpan) -> Result<(), ManyErrors> {
         self.pre_declare_fn(decl, span, false)?;
         self.build_fn_body(decl, span, false)
-    }
+    }*/
 
-    fn type_from_path(&self, path: &[Spanned<String>]) -> Option<Type> {
+    /*fn type_from_path(&self, path: &[Spanned<String>]) -> Option<Type> {
         if path.len() == 1 {
             return self.type_from_name(&path[0].0, false);
         }
@@ -2631,11 +2547,90 @@ impl GeneratorState<'_> {
         } else {
             r#type
         })
-    }
+    }*/
 }
 
 impl FnGenerator<'_, '_> {
-    fn build_call_arg(
+    pub fn build_blocks(&mut self, function: &MirFunction) {
+        for block in &function.blocks {
+            let crane_block = self.crane_blocks[block.id.0];
+            if self.builder.current_block() != Some(crane_block) {
+                self.builder.switch_to_block(crane_block);
+            }
+            self.build_block(&block);
+        }
+        self.builder.seal_all_blocks();
+    }
+
+    pub fn build_block(&mut self, block: &BasicBlock) {
+        let BasicBlock {
+            statements,
+            terminator,
+            ..
+        } = block;
+
+        for statement in statements {
+            self.build_statement(statement);
+        }
+
+        match terminator {
+            MirTerminator::Return(Some(operand)) => {
+                let (value, ty) = self.build_operand(operand);
+
+                match &ty {
+                    Type::Void => {
+                        unreachable!(
+                            "void must be handled above. Ok im actually unsure about that. We'll see."
+                        )
+                    }
+                    Type::Struct(struct_id) => {
+                        let return_dest = self
+                            .return_dest
+                            .expect("Return destination must be valid when returning struct.");
+
+                        let return_dest = self.stack_slot_addr(return_dest);
+                        let return_dest = self.builder.ins().load(
+                            self.state.isa.pointer_type(),
+                            MemFlags::trusted(),
+                            return_dest,
+                            0,
+                        );
+                        self.copy_struct_value(*struct_id, value, return_dest);
+                        self.builder.ins().return_(&[]);
+                    }
+                    _ => {
+                        self.builder.ins().return_(&[value]);
+                    }
+                }
+            }
+            MirTerminator::Return(None) => {
+                self.builder.ins().return_(&[]);
+            }
+            MirTerminator::Jump(block_id) => {
+                self.builder.ins().jump(self.crane_blocks[block_id.0], []);
+            }
+            MirTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let (cond, ty) = self.build_scalar_operand(cond);
+                debug_assert_eq!(ty, Type::Bool);
+                self.builder.ins().brif(
+                    cond,
+                    self.crane_blocks[then_block.0],
+                    [],
+                    self.crane_blocks[else_block.0],
+                    [],
+                );
+            }
+            MirTerminator::Unreachable => {
+                self.builder.ins().trap(UNREACHABLE);
+            }
+        }
+    }
+
+    /* fn build_call_arg(
         &mut self,
         callee_name: &str,
         arg: &Spanned<Arg>,
@@ -2687,9 +2682,53 @@ impl FnGenerator<'_, '_> {
                 .get_value(value)
                 .expect("ssa or stack slot function argument must produce a value"))
         }
+    }*/
+
+    fn build_fn_call(&mut self, callee: &MirCallee, args: &[Operand]) -> Option<GenValue> {
+        let func = self.state.function_types[&callee.0].clone();
+
+        let mut arg_values: Vec<Value> = args
+            .iter()
+            .zip(func.params.iter())
+            .map(|(arg, param_ty)| self.build_call_arg(arg, param_ty))
+            .collect();
+
+        let return_slot = if let Type::Struct(struct_id) = &*func.return_type {
+            let (size, align_shift) = self.state.types.layout(&Type::Struct(*struct_id));
+            if func.is_extern {
+                todo!("Extern return structs.");
+            }
+            let stack_slot_data =
+                StackSlotData::new(StackSlotKind::ExplicitSlot, size, align_shift);
+            let stack_slot = self.builder.create_sized_stack_slot(stack_slot_data);
+
+            let struct_addr = self.builder.ins().stack_addr(types::I64, stack_slot, 0);
+            arg_values.push(struct_addr);
+
+            Some(stack_slot)
+        } else {
+            None
+        };
+
+        let func_ref = self
+            .state
+            .module
+            .declare_func_in_func(self.state.crane_functions[&callee.0], self.builder.func);
+        let inst = self.builder.ins().call(func_ref, &arg_values);
+        match self.builder.inst_results(inst) {
+            // Struct return
+            [] if *func.return_type != Type::Void => {
+                let addr =
+                    self.stack_slot_addr(return_slot.expect("struct return slot must be defined"));
+                Some(GenValue::Addr(addr, (*func.return_type).clone()))
+            }
+            [] => None,
+            [value] => Some(GenValue::Ssa(*value, (*func.return_type).clone())),
+            _ => panic!("Invalid number of return values. Must be 0 or 1."),
+        }
     }
 
-    fn build_fn_call(
+    /*fn build_fn_call_old(
         &mut self,
         callee: &Spanned<Expression>,
         args: &[Spanned<Arg>],
@@ -2814,10 +2853,11 @@ impl FnGenerator<'_, '_> {
             [value] => Ok(ExprValue::Ssa(*value, *func_type.return_type)),
             _ => panic!("Invalid number of return values. Must be 0 or 1."),
         }
-    }
+    }*/
 }
 
 impl GeneratorState<'_> {
+    /*
     pub fn declare_struct(&mut self, decl: &StructDecl) -> Result<TypeId, ManyErrors> {
         let mut errors = ManyErrors::new();
 
@@ -2848,7 +2888,7 @@ impl GeneratorState<'_> {
             fields.insert(
                 name.0.clone(),
                 StructField {
-                    r#type: field_type,
+                    ty: field_type,
                     offset: current_offset,
                 },
             );
@@ -2946,7 +2986,7 @@ impl GeneratorState<'_> {
     fn build_enum_decl(&mut self, decl: &EnumDecl) -> Result<(), ManyErrors> {
         self.declare_enum(decl)?;
         Ok(())
-    }
+    }*/
 
     fn get_extern_abi_param(&self, r#type: &Type) -> Option<AbiParam> {
         let mut purpose = ArgumentPurpose::Normal;
@@ -2999,7 +3039,7 @@ impl GeneratorState<'_> {
     }
 }
 
-fn expr_callee_name(expr: &Expression) -> String {
+/* fn expr_callee_name(expr: &Expression) -> String {
     match expr {
         Expression::Identifier(name) => name.clone(),
         Expression::MemberAccess(base, member) => {
@@ -3011,17 +3051,11 @@ fn expr_callee_name(expr: &Expression) -> String {
 
 fn combine_spans(a: SimpleSpan, b: SimpleSpan) -> SimpleSpan {
     SimpleSpan::new(a.context, a.start..b.end)
-}
+} */
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use luga_syntax::parse_source;
-
-    use super::*;
-
-    fn generation_errors(src: &str) -> ManyErrors {
+    /*fn generation_errors(src: &str) -> ManyErrors {
         let path = Path::new("test.luga");
         let program = parse_source(src, false)
             .unwrap_or_else(|err| panic!("test source must parse: {}", err.short_reason()));
@@ -3054,9 +3088,9 @@ mod tests {
         let errors = generation_errors(
             r#"
 fn main() {
-    var bad = "x" + 1;
-    return bad;
-    @println("after");
+	var bad = "x" + 1;
+	return bad;
+	@println("after");
 }
 "#,
         );
@@ -3069,13 +3103,13 @@ fn main() {
         let errors = generation_errors(
             r#"
 fn main() {
-    var bad = "x" + 1;
-    if bad then {
-        @println("then");
-    } else {
-        return 0;
-    }
-    @println("after");
+	var bad = "x" + 1;
+	if bad then {
+		@println("then");
+	} else {
+		return 0;
+	}
+	@println("after");
 }
 "#,
         );
@@ -3091,9 +3125,9 @@ fn needs_ref(ref value: i32) {
 }
 
 fn main() {
-    var value = 1;
-    var poisoned = needs_ref(value);
-    needs_ref(ref poisoned);
+	var value = 1;
+	var poisoned = needs_ref(value);
+	needs_ref(ref poisoned);
 }
 "#,
         );
@@ -3103,5 +3137,5 @@ fn main() {
                 .iter()
                 .any(|Spanned(error, _)| matches!(error, CodeError::ExpectedRefArgument))
         );
-    }
+    }*/
 }

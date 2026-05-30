@@ -1,7 +1,9 @@
 use luga_syntax::parser::{BinOp, UnOp};
 
 use crate::lower_state::LowerFuncId;
-use crate::types::{Type, TypeId};
+use crate::types::{FuncType, Type, TypeContext, TypeId};
+use indexmap::IndexMap;
+use luga_syntax::Intrinsic;
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display, Write},
@@ -9,8 +11,10 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct MirProgram {
-    pub functions: HashMap<LowerFuncId, MirFunction>,
+    pub functions: IndexMap<LowerFuncId, MirFunction>,
+    pub function_types: IndexMap<LowerFuncId, FuncType>,
     pub main_func_id: LowerFuncId,
+    pub types: TypeContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,7 +33,7 @@ pub struct MirFunction {
     pub locals: Vec<MirLocal>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
-    pub return_type: Type,
+    pub ty: FuncType,
     pub type_names: HashMap<TypeId, String>,
 }
 
@@ -50,6 +54,7 @@ pub enum LocalKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicBlock {
+    pub id: BlockId,
     pub label: Option<String>,
     pub statements: Vec<MirStatement>,
     pub terminator: MirTerminator,
@@ -71,23 +76,23 @@ pub enum Rvalue {
     },
     Unary {
         op: UnOp,
-        value: Operand,
+        operand: Operand,
     },
     Call {
         callee: MirCallee,
         args: Vec<Operand>,
     },
     Intrinsic {
-        intrinsic: MirIntrinsic,
+        intrinsic: Intrinsic,
         args: Vec<Operand>,
     },
     StructInit {
-        ty: Type,
+        ty: TypeId,
         fields: Vec<(FieldId, Operand)>,
     },
     EnumVariant {
-        ty: Type,
-        variant: String,
+        ty: TypeId,
+        value: u32,
     },
 }
 
@@ -106,24 +111,24 @@ pub enum MirTerminator {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Place(Place),
-    Const(MirConst),
+    Const(MirConst, Type),
+}
+
+impl Operand {
+    pub fn ty(&self) -> &Type {
+        match self {
+            Operand::Place(place) => place.ty(),
+            Operand::Const(_, ty) => ty,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirConst {
     Bool(bool),
     Float(f32),
-    Int(i64),
+    Integer(i64),
     String(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MirIntrinsic {
-    Print,
-    Println,
-    Assert,
-    Exit,
-    EnumToInt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +136,7 @@ pub enum Place {
     Local(LocalId, Type),
     Field {
         base: Box<Place>,
-        field: FieldId,
+        field_id: FieldId,
         ty: Type,
     },
     Deref {
@@ -148,10 +153,7 @@ impl Place {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum MirCallee {
-    Function(LowerFuncId),
-    Operand(Operand),
-}
+pub struct MirCallee(pub LowerFuncId);
 
 impl Display for MirFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -166,7 +168,7 @@ impl Display for MirFunction {
             f,
             "fn {}({params}) -> {} {{",
             self.name,
-            self.fmt_type(&self.return_type)
+            self.fmt_type(&self.ty.return_type)
         )?;
 
         let mut assigned_locals = HashSet::new();
@@ -235,7 +237,7 @@ impl MirFunction {
     fn fmt_rvalue(&self, f: &mut fmt::Formatter<'_>, rvalue: &Rvalue) -> fmt::Result {
         match rvalue {
             Rvalue::StructInit { ty, fields } => {
-                write!(f, "{} {{ ", self.fmt_type(ty))?;
+                write!(f, "{} {{ ", self.fmt_type(&Type::Struct(*ty)))?;
                 for (idx, (field, operand)) in fields.iter().enumerate() {
                     if idx != 0 {
                         write!(f, ", ")?;
@@ -244,7 +246,7 @@ impl MirFunction {
                 }
                 write!(f, " }}")
             }
-            Rvalue::EnumVariant { ty, variant } => write!(f, "{}.{variant}", self.fmt_type(ty)),
+            Rvalue::EnumVariant { value, .. } => write!(f, ".{value}"),
             rvalue => write!(f, "{rvalue}"),
         }
     }
@@ -297,13 +299,13 @@ impl Display for Rvalue {
         match self {
             Rvalue::Use(operand) => write!(f, "{operand}"),
             Rvalue::Binary { op, left, right } => write!(f, "{left} {op} {right}"),
-            Rvalue::Unary { op, value } => write!(f, "{op}{value}"),
+            Rvalue::Unary { op, operand: value } => write!(f, "{op}{value}"),
             Rvalue::Call { callee, args } => write!(f, "call {callee}({})", display_list(args)),
             Rvalue::Intrinsic { intrinsic, args } => {
                 write!(f, "@{intrinsic}({})", display_list(args))
             }
             Rvalue::StructInit { ty, fields } => {
-                write!(f, "{ty} {{ ")?;
+                write!(f, "{} {{ ", Type::Struct(*ty))?;
                 for (idx, (field, operand)) in fields.iter().enumerate() {
                     if idx != 0 {
                         write!(f, ", ")?;
@@ -312,7 +314,7 @@ impl Display for Rvalue {
                 }
                 write!(f, " }}")
             }
-            Rvalue::EnumVariant { ty, variant } => write!(f, "{ty}.{variant}"),
+            Rvalue::EnumVariant { value, .. } => write!(f, ".{value}"),
         }
     }
 }
@@ -337,7 +339,7 @@ impl Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Operand::Place(place) => write!(f, "{place}"),
-            Operand::Const(value) => write!(f, "{value}"),
+            Operand::Const(value, _) => write!(f, "{value}"),
         }
     }
 }
@@ -347,7 +349,7 @@ impl Display for MirConst {
         match self {
             MirConst::Bool(value) => write!(f, "{value}"),
             MirConst::Float(value) => write!(f, "{value}"),
-            MirConst::Int(value) => write!(f, "{value}"),
+            MirConst::Integer(value) => write!(f, "{value}"),
             MirConst::String(value) => write!(f, "{value:?}"),
         }
     }
@@ -357,7 +359,11 @@ impl Display for Place {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Place::Local(local, _) => write!(f, "{local}"),
-            Place::Field { base, field, .. } => write!(f, "{base}.{field}"),
+            Place::Field {
+                base,
+                field_id: field,
+                ..
+            } => write!(f, "{base}.{field}"),
             Place::Deref { pointer, .. } => write!(f, "*{pointer}"),
         }
     }
@@ -381,24 +387,9 @@ impl Display for FieldId {
     }
 }
 
-impl Display for MirIntrinsic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MirIntrinsic::Print => write!(f, "print"),
-            MirIntrinsic::Println => write!(f, "println"),
-            MirIntrinsic::Assert => write!(f, "assert"),
-            MirIntrinsic::Exit => write!(f, "exit"),
-            MirIntrinsic::EnumToInt => write!(f, "enumToInt"),
-        }
-    }
-}
-
 impl Display for MirCallee {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MirCallee::Function(func_id) => write!(f, "{func_id:?}"),
-            MirCallee::Operand(operand) => write!(f, "{operand}"),
-        }
+        write!(f, "{:?}", self.0)
     }
 }
 

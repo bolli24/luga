@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use ariadne::Source;
-use cranelift::codegen::verifier::VerifierError;
+use cranelift::module::ModuleError;
 use luga_syntax::{
     BinOp, ParseFailure, SimpleSpan, Spanned, UnOp, lexer::LexingError, parsing::report_error,
 };
@@ -188,8 +188,7 @@ impl std::ops::DerefMut for ManyErrors {
 }
 
 pub enum GeneratorErrors {
-    ModuleErrors(Vec<ModuleErrors>),
-    VerifierErrors(Vec<VerifierError>),
+    ModuleErrors(Vec<ModuleError>),
     MissingMain,
 }
 

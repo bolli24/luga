@@ -2,11 +2,12 @@
 
 use ariadne::Source;
 use luga::errors::report_compile_errors;
-use luga::{LowerErrors, check_file, diagnostic_path};
+use luga::{GeneratorErrors, LowerErrors, check_file, diagnostic_path};
 use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
 
 use colored::Colorize;
+use luga::generator::generate;
 use luga::lower_state::lower_ast;
 use std::fs::{self, File, create_dir_all, remove_dir_all};
 use std::io::Write;
@@ -314,12 +315,12 @@ fn build_file(
     file_path: &Path,
     output_dir: &Path,
     verbose: bool,
-    _release: bool,
-    _linker_args: &str,
-    _runtime_lib: &Path,
+    release: bool,
+    linker_args: &str,
+    runtime_lib: &Path,
 ) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
-    let _output_file = output_dir.join(base_name);
+    let output_file = output_dir.join(base_name);
 
     let src = fs::read_to_string(file_path)
         .map_err(|err| BuildError::Io(file_path.to_path_buf(), err))?;
@@ -362,32 +363,16 @@ fn build_file(
     };
 
     if verbose {
-        for func in &mir_program.functions.values() {
+        for func in mir_program.functions.values() {
             println!("{func}");
         }
     }
 
-    println!("Lowered program to MIR. Exiting");
-    std::process::exit(0);
-
-    /* let product = match generate(mir_program, Some(file_path), &src, verbose, release) {
+    let product = match generate(mir_program, Some(file_path), release, verbose) {
         Ok(product) => product,
         Err(errors) => match errors {
-            GeneratorErrors::ModuleErrors(modules) => {
-                for module_errors in modules {
-                    let diagnostic_path = module_errors.path.as_deref().map(diagnostic_path);
-                    let src_report = Source::from(module_errors.src.as_str());
-                    report_compile_errors(
-                        diagnostic_path.as_deref(),
-                        &src_report,
-                        module_errors.errors,
-                    );
-                }
-
-                return Err(BuildError::Generator(file_path.into()));
-            }
-            GeneratorErrors::VerifierErrors(verifier_errors) => {
-                for error in verifier_errors {
+            GeneratorErrors::ModuleErrors(module_errors) => {
+                for error in module_errors {
                     // TODO: make this printing nice
                     eprintln!("{error}");
                 }
@@ -445,8 +430,7 @@ fn build_file(
         println!("Saved executable to '{}'", exe_file.display());
     }
 
-
-    Ok(exe_file)*/
+    Ok(exe_file)
 }
 
 fn clean() -> Result<(), ()> {

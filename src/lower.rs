@@ -1,20 +1,21 @@
-use std::collections::HashMap;
 use luga_syntax::{
     BinOp, Expression, FunctionDecl, If, Intrinsic, SimpleSpan, Span, Spanned, Statement,
     StructDecl, StructInit, UnOp, parser::Arg,
 };
+use std::collections::HashMap;
 
 use crate::{
     CodeError, ManyErrors,
     mir::{
-        BasicBlock, BlockId, LocalId, LocalKind, MirCallee, MirConst, MirFunction, MirIntrinsic,
-        MirLocal, MirStatement, MirTerminator, Operand, Place, Rvalue,
+        BasicBlock, BlockId, LocalId, LocalKind, MirCallee, MirConst, MirFunction, MirLocal,
+        MirStatement, MirTerminator, Operand, Place, Rvalue,
     },
     types::{FuncType, Type, TypeId},
 };
 
 use crate::lower_scope::{LookupResult, LowerScope, LowerSymbol};
 use crate::lower_state::{LowerFuncId, LowerState};
+use crate::mir::FieldId;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleId(pub usize);
@@ -32,32 +33,35 @@ pub struct MirLowerer<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoweredValue {
-    Value { operand: Operand, ty: Type },
+    Value { operand: Operand },
     Void,
     Never,
     Error,
 }
 
 impl LoweredValue {
-    pub fn ty(&self) -> Type {
+    pub fn ty(&self) -> &Type {
         match self {
-            LoweredValue::Value { ty, .. } => ty.clone(),
-            LoweredValue::Void => Type::Void,
-            LoweredValue::Never => Type::Never,
-            LoweredValue::Error => Type::Error,
+            LoweredValue::Value { operand } => operand.ty(),
+            LoweredValue::Void => &Type::Void,
+            LoweredValue::Never => &Type::Never,
+            LoweredValue::Error => &Type::Error,
         }
     }
 
     pub fn operand(self) -> Option<Operand> {
         match self {
-            LoweredValue::Value { operand, .. } => Some(operand),
+            LoweredValue::Value { operand } => Some(operand),
             LoweredValue::Void | LoweredValue::Never | LoweredValue::Error => None,
         }
     }
 
     pub fn usable_operand(self) -> Option<(Operand, Type)> {
         match self {
-            LoweredValue::Value { operand, ty } => Some((operand, ty)),
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
+                Some((operand, ty))
+            }
             LoweredValue::Void | LoweredValue::Never | LoweredValue::Error => None,
         }
     }
@@ -91,6 +95,7 @@ impl<'state> MirLowerer<'state> {
             locals: Vec::new(),
             local_scope: LocalScope::new(),
             blocks: vec![BasicBlock {
+                id: entry,
                 label: Some("entry".to_string()),
                 statements: Vec::new(),
                 terminator: MirTerminator::Unreachable,
@@ -135,6 +140,7 @@ impl<'state> MirLowerer<'state> {
     pub fn new_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len());
         self.blocks.push(BasicBlock {
+            id,
             label: None,
             statements: Vec::new(),
             terminator: MirTerminator::Unreachable,
@@ -145,6 +151,7 @@ impl<'state> MirLowerer<'state> {
     pub fn new_block_labelled(&mut self, label: impl Into<String>) -> BlockId {
         let id = BlockId(self.blocks.len());
         self.blocks.push(BasicBlock {
+            id,
             label: Some(label.into()),
             statements: Vec::new(),
             terminator: MirTerminator::Unreachable,
@@ -157,7 +164,7 @@ impl<'state> MirLowerer<'state> {
         self.current_block = block;
     }
 
-    pub fn finish(self, name: String, params: Vec<LocalId>, return_type: Type) -> MirFunction {
+    pub fn finish(self, name: String, params: Vec<LocalId>, func_type: FuncType) -> MirFunction {
         let type_names = self
             .state
             .types
@@ -173,7 +180,7 @@ impl<'state> MirLowerer<'state> {
             locals: self.locals,
             blocks: self.blocks,
             entry: BlockId(0),
-            return_type,
+            ty: func_type,
             type_names,
         }
     }
@@ -359,14 +366,16 @@ impl<'state> MirLowerer<'state> {
                 self.set_terminator(MirTerminator::Return(None));
             }
             Ok((LoweredValue::Void, _)) if main_implicit_zero => {
-                self.set_terminator(MirTerminator::Return(Some(Operand::Const(MirConst::Int(
-                    0,
-                )))));
+                self.set_terminator(MirTerminator::Return(Some(Operand::Const(
+                    MirConst::Integer(0),
+                    Type::I32,
+                ))));
             }
             Ok((LoweredValue::Void, _)) => {
                 errors.push(CodeError::MissingReturnStatement.spanned(*span));
             }
-            Ok((LoweredValue::Value { operand, ty }, _)) => {
+            Ok((LoweredValue::Value { operand }, _)) => {
+                let ty = operand.ty().clone();
                 if !can_coerce_type(&ty, &return_type) {
                     errors.push(
                         CodeError::InvalidReturnType(return_type.to_string(), ty.to_string())
@@ -380,7 +389,8 @@ impl<'state> MirLowerer<'state> {
 
         if errors.is_empty() {
             let nested_functions = std::mem::take(&mut self.nested_functions);
-            let mut functions = HashMap::from([(func_id, self.finish(decl.name.clone(), params, return_type))]);
+            let mut functions =
+                HashMap::from([(func_id, self.finish(decl.name.clone(), params, func_type))]);
             functions.extend(nested_functions);
             Ok(functions)
         } else {
@@ -467,8 +477,8 @@ impl<'state> MirLowerer<'state> {
                         return Err(errors);
                     }
                 };
-                let (operand, ty) = match value.0 {
-                    LoweredValue::Value { operand, ty } => (operand, ty),
+                let operand = match value.0 {
+                    LoweredValue::Value { operand } => operand,
                     LoweredValue::Void => {
                         return CodeError::BindingType(Type::Void.to_string()).err(expr.1);
                     }
@@ -483,13 +493,13 @@ impl<'state> MirLowerer<'state> {
                         return Ok((
                             LoweredValue::Value {
                                 operand: Operand::Place(Place::Local(local, Type::Error)),
-                                ty: Type::Error,
                             },
                             Control::Continues,
                         ));
                     }
                 };
 
+                let ty = operand.ty();
                 let local = self.new_local(MirLocal {
                     name: Some(name.clone()),
                     kind: LocalKind::User,
@@ -501,7 +511,7 @@ impl<'state> MirLowerer<'state> {
                     .insert_symbol(name.clone(), LowerSymbol::Local(ty.clone()))
                     .expect("local binding must not already exist in scope");
                 self.push_statement(MirStatement::Assign(
-                    Place::Local(local, ty),
+                    Place::Local(local, ty.clone()),
                     Rvalue::Use(operand),
                 ));
             }
@@ -511,7 +521,8 @@ impl<'state> MirLowerer<'state> {
                 let value = self.lower_expr(expr, Some(place_type.clone()))?;
 
                 let rvalue = match value.0 {
-                    LoweredValue::Value { operand, ty } => {
+                    LoweredValue::Value { operand } => {
+                        let ty = operand.ty().clone();
                         if !can_coerce_type(&ty, place_type) {
                             return CodeError::AssignmentIncompatibleTypes(
                                 place.ty().to_string(),
@@ -595,8 +606,7 @@ impl<'state> MirLowerer<'state> {
             Expression::Identifier(_) => Ok((self.lower_place_value(expr)?, Control::Continues)),
             Expression::Float(value) => Ok((
                 LoweredValue::Value {
-                    operand: Operand::Const(MirConst::Float(*value as f32)),
-                    ty: Type::F32,
+                    operand: Operand::Const(MirConst::Float(*value as f32), Type::F32),
                 },
                 Control::Continues,
             )),
@@ -627,23 +637,20 @@ impl<'state> MirLowerer<'state> {
 
                 Ok((
                     LoweredValue::Value {
-                        operand: Operand::Const(MirConst::Int(*value)),
-                        ty: into_type,
+                        operand: Operand::Const(MirConst::Integer(*value), into_type.clone()),
                     },
                     Control::Continues,
                 ))
             }
             Expression::String(value) => Ok((
                 LoweredValue::Value {
-                    operand: Operand::Const(MirConst::String(value.clone())),
-                    ty: Type::String,
+                    operand: Operand::Const(MirConst::String(value.clone()), Type::String),
                 },
                 Control::Continues,
             )),
             Expression::Bool(value) => Ok((
                 LoweredValue::Value {
-                    operand: Operand::Const(MirConst::Bool(*value)),
-                    ty: Type::Bool,
+                    operand: Operand::Const(MirConst::Bool(*value), Type::Bool),
                 },
                 Control::Continues,
             )),
@@ -656,7 +663,10 @@ impl<'state> MirLowerer<'state> {
                 }
 
                 let (left_operand, left_type) = match left_value {
-                    LoweredValue::Value { operand, ty } => (operand, ty),
+                    LoweredValue::Value { operand } => {
+                        let ty = operand.ty().clone();
+                        (operand, ty)
+                    }
                     LoweredValue::Void => {
                         return CodeError::InvalidBinOpType(*op, Type::Void.to_string())
                             .err(expr.1);
@@ -671,7 +681,10 @@ impl<'state> MirLowerer<'state> {
                 }
 
                 let (right_operand, right_type) = match right_value {
-                    LoweredValue::Value { operand, ty } => (operand, ty),
+                    LoweredValue::Value { operand } => {
+                        let ty = operand.ty().clone();
+                        (operand, ty)
+                    }
                     LoweredValue::Void => {
                         return CodeError::InvalidBinOpType(*op, Type::Void.to_string())
                             .err(expr.1);
@@ -734,7 +747,6 @@ impl<'state> MirLowerer<'state> {
                 Ok((
                     LoweredValue::Value {
                         operand: Operand::Place(temp_place),
-                        ty: result_type,
                     },
                     Control::Continues,
                 ))
@@ -746,7 +758,8 @@ impl<'state> MirLowerer<'state> {
                 }
 
                 let operand = match value {
-                    LoweredValue::Value { operand, ty } => {
+                    LoweredValue::Value { operand } => {
+                        let ty = operand.ty().clone();
                         if ty != Type::Bool || *op != UnOp::Not {
                             return CodeError::InvalidUnOpType(*op, ty.to_string()).err(expr.1);
                         }
@@ -771,14 +784,13 @@ impl<'state> MirLowerer<'state> {
                     temp_place.clone(),
                     Rvalue::Unary {
                         op: *op,
-                        value: operand,
+                        operand: operand,
                     },
                 ));
 
                 Ok((
                     LoweredValue::Value {
                         operand: Operand::Place(temp_place),
-                        ty: Type::Bool,
                     },
                     Control::Continues,
                 ))
@@ -855,8 +867,8 @@ impl<'state> MirLowerer<'state> {
 
                 Ok(Place::Field {
                     base: Box::new(base_place),
-                    field: crate::mir::FieldId(field_index),
-                    ty: field.r#type.clone(),
+                    field_id: FieldId(field_index),
+                    ty: field.ty.clone(),
                 })
             }
             _ => CodeError::ExpectedLValue.err(target.1),
@@ -876,7 +888,6 @@ impl<'state> MirLowerer<'state> {
 
         Ok(LoweredValue::Value {
             operand: Operand::Place(place),
-            ty,
         })
     }
 
@@ -891,7 +902,10 @@ impl<'state> MirLowerer<'state> {
         }
 
         let (base_operand, base_ty) = match base_value {
-            LoweredValue::Value { operand, ty } => (operand, ty),
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
+                (operand, ty)
+            }
             LoweredValue::Void => {
                 return CodeError::UnknownField(Type::Void.to_string(), member_name.0.clone())
                     .err(member_name.1);
@@ -914,7 +928,7 @@ impl<'state> MirLowerer<'state> {
             .fields
             .get(&member_name.0)
             .expect("field index came from same map");
-        let field_ty = field.r#type.clone();
+        let field_ty = field.ty.clone();
 
         let base_place = match base_operand {
             Operand::Place(place) => place,
@@ -937,17 +951,16 @@ impl<'state> MirLowerer<'state> {
             LoweredValue::Value {
                 operand: Operand::Place(Place::Field {
                     base: Box::new(base_place),
-                    field: crate::mir::FieldId(field_index),
+                    field_id: FieldId(field_index),
                     ty: field_ty.clone(),
                 }),
-                ty: field_ty,
             },
             Control::Continues,
         ))
     }
 
     fn lower_symbol_member_value(
-        &self,
+        &mut self,
         expr: &Spanned<Expression>,
     ) -> Result<Option<LoweredValue>, ManyErrors> {
         let Expression::MemberAccess(base, member_name) = &expr.0 else {
@@ -974,9 +987,24 @@ impl<'state> MirLowerer<'state> {
                     .err(member_name.1);
                 };
 
+                let ty = Type::Enum(enum_id);
+                let temp = self.new_local(MirLocal {
+                    name: None,
+                    ty: ty.clone(),
+                    kind: LocalKind::Temp,
+                });
+                let temp_place = Place::Local(temp, ty);
+
+                self.push_statement(MirStatement::Assign(
+                    temp_place.clone(),
+                    Rvalue::EnumVariant {
+                        ty: enum_id,
+                        value: idx as u32,
+                    },
+                ));
+
                 Ok(Some(LoweredValue::Value {
-                    operand: Operand::Const(MirConst::Int(idx as i64)),
-                    ty: Type::Enum(enum_id),
+                    operand: Operand::Place(temp_place),
                 }))
             }
             LowerSymbol::Type(Type::Struct(struct_id)) => {
@@ -1081,7 +1109,7 @@ impl<'state> MirLowerer<'state> {
             }
         }
 
-        let callee = MirCallee::Function(func_id);
+        let callee = MirCallee(func_id);
         match *func_type.return_type {
             Type::Void => {
                 self.push_statement(MirStatement::Eval(Rvalue::Call {
@@ -1117,7 +1145,6 @@ impl<'state> MirLowerer<'state> {
                 Ok((
                     LoweredValue::Value {
                         operand: Operand::Place(temp_place),
-                        ty: return_type,
                     },
                     Control::Continues,
                 ))
@@ -1149,7 +1176,6 @@ impl<'state> MirLowerer<'state> {
             Ok((
                 LoweredValue::Value {
                     operand: Operand::Place(place),
-                    ty: param_type.clone(),
                 },
                 Control::Continues,
             ))
@@ -1282,7 +1308,10 @@ impl<'state> MirLowerer<'state> {
         if new_line {
             format_string.push('\n');
         }
-        operands.push(Operand::Const(MirConst::String(format_string)));
+        operands.push(Operand::Const(
+            MirConst::String(format_string),
+            Type::String,
+        ));
 
         for arg in other_args {
             let (value, control) = self.lower_expr(arg, None)?;
@@ -1291,7 +1320,8 @@ impl<'state> MirLowerer<'state> {
             }
 
             match value {
-                LoweredValue::Value { operand, ty } => {
+                LoweredValue::Value { operand } => {
+                    let ty = operand.ty().clone();
                     if !PRINT_ARG_TYPES.contains(&ty) && !matches!(ty, Type::Enum(_)) {
                         return CodeError::IntrisicArgumentType(
                             "print",
@@ -1326,9 +1356,9 @@ impl<'state> MirLowerer<'state> {
             temp_place.clone(),
             Rvalue::Intrinsic {
                 intrinsic: if new_line {
-                    MirIntrinsic::Println
+                    Intrinsic::Println
                 } else {
-                    MirIntrinsic::Print
+                    Intrinsic::Print
                 },
                 args: operands,
             },
@@ -1337,7 +1367,6 @@ impl<'state> MirLowerer<'state> {
         Ok((
             LoweredValue::Value {
                 operand: Operand::Place(temp_place),
-                ty: Type::I32,
             },
             Control::Continues,
         ))
@@ -1358,7 +1387,8 @@ impl<'state> MirLowerer<'state> {
         }
 
         let operand = match value {
-            LoweredValue::Value { operand, ty } => {
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
                 if !can_coerce_type(&ty, &Type::Bool) {
                     return CodeError::IntrisicArgumentType("assert", &["bool"], ty.to_string())
                         .err(args[0].1);
@@ -1378,7 +1408,7 @@ impl<'state> MirLowerer<'state> {
         };
 
         self.push_statement(MirStatement::Eval(Rvalue::Intrinsic {
-            intrinsic: MirIntrinsic::Assert,
+            intrinsic: Intrinsic::Assert,
             args: vec![operand],
         }));
 
@@ -1400,7 +1430,8 @@ impl<'state> MirLowerer<'state> {
         }
 
         let operand = match value {
-            LoweredValue::Value { operand, ty } => {
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
                 if !can_coerce_type(&ty, &Type::I32) {
                     return CodeError::IntrisicArgumentType("exit", &["i32"], ty.to_string())
                         .err(args[0].1);
@@ -1416,7 +1447,7 @@ impl<'state> MirLowerer<'state> {
         };
 
         self.push_statement(MirStatement::Eval(Rvalue::Intrinsic {
-            intrinsic: MirIntrinsic::Exit,
+            intrinsic: Intrinsic::Exit,
             args: vec![operand],
         }));
         self.set_terminator(MirTerminator::Unreachable);
@@ -1439,7 +1470,8 @@ impl<'state> MirLowerer<'state> {
         }
 
         let operand = match value {
-            LoweredValue::Value { operand, ty } => {
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
                 if !matches!(ty, Type::Enum(_)) {
                     return CodeError::IntrinsicExpectedEnum("enumToInt", ty.to_string())
                         .err(args[0].1);
@@ -1464,7 +1496,7 @@ impl<'state> MirLowerer<'state> {
         self.push_statement(MirStatement::Assign(
             temp_place.clone(),
             Rvalue::Intrinsic {
-                intrinsic: MirIntrinsic::EnumToInt,
+                intrinsic: Intrinsic::EnumToInt,
                 args: vec![operand],
             },
         ));
@@ -1472,7 +1504,6 @@ impl<'state> MirLowerer<'state> {
         Ok((
             LoweredValue::Value {
                 operand: Operand::Place(temp_place),
-                ty: Type::I32,
             },
             Control::Continues,
         ))
@@ -1502,7 +1533,7 @@ impl<'state> MirLowerer<'state> {
                 .as_ref()
                 .and_then(|ty| self.state.types.struct_type(ty))
                 .and_then(|struct_type| struct_type.fields.get(&arg.0.0).cloned())
-                .map(|struct_field| struct_field.r#type);
+                .map(|struct_field| struct_field.ty);
 
             match self.lower_expr(&arg.1, expected_type) {
                 Ok((value, control)) => {
@@ -1556,14 +1587,12 @@ impl<'state> MirLowerer<'state> {
             };
 
             let operand = match value {
-                LoweredValue::Value { operand, ty } => {
-                    if !can_coerce_type(&ty, &field.r#type) {
+                LoweredValue::Value { operand } => {
+                    let ty = operand.ty().clone();
+                    if !can_coerce_type(&ty, &field.ty) {
                         errors.push(
-                            CodeError::StructInitInvalidType(
-                                field.r#type.to_string(),
-                                ty.to_string(),
-                            )
-                            .spanned(span),
+                            CodeError::StructInitInvalidType(field.ty.to_string(), ty.to_string())
+                                .spanned(span),
                         );
                         continue;
                     }
@@ -1573,7 +1602,7 @@ impl<'state> MirLowerer<'state> {
                 LoweredValue::Void => {
                     errors.push(
                         CodeError::StructInitInvalidType(
-                            field.r#type.to_string(),
+                            field.ty.to_string(),
                             Type::Void.to_string(),
                         )
                         .spanned(span),
@@ -1590,7 +1619,7 @@ impl<'state> MirLowerer<'state> {
                 }
             };
 
-            fields.push((crate::mir::FieldId(field_index), operand));
+            fields.push((FieldId(field_index), operand));
         }
 
         for (name, (field_span, _)) in arg_values {
@@ -1618,7 +1647,7 @@ impl<'state> MirLowerer<'state> {
         self.push_statement(MirStatement::Assign(
             temp_place.clone(),
             Rvalue::StructInit {
-                ty: ty.clone(),
+                ty: struct_id,
                 fields,
             },
         ));
@@ -1626,7 +1655,6 @@ impl<'state> MirLowerer<'state> {
         Ok((
             LoweredValue::Value {
                 operand: Operand::Place(temp_place),
-                ty,
             },
             Control::Continues,
         ))
@@ -1690,7 +1718,8 @@ impl<'state> MirLowerer<'state> {
         let condition_value = self.lower_expr(&conditional.condition, None)?;
 
         match condition_value.0 {
-            LoweredValue::Value { operand, ty } => {
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
                 if !can_coerce_type(&ty, &Type::Bool) {
                     return CodeError::InvalidConditionType(ty.to_string())
                         .err(conditional.condition.1);
@@ -1787,7 +1816,8 @@ impl<'state> MirLowerer<'state> {
 
             self.switch_to_block(condition_block);
             match self.lower_expr(&conditional.condition, Some(Type::Bool)) {
-                Ok((LoweredValue::Value { operand, ty }, _)) => {
+                Ok((LoweredValue::Value { operand }, _)) => {
+                    let ty = operand.ty().clone();
                     if !can_coerce_type(&ty, &Type::Bool) {
                         errors.push(
                             CodeError::InvalidConditionType(ty.to_string())
@@ -1883,7 +1913,6 @@ impl<'state> MirLowerer<'state> {
             Ok((
                 LoweredValue::Value {
                     operand: Operand::Place(Place::Local(local, ty.clone())),
-                    ty,
                 },
                 Control::Continues,
             ))
@@ -1908,7 +1937,8 @@ impl<'state> MirLowerer<'state> {
         }
 
         match value {
-            LoweredValue::Value { operand, ty } => {
+            LoweredValue::Value { operand } => {
+                let ty = operand.ty().clone();
                 if result_type.is_none() {
                     *result_type = Some(ty.clone());
                 }

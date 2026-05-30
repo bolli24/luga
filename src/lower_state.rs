@@ -10,6 +10,7 @@ use luga_syntax::{
     Ast, EnumDecl, FunctionDecl, Param, SimpleSpan, Spanned, StructDecl, TopLevelItem, parse_source,
 };
 use std::collections::{HashMap, HashSet};
+use std::default::Default;
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -22,7 +23,7 @@ pub struct LowerState {
     fn_name_prefix: String,
     main_function: Option<LowerFuncId>,
     functions: Vec<FuncType>,
-    imported_mir_functions: HashMap<LowerFuncId, MirFunction>,
+    imported_mir_functions: IndexMap<LowerFuncId, MirFunction>,
     dir: PathBuf,
     lowering_imports: HashSet<PathBuf>,
     lowered_imports: HashMap<PathBuf, HashMap<String, LowerSymbol>>,
@@ -42,7 +43,7 @@ pub fn lower_ast(
         fn_name_prefix: "".to_string(),
         main_function: None,
         functions: Vec::new(),
-        imported_mir_functions: HashMap::new(),
+        imported_mir_functions: Default::default(),
         dir: file_path
             .and_then(Path::parent)
             .unwrap_or(Path::new("."))
@@ -75,7 +76,15 @@ pub fn lower_ast(
 
     Ok(MirProgram {
         functions: all_mir_functions,
+        function_types: state
+            .functions
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, func_type)| (LowerFuncId(idx), func_type))
+            .collect(),
         main_func_id,
+        types: state.types,
     })
 }
 
@@ -370,8 +379,17 @@ impl LowerState {
             todo!("Return values larger than 8 bytes.")
         }
 
+        let func_id = LowerFuncId(self.functions.len());
+        let object_name = if *is_extern {
+            name.to_owned()
+        } else if is_main {
+            "main".to_string()
+        } else {
+            format!("{}{}${}", self.fn_name_prefix, name, func_id.0)
+        };
+
         let func_type = FuncType {
-            name: name.to_owned(),
+            name: object_name,
             params: param_types,
             return_type: return_type.into(),
             is_extern: *is_extern,
@@ -381,7 +399,6 @@ impl LowerState {
             println!("{func_type}");
         }
 
-        let func_id = LowerFuncId(self.functions.len());
         self.functions.push(func_type.clone());
 
         Ok((func_id, func_type))
@@ -417,7 +434,7 @@ impl LowerState {
             fields.insert(
                 name.0.clone(),
                 StructField {
-                    r#type: field_type,
+                    ty: field_type,
                     offset: current_offset,
                 },
             );
@@ -597,7 +614,7 @@ impl LowerState {
         }
 
         let mut errors = ManyErrors::new();
-        let mut mir_functions = self.lower_mir_functions(&program, &mut errors);
+        let mir_functions = self.lower_mir_functions(&program, &mut errors);
         if !errors.is_empty() {
             self.current_module = saved_module;
             self.current_scope = saved_scope;

@@ -135,7 +135,7 @@ impl Display for DisplayStructType<'_> {
                         "{}@{}: {}",
                         field.0,
                         field.1.offset,
-                        field.1.r#type.display(self.types)
+                        field.1.ty.display(self.types)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -152,7 +152,7 @@ impl Display for StructType {
             self.name,
             self.fields
                 .iter()
-                .map(|field| { format!("{}@{}: {}", field.0, field.1.offset, field.1.r#type) })
+                .map(|field| { format!("{}@{}: {}", field.0, field.1.offset, field.1.ty) })
                 .collect::<Vec<_>>()
                 .join(", "),
         )

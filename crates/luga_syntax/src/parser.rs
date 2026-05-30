@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fmt::Display;
 
 use crate::lexer::Token;
@@ -151,7 +152,7 @@ impl Display for UnOp {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
     Print,
     Println,
@@ -160,14 +161,14 @@ pub enum Intrinsic {
     EnumToInt,
 }
 
-impl Intrinsic {
-    pub const fn name(&self) -> &'static str {
+impl Display for Intrinsic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Print => "@print",
-            Self::Println => "@println",
-            Self::Assert => "@assert",
-            Self::Exit => "@exit",
-            Self::EnumToInt => "@enumToInt",
+            Self::Print => write!(f, "print"),
+            Self::Println => write!(f, "println"),
+            Self::Assert => write!(f, "assert"),
+            Self::Exit => write!(f, "exit"),
+            Self::EnumToInt => write!(f, "enumToInt"),
         }
     }
 }
