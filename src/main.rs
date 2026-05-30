@@ -362,7 +362,7 @@ fn build_file(
     };
 
     if verbose {
-        for func in &mir_program.0 {
+        for func in &mir_program.functions.values() {
             println!("{func}");
         }
     }

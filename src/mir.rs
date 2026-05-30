@@ -8,7 +8,10 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-pub struct MirProgram(pub Vec<MirFunction>);
+pub struct MirProgram {
+    pub functions: HashMap<LowerFuncId, MirFunction>,
+    pub main_func_id: LowerFuncId,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalId(pub usize);

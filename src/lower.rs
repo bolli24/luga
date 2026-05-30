@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-
 use luga_syntax::{
     BinOp, Expression, FunctionDecl, If, Intrinsic, SimpleSpan, Span, Spanned, Statement,
     StructDecl, StructInit, UnOp, parser::Arg,
@@ -28,7 +27,7 @@ pub struct MirLowerer<'a> {
     current_block: BlockId,
     current_func_type: FuncType,
     result_span: Option<SimpleSpan>,
-    nested_functions: Vec<MirFunction>,
+    nested_functions: HashMap<LowerFuncId, MirFunction>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,7 +98,7 @@ impl<'state> MirLowerer<'state> {
             current_block: entry,
             current_func_type,
             result_span: None,
-            nested_functions: Vec::new(),
+            nested_functions: HashMap::new(),
         }
     }
 
@@ -179,7 +178,7 @@ impl<'state> MirLowerer<'state> {
         }
     }
 
-    pub fn into_nested_functions(self) -> Vec<MirFunction> {
+    pub fn into_nested_functions(self) -> HashMap<LowerFuncId, MirFunction> {
         self.nested_functions
     }
 
@@ -210,7 +209,7 @@ impl<'state> MirLowerer<'state> {
         decl: &FunctionDecl,
         span: &SimpleSpan,
     ) -> Result<(), ManyErrors> {
-        let (_, func_type) = self
+        let (func_id, func_type) = self
             .state
             .current_scope
             .get_function(&decl.name)
@@ -221,7 +220,7 @@ impl<'state> MirLowerer<'state> {
         self.state.current_scope = outer_scope.function_scope();
 
         let lowerer = MirLowerer::new(self.state, func_type);
-        let result = lowerer.lower_function(decl, span, false);
+        let result = lowerer.lower_function(func_id, decl, span, false);
 
         self.state.current_scope = *self
             .state
@@ -231,8 +230,8 @@ impl<'state> MirLowerer<'state> {
             .expect("mir nested function scope must have parent");
 
         match result {
-            Ok(mut functions) => {
-                self.nested_functions.append(&mut functions);
+            Ok(functions) => {
+                self.nested_functions.extend(functions);
                 Ok(())
             }
             Err(errors) => Err(errors),
@@ -267,7 +266,7 @@ impl<'state> MirLowerer<'state> {
         decl: &FunctionDecl,
         span: &SimpleSpan,
     ) -> Result<(), ManyErrors> {
-        let LowerSymbol::Function(_, func_type) = self
+        let LowerSymbol::Function(func_id, func_type) = self
             .state
             .types
             .associated_functions
@@ -283,7 +282,7 @@ impl<'state> MirLowerer<'state> {
         self.state.current_scope = outer_scope.function_scope();
 
         let lowerer = MirLowerer::new(self.state, func_type.clone());
-        let result = lowerer.lower_function_with_type(decl, span, false, func_type);
+        let result = lowerer.lower_function_with_type(func_id, decl, span, false, func_type);
 
         self.state.current_scope = *self
             .state
@@ -293,8 +292,8 @@ impl<'state> MirLowerer<'state> {
             .expect("mir associated function scope must have parent");
 
         match result {
-            Ok(mut functions) => {
-                self.nested_functions.append(&mut functions);
+            Ok(functions) => {
+                self.nested_functions.extend(functions);
                 Ok(())
             }
             Err(errors) => Err(errors),
@@ -303,10 +302,11 @@ impl<'state> MirLowerer<'state> {
 
     pub fn lower_function(
         self,
+        func_id: LowerFuncId,
         decl: &FunctionDecl,
         span: &SimpleSpan,
         is_top_level: bool,
-    ) -> Result<Vec<MirFunction>, ManyErrors> {
+    ) -> Result<HashMap<LowerFuncId, MirFunction>, ManyErrors> {
         let (_, func_type) = self
             .state
             .current_scope
@@ -314,16 +314,17 @@ impl<'state> MirLowerer<'state> {
             .map(|(id, ft)| (id, ft.clone()))
             .expect("Function must be pre-declared before lowering its body");
 
-        self.lower_function_with_type(decl, span, is_top_level, func_type)
+        self.lower_function_with_type(func_id, decl, span, is_top_level, func_type)
     }
 
     pub fn lower_function_with_type(
         mut self,
+        func_id: LowerFuncId,
         decl: &FunctionDecl,
         span: &SimpleSpan,
         is_top_level: bool,
         func_type: FuncType,
-    ) -> Result<Vec<MirFunction>, ManyErrors> {
+    ) -> Result<HashMap<LowerFuncId, MirFunction>, ManyErrors> {
         let mut errors = ManyErrors::new();
 
         let params = decl
@@ -378,9 +379,9 @@ impl<'state> MirLowerer<'state> {
         }
 
         if errors.is_empty() {
-            let mut nested_functions = std::mem::take(&mut self.nested_functions);
-            let mut functions = vec![self.finish(decl.name.clone(), params, return_type)];
-            functions.append(&mut nested_functions);
+            let nested_functions = std::mem::take(&mut self.nested_functions);
+            let mut functions = HashMap::from([(func_id, self.finish(decl.name.clone(), params, return_type))]);
+            functions.extend(nested_functions);
             Ok(functions)
         } else {
             Err(errors)

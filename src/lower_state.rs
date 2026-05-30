@@ -20,11 +20,12 @@ pub struct LowerState {
     pub(crate) types: TypeContext,
     pub(crate) current_scope: LowerScope,
     fn_name_prefix: String,
+    main_function: Option<LowerFuncId>,
     functions: Vec<FuncType>,
-    imported_mir_functions: Vec<MirFunction>,
+    imported_mir_functions: HashMap<LowerFuncId, MirFunction>,
     dir: PathBuf,
-    compiling_imports: HashSet<PathBuf>,
-    compiled_imports: HashMap<PathBuf, HashMap<String, LowerSymbol>>,
+    lowering_imports: HashSet<PathBuf>,
+    lowered_imports: HashMap<PathBuf, HashMap<String, LowerSymbol>>,
     verbose: bool,
 }
 
@@ -39,20 +40,21 @@ pub fn lower_ast(
         types: TypeContext::new(),
         current_scope: LowerScope::new(),
         fn_name_prefix: "".to_string(),
+        main_function: None,
         functions: Vec::new(),
-        imported_mir_functions: Vec::new(),
+        imported_mir_functions: HashMap::new(),
         dir: file_path
             .and_then(Path::parent)
             .unwrap_or(Path::new("."))
             .to_path_buf(),
-        compiling_imports: HashSet::new(),
-        compiled_imports: HashMap::new(),
+        lowering_imports: HashSet::new(),
+        lowered_imports: HashMap::new(),
         verbose,
     };
 
     let mut mod_errors = Vec::new();
 
-    let mut mir_functions = match state.lower_main_module(&ast, &mut mod_errors) {
+    let (main_func_id, mir_functions) = match state.lower_main_module(&ast, &mut mod_errors) {
         Err(MainModuleError::MissingMain) => return Err(LowerErrors::MissingMain),
         Err(MainModuleError::CodeErrors(errors)) => {
             mod_errors.push(ModuleErrors {
@@ -69,9 +71,12 @@ pub fn lower_ast(
     };
 
     let mut all_mir_functions = state.imported_mir_functions;
-    all_mir_functions.append(&mut mir_functions);
+    all_mir_functions.extend(mir_functions);
 
-    Ok(MirProgram(all_mir_functions))
+    Ok(MirProgram {
+        functions: all_mir_functions,
+        main_func_id,
+    })
 }
 
 impl LowerState {
@@ -79,14 +84,14 @@ impl LowerState {
         &mut self,
         ast: &Ast,
         mod_errors: &mut Vec<ModuleErrors>,
-    ) -> Result<Vec<MirFunction>, MainModuleError> {
-        let found_main = self
+    ) -> Result<(LowerFuncId, HashMap<LowerFuncId, MirFunction>), MainModuleError> {
+        let main_func_id = self
             .pass1(&ast, mod_errors, true)
             .map_err(|errors| MainModuleError::CodeErrors(errors))?;
 
-        if !found_main {
+        let Some(main_func_id) = main_func_id else {
             return Err(MainModuleError::MissingMain);
-        }
+        };
 
         let mut errors = ManyErrors::new();
 
@@ -95,11 +100,15 @@ impl LowerState {
         if !errors.is_empty() {
             return Err(MainModuleError::CodeErrors(errors));
         }
-        Ok(mir_functions)
+        Ok((main_func_id, mir_functions))
     }
 
-    fn lower_mir_functions(&mut self, program: &Ast, errors: &mut ManyErrors) -> Vec<MirFunction> {
-        let mut functions = Vec::new();
+    fn lower_mir_functions(
+        &mut self,
+        program: &Ast,
+        errors: &mut ManyErrors,
+    ) -> HashMap<LowerFuncId, MirFunction> {
+        let mut functions = HashMap::new();
 
         for item in &program.items {
             match &item.0 {
@@ -108,7 +117,8 @@ impl LowerState {
                         continue;
                     }
 
-                    let Some((_, func_type)) = self.current_scope.get_function(&decl.name) else {
+                    let Some((func_id, func_type)) = self.current_scope.get_function(&decl.name)
+                    else {
                         continue;
                     };
                     let func_type = func_type.clone();
@@ -117,7 +127,7 @@ impl LowerState {
                     self.current_scope = outer_scope.function_scope();
 
                     let lowerer = MirLowerer::new(self, func_type);
-                    let result = lowerer.lower_function(decl, &item.1, true);
+                    let result = lowerer.lower_function(func_id, decl, &item.1, true);
 
                     self.current_scope = *self
                         .current_scope
@@ -126,7 +136,9 @@ impl LowerState {
                         .expect("mir function scope must have parent");
 
                     match result {
-                        Ok(mut lowered_functions) => functions.append(&mut lowered_functions),
+                        Ok(lowered_functions) => {
+                            functions.extend(lowered_functions);
+                        }
                         Err(mut new_errors) => errors.append(&mut new_errors),
                     }
                 }
@@ -157,7 +169,7 @@ impl LowerState {
                         }
                     }
 
-                    functions.append(&mut lowerer.into_nested_functions());
+                    functions.extend(lowerer.into_nested_functions());
                 }
                 _ => {}
             }
@@ -166,24 +178,29 @@ impl LowerState {
         functions
     }
 
+    /// Returns: main function id if found
     pub fn pass1(
         &mut self,
         program: &Ast,
         mod_errors: &mut Vec<ModuleErrors>,
-        is_entry: bool,
-    ) -> Result<bool, ManyErrors> {
+        is_entry_module: bool,
+    ) -> Result<Option<LowerFuncId>, ManyErrors> {
         let mut errors = ManyErrors::new();
 
-        let mut found_main = false;
+        let mut main_func_id = None;
         for item in &program.items {
             match &item.0 {
                 TopLevelItem::FunctionDecl(decl) => {
-                    if is_entry && decl.name == "main" && !decl.r#extern {
-                        found_main = true;
-                    }
+                    let func_id = match self.pre_declare_fn(decl, &item.1, is_entry_module) {
+                        Err(mut e) => {
+                            errors.append(&mut e);
+                            continue;
+                        }
+                        Ok(func_id) => func_id,
+                    };
 
-                    if let Err(mut e) = self.pre_declare_fn(decl, &item.1, is_entry) {
-                        errors.append(&mut e);
+                    if is_entry_module && decl.name == "main" && !decl.r#extern {
+                        main_func_id = Some(func_id);
                     }
                 }
                 TopLevelItem::StructDecl(decl) => {
@@ -212,7 +229,7 @@ impl LowerState {
         if !errors.is_empty() {
             Err(errors)
         } else {
-            Ok(found_main)
+            Ok(main_func_id)
         }
     }
 
@@ -221,20 +238,20 @@ impl LowerState {
         decl: &FunctionDecl,
         span: &SimpleSpan,
         is_top_level: bool,
-    ) -> Result<(), ManyErrors> {
+    ) -> Result<LowerFuncId, ManyErrors> {
         if let LookupResult::Found(_) = self.current_scope.get_symbol(&decl.name) {
             return Err(CodeError::NameAlreadyDefined(decl.name.to_owned())
                 .spanned(*span)
                 .into());
         }
 
-        let symbol = self.make_function_symbol(decl, span, is_top_level)?;
+        let (func_id, func_type) = self.make_function_symbol(decl, span, is_top_level)?;
 
         self.current_scope
-            .insert_symbol(decl.name.clone(), symbol)
+            .insert_symbol(decl.name.clone(), LowerSymbol::Function(func_id, func_type))
             .expect("Must not overwrite symbol");
 
-        Ok(())
+        Ok(func_id)
     }
 
     fn pre_declare_assoc_fn(
@@ -254,17 +271,13 @@ impl LowerState {
                 .into());
         }
 
-        let LowerSymbol::Function(f_id, f_type) = self.make_function_symbol(decl, span, false)?
-        else {
-            unreachable!()
-        };
-        let symbol = LowerSymbol::Function(f_id, f_type);
+        let (func_id, func_type) = self.make_function_symbol(decl, span, false)?;
 
         self.types
             .associated_functions
             .entry(owner)
             .or_default()
-            .insert(decl.name.clone(), symbol);
+            .insert(decl.name.clone(), LowerSymbol::Function(func_id, func_type));
 
         Ok(())
     }
@@ -274,7 +287,7 @@ impl LowerState {
         decl: &FunctionDecl,
         span: &SimpleSpan,
         is_top_level: bool,
-    ) -> Result<LowerSymbol, ManyErrors> {
+    ) -> Result<(LowerFuncId, FuncType), ManyErrors> {
         let FunctionDecl {
             name,
             r#extern: is_extern,
@@ -371,7 +384,7 @@ impl LowerState {
         let func_id = LowerFuncId(self.functions.len());
         self.functions.push(func_type.clone());
 
-        Ok(LowerSymbol::Function(func_id, func_type))
+        Ok((func_id, func_type))
     }
 
     pub fn declare_struct(&mut self, decl: &StructDecl) -> Result<TypeId, ManyErrors> {
@@ -507,13 +520,13 @@ impl LowerState {
             CompileError::Code(CodeError::ImportNotFound(path_str.clone()).spanned(import_span))
         })?;
 
-        if self.compiling_imports.contains(&canonical) {
+        if self.lowering_imports.contains(&canonical) {
             return Err(CodeError::CircularImport(path_str)
                 .spanned(import_span)
                 .into());
         }
         // Now we start compiling the module itself.
-        let symbols = if let Some(cached) = self.compiled_imports.get(&canonical) {
+        let symbols = if let Some(cached) = self.lowered_imports.get(&canonical) {
             cached.clone()
         } else {
             let src = std::fs::read_to_string(&canonical).map_err(|err| {
@@ -533,11 +546,11 @@ impl LowerState {
             };
             let dir = joined_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-            self.compiling_imports.insert(canonical.clone());
-            let symbols = match self.compile_import(program, &dir, &canonical, mod_errors) {
+            self.lowering_imports.insert(canonical.clone());
+            let symbols = match self.lower_import(program, &dir, &canonical, mod_errors) {
                 Ok(compiled) => compiled,
                 Err(errors) => {
-                    self.compiling_imports.remove(&canonical);
+                    self.lowering_imports.remove(&canonical);
                     mod_errors.push(ModuleErrors {
                         path: Some(canonical),
                         src: src.to_owned(),
@@ -546,8 +559,8 @@ impl LowerState {
                     return Err(CompileError::ModuleInner);
                 }
             };
-            self.compiling_imports.remove(&canonical);
-            self.compiled_imports
+            self.lowering_imports.remove(&canonical);
+            self.lowered_imports
                 .insert(canonical.clone(), symbols.clone());
             symbols
         };
@@ -561,7 +574,7 @@ impl LowerState {
             })
     }
 
-    fn compile_import(
+    fn lower_import(
         &mut self,
         program: Ast,
         dir: &Path,
@@ -572,7 +585,7 @@ impl LowerState {
         let saved_module = std::mem::replace(&mut self.current_module, new_module);
         let saved_scope = std::mem::replace(&mut self.current_scope, LowerScope::new());
         let saved_dir = std::mem::replace(&mut self.dir, dir.to_path_buf());
-        let new_prefix = module_prefix(canonical, self.compiled_imports.len());
+        let new_prefix = module_prefix(canonical, self.lowered_imports.len());
         let saved_prefix = std::mem::replace(&mut self.fn_name_prefix, new_prefix);
 
         if let Err(errors) = self.pass1(&program, mod_errors, false) {
@@ -593,7 +606,7 @@ impl LowerState {
             return Err(errors);
         }
 
-        self.imported_mir_functions.append(&mut mir_functions);
+        self.imported_mir_functions.extend(mir_functions);
 
         let module_symbols = std::mem::replace(&mut self.current_scope, saved_scope).symbols;
         self.current_module = saved_module;
