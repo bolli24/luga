@@ -5,8 +5,8 @@ extern fn abs(number: i32) : i32;
 
 // Struct fields are declared with semicolons.
 struct Point {
-    x: i32;
-    y: i32;
+    x: i32,
+    y: i32,
 } {
     // Struct functions are called through the type name.
     fn new(x: i32, y: i32) : Point {
@@ -21,7 +21,7 @@ struct Point {
 }
 
 struct Box {
-    value: i32;
+    value: i32,
 }
 
 enum Status {

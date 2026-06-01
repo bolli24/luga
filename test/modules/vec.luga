@@ -1,7 +1,7 @@
 /// SKIP_TEST
 struct iVec {
-    x: i32;
-    y: i32;
+    x: i32,
+    y: i32,
 }
 
 fn printVec(vec: iVec) {

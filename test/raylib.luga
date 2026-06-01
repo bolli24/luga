@@ -1,10 +1,10 @@
 /// SKIP_TEST
 
 struct Color {
-    r: u8;
-    g: u8;
-    b: u8;
-    a: u8;
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
 }
 
 fn color(r: u8, g: u8, b: u8) : Color {

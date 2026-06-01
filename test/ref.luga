@@ -1,10 +1,10 @@
 struct Box {
-    value: i32;
+    value: i32
 }
 
 struct Pair {
-    left: i32;
-    right: i32;
+    left: i32,
+    right: i32,
 }
 
 fn get(ref value: i32) : i32 {

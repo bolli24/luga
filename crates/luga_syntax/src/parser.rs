@@ -474,8 +474,8 @@ where
             identifier_spanned
                 .then_ignore(just(Token::Colon))
                 .then(identifier_spanned)
-                .then_ignore(just(Token::Semicolon))
-                .repeated()
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::BraceOpen), just(Token::BraceClose)),
         )

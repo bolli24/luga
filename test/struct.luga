@@ -1,6 +1,6 @@
 struct iVec {
-    x: i32;
-    y: i32;
+    x: i32,
+    y: i32,
 } {
     fn add(ref this: iVec, other: iVec) : iVec {
         return iVec {x: this.x + other.x, y: this.y + other.y};
@@ -18,23 +18,23 @@ fn printVec(vec: iVec) {
 // struct declared inside a function scope
 fn sumComponents() : i32 {
     struct Pair {
-        a: i32;
-        b: i32;
+        a: i32,
+        b: i32,
     }
     var p = Pair {a: 10, b: 32};
     return p.a + p.b;
 }
 
 struct Inner {
-    value: i32;
+    value: i32
 }
 
 struct Middle {
-    inner: Inner;
+    inner: Inner
 }
 
 struct Outer {
-    middle: Middle;
+    middle: Middle
 }
 
 fn nestedValue(outer: Outer) : i32 {
