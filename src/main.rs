@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// #![allow(dead_code)]
 
 use ariadne::Source;
 use luga::errors::report_compile_errors;
@@ -371,7 +371,7 @@ fn build_file(
     let product = match generate(mir_program, Some(file_path), release, verbose) {
         Ok(product) => product,
         Err(errors) => match errors {
-            GeneratorErrors::ModuleErrors(module_errors) => {
+            GeneratorErrors::CraneModuleErrors(module_errors) => {
                 for error in module_errors {
                     // TODO: make this printing nice
                     eprintln!("{error}");
