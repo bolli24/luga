@@ -2,11 +2,14 @@
 
 These notes describe how Luga should lower arguments for external C functions on x86_64 Windows and Linux when using Cranelift.
 
+TODO: cross reference with https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf
+
 ## Cranelift Responsibilities
 
 Cranelift handles physical argument placement once the signature is correct.
 
-For normal ABI parameters such as `I32`, `I64`, `F32`, `F64`, or pointer values, Luga should emit one `AbiParam` per ABI-level argument and pass one Cranelift `Value` per `AbiParam`. Cranelift then decides whether each value goes in a register or on the stack.
+For normal ABI parameters such as `I32`, `I64`, `F32`, `F64`, or pointer values, Luga should emit one `AbiParam` per ABI-level argument and pass one Cranelift `Value` per `AbiParam`. 
+Cranelift then decides whether each value goes in a register or on the stack.
 
 Examples:
 
