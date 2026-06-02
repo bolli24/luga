@@ -11,7 +11,7 @@ ariadne = "0.6"
 thiserror = "2.0"
 luga_syntax = { path = "crates/luga_syntax" }
 
-cranelift = { version = "0.131", features = [
+cranelift = { version = "0.132", features = [
     "core",
     "frontend",
     "module",
