@@ -33,7 +33,7 @@ fn is_done(status: Status) : bool {
 }
 
 fn sum_to(limit: i32) : i32 {
-    var total = 0;
+    var total : i32 = 0;    // Type names are optional
     var i = 1;
 
     // While loops run while their condition is true.
@@ -62,8 +62,8 @@ fn main() {
     @assert(arithmetic != 10);
 
     // Bools, strings, and unary ! are first-class expressions.
-    var message = "language tour";
-    var ok = true;
+    var message: string = "language tour";
+    var ok: bool = true;
     @assert(ok);
     @assert(!false);
     @println("%s", message);

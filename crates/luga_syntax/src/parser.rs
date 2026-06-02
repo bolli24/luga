@@ -23,7 +23,7 @@ pub enum TopLevelItem {
 #[derive(Clone, Debug)]
 pub enum Statement {
     Expression(Spanned<Expression>),
-    Binding(String, Spanned<Expression>),
+    Binding(String, Option<Spanned<String>>, Spanned<Expression>),
     Assignment(Spanned<Expression>, Spanned<Expression>),
     Return(Spanned<Expression>),
     While(Conditional),
@@ -521,10 +521,14 @@ where
     expression.define(binary.labelled("expression"));
     let binding = just(Token::Id("var"))
         .ignore_then(identifier)
+        .then(just(Token::Colon).ignore_then(identifier_spanned).or_not())
         .then_ignore(just(Token::Equal))
         .then(expression.clone())
-        .map_with(|(ident, expr), extra| -> Spanned<Statement> {
-            Spanned(Statement::Binding(ident.to_owned(), expr), extra.span())
+        .map_with(|((ident, type_name), expr), extra| -> Spanned<Statement> {
+            Spanned(
+                Statement::Binding(ident.to_owned(), type_name, expr),
+                extra.span(),
+            )
         });
 
     let assignment = expression

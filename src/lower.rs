@@ -455,7 +455,15 @@ impl<'state> MirLowerer<'state> {
                     return Ok(value);
                 }
             }
-            Statement::Binding(name, expr) => {
+            Statement::Binding(name, type_path, expr) => {
+                let maybe_type =
+                    match type_path {
+                        Some(type_path) => Some(self.type_from_name(&type_path.0).ok_or(
+                            CodeError::UnknownType(type_path.0.clone()).spanned(type_path.1),
+                        )?),
+                        None => None,
+                    };
+
                 if self.local_scope.contains_in_current_scope(name)
                     || self
                         .state
@@ -465,7 +473,7 @@ impl<'state> MirLowerer<'state> {
                     return CodeError::VariableRedefinition(name.clone()).err(statement.1);
                 }
 
-                let value = match self.lower_expr(expr, None) {
+                let value = match self.lower_expr(expr, maybe_type.clone()) {
                     Ok(value) => value,
                     Err(errors) => {
                         let local = self.new_error_local(name.to_owned());
@@ -477,6 +485,19 @@ impl<'state> MirLowerer<'state> {
                         return Err(errors);
                     }
                 };
+
+                if let Some(expected_type) = maybe_type
+                    && &expected_type != value.0.ty()
+                    && value.0 != LoweredValue::Never
+                    && value.0 != LoweredValue::Error
+                {
+                    return CodeError::AssignmentIncompatibleTypes(
+                        expected_type.to_string(),
+                        value.0.ty().to_string(),
+                    )
+                    .err(statement.1);
+                }
+
                 let operand = match value.0 {
                     LoweredValue::Value { operand } => operand,
                     LoweredValue::Void => {

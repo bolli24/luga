@@ -3,18 +3,18 @@
 fn main() {
     var test = "error" + 2;
 
-    var b = test;
+    var b: string = test;
     var c = 2 * test;
     var d = !test;
     var e = (d == c) == (b == test);
 
     if c == b + test then {
-        @println(test);
+        @println("%s", test);
     }
 
     if !d then {
         var nested = e + 1;
-        @println(nested);
+        @println("%s", nested);
     }
 
     while test {
@@ -22,10 +22,13 @@ fn main() {
     }
 
     takes_i32(test);
+
+    var f = 2;
+    var g: string = f;
 }
 
 fn takes_i32(value: i32) {
-    @println("{}", value);
+    @println("%d", value);
 }
 
 fn returns_i32() : i32 {
