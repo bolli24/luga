@@ -1,6 +1,7 @@
 mod context;
 mod display;
 
+use cranelift::prelude::Signature;
 pub use context::TypeContext;
 
 use indexmap::{IndexMap, IndexSet};
@@ -64,6 +65,14 @@ impl Type {
 
     pub fn is_ref(&self) -> bool {
         matches!(self, Self::Ref(_))
+    }
+
+    pub fn is_enum(&self) -> bool {
+        matches!(self, Self::Enum(_))
+    }
+
+    pub fn is_struct(&self) -> bool {
+        matches!(self, Self::Struct(_))
     }
 
     pub fn ref_of(self) -> Option<Self> {

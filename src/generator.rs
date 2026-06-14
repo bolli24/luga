@@ -4,6 +4,7 @@ use std::{
 };
 
 use cranelift::codegen::Context;
+use cranelift::prelude::isa::OwnedTargetIsa;
 use cranelift::{
     codegen::ir::{ArgumentPurpose, StackSlot},
     module::{DataDescription, FuncId, Linkage, Module, default_libcall_names},
@@ -279,7 +280,7 @@ impl Scope {
 }
 
 pub struct GeneratorState<'a> {
-    isa: std::sync::Arc<dyn isa::TargetIsa>,
+    isa: OwnedTargetIsa,
     functions: &'a IndexMap<LowerFuncId, MirFunction>,
     function_types: &'a IndexMap<LowerFuncId, FuncType>,
     crane_functions: HashMap<LowerFuncId, FuncId>,
@@ -329,6 +330,7 @@ impl<'a> GeneratorState<'a> {
                 abi_param.purpose = if let Type::Struct(struct_id) = &param_type
                     && func_type.is_extern
                 {
+                    todo!("Extern strcut arguments");
                     let struct_type = &self.types.structs[struct_id];
                     ArgumentPurpose::StructArgument(struct_type.size_pad_8())
                 } else {
@@ -1308,7 +1310,19 @@ impl FnGenerator<'_, '_> {
         let mut arg_values: Vec<Value> = args
             .iter()
             .zip(func.params.iter())
-            .map(|(arg, param_ty)| self.build_call_arg(arg, param_ty))
+            .map(|(arg, param_ty)| {
+                if !(param_ty.is_int()
+                    || *param_ty == Type::String
+                    || *param_ty == Type::Bool
+                    || param_ty.is_enum()
+                    || (param_ty.is_struct()
+                        && self.state.isa.default_call_conv() == CallConv::WindowsFastcall))
+                    && func.is_extern
+                {
+                    todo!("Unsupported extern argument type: {param_ty}");
+                }
+                self.build_call_arg(arg, param_ty)
+            })
             .collect();
 
         let return_slot = if let Type::Struct(struct_id) = &*func.return_type {

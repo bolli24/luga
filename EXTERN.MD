@@ -2,7 +2,7 @@
 
 These notes describe how Luga should lower arguments for external C functions on x86_64 Windows and Linux when using Cranelift.
 
-TODO: cross reference with https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf
+Reference: System V AMD64 ABI Draft 0.99.6, section 3.2.3, Parameter Passing: https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf
 
 ## Cranelift Responsibilities
 
@@ -102,11 +102,14 @@ Basic rules:
 
 ```text
 unaligned non-ZST field -> stack/byval
-size > 16 bytes         -> stack/byval
+size > 32 bytes         -> stack/byval
 size <= 8 bytes         -> one ABI value if classifiable
 size 9..=16 bytes       -> one or two ABI values if classifiable
+size 17..=32 bytes      -> stack/byval unless it is a vector/SSEUP aggregate
 otherwise               -> stack/byval
 ```
+
+The SysV reference initially allows aggregates up to four eightbytes. After field classes are merged, it applies a cleanup rule: if an aggregate is larger than two eightbytes, it is passed in memory unless the first eightbyte is `SSE` and every other eightbyte is `SSEUP`. For Luga structs without vector types such as `__m256`, this means ordinary C structs larger than 16 bytes are stack/byval.
 
 Common direct cases:
 
@@ -138,6 +141,8 @@ total size 16 -> I64 + I64
 Normal C layout often pads structs to their alignment, so `I64 + I64` is common, but it is not universal.
 
 If different field classes occur in the same eightbyte, the classes are unified. Integer wins over SSE in the same eightbyte.
+
+After classifying all eightbytes, if any eightbyte becomes `MEMORY`, the whole aggregate is passed in memory.
 
 Example:
 
