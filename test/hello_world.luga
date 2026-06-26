@@ -1,0 +1,14 @@
+// Prints a greeting a few times.
+
+fn greet(name: string, times: i32) {
+    var i = 0;
+    while i < times {
+        @println("Hello, %s! (%d)", name, i);
+        i = i + 1;
+    }
+}
+
+fn main() {
+    @println("Hello, world!");
+    greet("Luga", 3);
+}
