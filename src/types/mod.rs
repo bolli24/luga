@@ -1,7 +1,6 @@
 mod context;
 mod display;
 
-use cranelift::prelude::Signature;
 pub use context::TypeContext;
 
 use indexmap::{IndexMap, IndexSet};

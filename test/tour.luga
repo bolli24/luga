@@ -45,6 +45,10 @@ fn sum_to(limit: i32) : i32 {
     return total;
 }
 
+fn accepts_i64(value: i64) : bool {
+    return true;
+}
+
 fn mutate(ref value: i32) {
     value = value + 1;
 }
@@ -60,6 +64,7 @@ fn main() {
     @assert(arithmetic == 11);
     @assert(arithmetic >= 11);
     @assert(arithmetic != 10);
+    @assert(accepts_i64(-(1)));
 
     // Bools, strings, and unary ! are first-class expressions.
     var message: string = "language tour";

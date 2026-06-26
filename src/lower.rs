@@ -773,7 +773,11 @@ impl<'state> MirLowerer<'state> {
                 ))
             }
             Expression::Unary(op, operand_expr) => {
-                let (value, control) = self.lower_expr(operand_expr, Some(Type::Bool))?;
+                let operand_type = match op {
+                    UnOp::Not => Some(Type::Bool),
+                    UnOp::Neg => try_into_type,
+                };
+                let (value, control) = self.lower_expr(operand_expr, operand_type)?;
                 if matches!(control, Control::Terminates) {
                     return Ok((LoweredValue::Never, Control::Terminates));
                 }
@@ -781,11 +785,17 @@ impl<'state> MirLowerer<'state> {
                 let operand = match value {
                     LoweredValue::Value { operand } => {
                         let ty = operand.ty().clone();
-                        if ty != Type::Bool || *op != UnOp::Not {
-                            return CodeError::InvalidUnOpType(*op, ty.to_string()).err(expr.1);
+                        match op {
+                            UnOp::Not if ty == Type::Bool => operand,
+                            UnOp::Neg
+                                if ty.is_signed_int() || ty == Type::F32 || ty == Type::F64 =>
+                            {
+                                operand
+                            }
+                            UnOp::Not | UnOp::Neg => {
+                                return CodeError::InvalidUnOpType(*op, ty.to_string()).err(expr.1);
+                            }
                         }
-
-                        operand
                     }
                     LoweredValue::Void => {
                         return CodeError::InvalidUnOpType(*op, Type::Void.to_string()).err(expr.1);
@@ -794,19 +804,20 @@ impl<'state> MirLowerer<'state> {
                     LoweredValue::Error => return Ok((LoweredValue::Error, Control::Continues)),
                 };
 
+                let result_type = match op {
+                    UnOp::Not => Type::Bool,
+                    UnOp::Neg => operand.ty().clone(),
+                };
                 let temp = self.new_local(MirLocal {
                     name: None,
-                    ty: Type::Bool,
+                    ty: result_type.clone(),
                     kind: LocalKind::Temp,
                 });
-                let temp_place = Place::Local(temp, Type::Bool);
+                let temp_place = Place::Local(temp, result_type);
 
                 self.push_statement(MirStatement::Assign(
                     temp_place.clone(),
-                    Rvalue::Unary {
-                        op: *op,
-                        operand: operand,
-                    },
+                    Rvalue::Unary { op: *op, operand },
                 ));
 
                 Ok((

@@ -784,11 +784,20 @@ impl<'a, 'ctx> FnGenerator<'a, 'ctx> {
     fn build_unary_op(&mut self, op: &UnOp, operand: &Operand) -> GenValue {
         let (value, ty) = self.build_scalar_operand(operand);
 
-        if ty == Type::Bool && *op == UnOp::Not {
-            let result = self.builder.ins().bxor_imm(value, 1);
-            GenValue::Ssa(result, Type::Bool)
-        } else {
-            unreachable!();
+        match ty {
+            Type::Bool if *op == UnOp::Not => {
+                let result = self.builder.ins().bxor_imm(value, 1);
+                GenValue::Ssa(result, Type::Bool)
+            }
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 if *op == UnOp::Neg => {
+                let result = self.builder.ins().ineg(value);
+                GenValue::Ssa(result, ty)
+            }
+            Type::F64 | Type::F32 if *op == UnOp::Neg => {
+                let result = self.builder.ins().fneg(value);
+                GenValue::Ssa(result, ty)
+            }
+            _ => unreachable!(),
         }
     }
 

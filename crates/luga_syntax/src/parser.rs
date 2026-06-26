@@ -142,12 +142,14 @@ impl Display for BinOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Not,
+    Neg,
 }
 
 impl Display for UnOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Not => write!(f, "!"),
+            Self::Neg => write!(f, "-"),
         }
     }
 }
@@ -227,6 +229,7 @@ where
 
     let unary_op = select! {
         Token::Bang => UnOp::Not,
+        Token::Minus => UnOp::Neg,
     };
 
     let mut expression = Recursive::declare();
