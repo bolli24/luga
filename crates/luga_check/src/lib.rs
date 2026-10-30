@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 pub mod check;
 pub mod errors;
-pub mod generator;
 pub mod lower;
 pub mod lower_scope;
 pub mod lower_state;

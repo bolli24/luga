@@ -9,7 +9,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use luga::CompileError;
+use luga_check::CompileError;
 use luga_syntax::{SimpleSpan, Spanned};
 use tracing_subscriber::EnvFilter;
 
@@ -193,7 +193,7 @@ impl Backend {
             let source = doc.text.to_string();
             drop(documents_guard);
 
-            let Some(modules) = luga::check_source(path, source.as_str(), false) else {
+            let Some(modules) = luga_check::check_source(path, source.as_str(), false) else {
                 tracing::warn!("Unable to check file {}", &uri);
                 return;
             };

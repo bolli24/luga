@@ -1,14 +1,15 @@
 // #![allow(dead_code)]
 
 use ariadne::Source;
-use luga::errors::report_compile_errors;
-use luga::{GeneratorErrors, LowerErrors, check_file, diagnostic_path};
+use luga_check::errors::report_compile_errors;
+use luga_check::{LowerErrors, check_file, diagnostic_path};
+use luga_codegen::GeneratorErrors;
 use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
 
 use colored::Colorize;
-use luga::generator::generate;
-use luga::lower_state::lower_ast;
+use luga_check::lower_state::lower_ast;
+use luga_codegen::generate;
 use std::fs::{self, File, create_dir_all, remove_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};

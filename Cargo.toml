@@ -4,23 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["runtime", "lsp", "crates/luga_syntax"]
+members = [
+    "runtime",
+    "lsp",
+    "crates/luga_syntax",
+    "crates/luga_check",
+    "crates/luga_codegen",
+]
 
 [dependencies]
 ariadne = "0.6"
 thiserror = "2.0"
 luga_syntax = { path = "crates/luga_syntax" }
-
-cranelift = { version = "0.132", features = [
-    "core",
-    "frontend",
-    "module",
-    "object",
-] }
+luga_check = { path = "crates/luga_check" }
+luga_codegen = { path = "crates/luga_codegen" }
 
 clap = { version = "4.6", features = ["derive"] }
 colored = "3.1"
 
-indexmap = "2.14"
 walkdir = "2.5"
 

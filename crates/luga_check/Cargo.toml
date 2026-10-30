@@ -1,0 +1,11 @@
+[package]
+name = "luga_check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariadne = "0.6"
+thiserror = "2.0"
+luga_syntax = { path = "../luga_syntax" }
+
+indexmap = "2.14"

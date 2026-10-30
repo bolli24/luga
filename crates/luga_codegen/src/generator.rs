@@ -15,13 +15,13 @@ use indexmap::IndexMap;
 use luga_syntax::parser::{BinOp, Intrinsic, UnOp};
 
 use crate::errors::*;
-use crate::lower::ModuleId;
-use crate::lower_state::LowerFuncId;
-use crate::mir::{
+use luga_check::lower::ModuleId;
+use luga_check::lower_state::LowerFuncId;
+use luga_check::mir::{
     BasicBlock, FieldId, LocalId, MirCallee, MirConst, MirFunction, MirProgram, MirStatement,
     MirTerminator, Operand, Place as MirPlace, Rvalue,
 };
-use crate::types::{Type, *};
+use luga_check::types::{Type, *};
 
 const UNREACHABLE: TrapCode = TrapCode::unwrap_user(1);
 

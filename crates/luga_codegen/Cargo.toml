@@ -1,0 +1,17 @@
+[package]
+name = "luga_codegen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+luga_check = { path = "../luga_check" }
+luga_syntax = { path = "../luga_syntax" }
+
+cranelift = { version = "0.132", features = [
+    "core",
+    "frontend",
+    "module",
+    "object",
+] }
+
+indexmap = "2.14"

@@ -827,18 +827,38 @@ dependencies = [
  "ariadne",
  "clap",
  "colored",
- "cranelift",
- "indexmap",
+ "luga_check",
+ "luga_codegen",
  "luga_syntax",
  "thiserror",
  "walkdir",
 ]
 
 [[package]]
+name = "luga_check"
+version = "0.1.0"
+dependencies = [
+ "ariadne",
+ "indexmap",
+ "luga_syntax",
+ "thiserror",
+]
+
+[[package]]
+name = "luga_codegen"
+version = "0.1.0"
+dependencies = [
+ "cranelift",
+ "indexmap",
+ "luga_check",
+ "luga_syntax",
+]
+
+[[package]]
 name = "luga_lsp"
 version = "0.1.0"
 dependencies = [
- "luga",
+ "luga_check",
  "luga_syntax",
  "tokio",
  "tower-lsp",
