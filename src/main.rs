@@ -2,7 +2,7 @@
 
 use ariadne::Source;
 use luga_check::errors::report_compile_errors;
-use luga_check::{LowerErrors, check_file, diagnostic_path};
+use luga_check::{FsLoader, LowerErrors, check_file, diagnostic_path};
 use luga_codegen::GeneratorErrors;
 use luga_syntax::parsing::{ParseFailure, parse_source};
 use thiserror::Error;
@@ -340,7 +340,7 @@ fn build_file(
         println!();
     }
 
-    let mir_program = match lower_ast(ast, Some(file_path), &src, verbose) {
+    let mir_program = match lower_ast(ast, Some(file_path), &src, &FsLoader, verbose) {
         Ok(product) => product,
         Err(errors) => match errors {
             LowerErrors::ModuleErrors(modules) => {

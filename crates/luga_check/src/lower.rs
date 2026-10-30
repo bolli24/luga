@@ -20,8 +20,8 @@ use crate::mir::FieldId;
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleId(pub usize);
 
-pub struct MirLowerer<'a> {
-    state: &'a mut LowerState,
+pub struct MirLowerer<'a, 'l> {
+    state: &'a mut LowerState<'l>,
     locals: Vec<MirLocal>,
     local_scope: LocalScope,
     blocks: Vec<BasicBlock>,
@@ -86,8 +86,8 @@ pub fn can_coerce_type(actual: &Type, expected: &Type) -> bool {
         || matches!(actual, Type::Ref(inner) if inner.as_ref() == expected)
 }
 
-impl<'state> MirLowerer<'state> {
-    pub fn new(state: &'state mut LowerState, current_func_type: FuncType) -> Self {
+impl<'state, 'l> MirLowerer<'state, 'l> {
+    pub fn new(state: &'state mut LowerState<'l>, current_func_type: FuncType) -> Self {
         let entry = BlockId(0);
 
         Self {

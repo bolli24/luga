@@ -1,3 +1,4 @@
+use crate::loader::SourceLoader;
 use crate::lower::{MirLowerer, ModuleId};
 use crate::lower_scope::{LookupResult, LowerScope, LowerSymbol};
 use crate::mir::{MirFunction, MirProgram};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LowerFuncId(usize);
 
-pub struct LowerState {
+pub struct LowerState<'l> {
     current_module: ModuleId,
     pub(crate) types: TypeContext,
     pub(crate) current_scope: LowerScope,
@@ -27,6 +28,7 @@ pub struct LowerState {
     dir: PathBuf,
     lowering_imports: HashSet<PathBuf>,
     lowered_imports: HashMap<PathBuf, HashMap<String, LowerSymbol>>,
+    loader: &'l dyn SourceLoader,
     verbose: bool,
 }
 
@@ -34,6 +36,7 @@ pub fn lower_ast(
     ast: Ast,
     file_path: Option<&Path>,
     src: &str,
+    loader: &dyn SourceLoader,
     verbose: bool,
 ) -> Result<MirProgram, LowerErrors> {
     let mut state = LowerState {
@@ -50,6 +53,7 @@ pub fn lower_ast(
             .to_path_buf(),
         lowering_imports: HashSet::new(),
         lowered_imports: HashMap::new(),
+        loader,
         verbose,
     };
 
@@ -88,7 +92,7 @@ pub fn lower_ast(
     })
 }
 
-impl LowerState {
+impl LowerState<'_> {
     fn lower_main_module(
         &mut self,
         ast: &Ast,
@@ -533,7 +537,7 @@ impl LowerState {
             .with_extension("luga");
 
         let path_str = joined_path.display().to_string();
-        let canonical = std::fs::canonicalize(&joined_path).map_err(|_| {
+        let canonical = self.loader.resolve(&joined_path).ok_or_else(|| {
             CompileError::Code(CodeError::ImportNotFound(path_str.clone()).spanned(import_span))
         })?;
 
@@ -546,7 +550,7 @@ impl LowerState {
         let symbols = if let Some(cached) = self.lowered_imports.get(&canonical) {
             cached.clone()
         } else {
-            let src = std::fs::read_to_string(&canonical).map_err(|err| {
+            let src = self.loader.load(&canonical).map_err(|err| {
                 CodeError::ImportError(path_str.clone(), err.to_string()).spanned(import_span)
             })?;
 

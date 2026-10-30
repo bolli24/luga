@@ -193,7 +193,9 @@ impl Backend {
             let source = doc.text.to_string();
             drop(documents_guard);
 
-            let Some(modules) = luga_check::check_source(path, source.as_str(), false) else {
+            let Some(modules) =
+                luga_check::check_source(path, source.as_str(), &luga_check::FsLoader, false)
+            else {
                 tracing::warn!("Unable to check file {}", &uri);
                 return;
             };

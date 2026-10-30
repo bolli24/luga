@@ -6,6 +6,7 @@ use std::{
 use ariadne::Source;
 use luga_syntax::parse_source;
 
+use crate::loader::{FsLoader, SourceLoader};
 use crate::lower_state::lower_ast;
 use crate::{CompileError, LowerErrors, ModuleErrors, report_compile_errors};
 
@@ -13,7 +14,8 @@ pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
     let src = fs::read_to_string(file_path)
         .map_err(|err| eprintln!("Error reading file '{}': {}", file_path.display(), err))?;
 
-    let Some(modules) = check_source(Some(file_path.to_path_buf()), &src, verbose) else {
+    let Some(modules) = check_source(Some(file_path.to_path_buf()), &src, &FsLoader, verbose)
+    else {
         eprintln!("Error checking {}", file_path.display());
         return Err(());
     };
@@ -36,6 +38,7 @@ pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
 pub fn check_source(
     file_path: Option<PathBuf>,
     src: &str,
+    loader: &dyn SourceLoader,
     verbose: bool,
 ) -> Option<Vec<ModuleErrors>> {
     let ast = match parse_source(&src, verbose) {
@@ -54,7 +57,7 @@ pub fn check_source(
         println!();
     }
 
-    match lower_ast(ast, file_path.as_deref(), &src, verbose) {
+    match lower_ast(ast, file_path.as_deref(), &src, loader, verbose) {
         Ok(_) => return Some(Vec::new()),
         Err(errors) => match errors {
             LowerErrors::ModuleErrors(modules) => Some(modules),
