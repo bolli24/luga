@@ -55,7 +55,7 @@ impl SourceLoader for MemoryLoader {
 }
 
 /// Lexically normalize a path by removing `.` and resolving `..` components.
-fn normalize(path: &Path) -> PathBuf {
+pub fn normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {

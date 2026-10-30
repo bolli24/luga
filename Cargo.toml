@@ -10,6 +10,7 @@ members = [
     "crates/luga_syntax",
     "crates/luga_check",
     "crates/luga_codegen",
+    "crates/luga_wasm",
 ]
 
 [dependencies]

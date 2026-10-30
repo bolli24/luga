@@ -217,6 +217,17 @@ impl From<Spanned<CodeError>> for CompileError {
 }
 
 impl CompileError {
+    /// The error message and its span, or `None` for `ModuleInner`, which marks an
+    /// import whose errors are reported in that module instead.
+    pub fn spanned_message(&self) -> Option<Spanned<String>> {
+        match self {
+            CompileError::Code(Spanned(err, span)) => Some(Spanned(err.to_string(), *span)),
+            CompileError::Lex(Spanned(err, span)) => Some(Spanned(err.to_string(), *span)),
+            CompileError::Parse(Spanned(err, span)) => Some(Spanned(err.to_string(), *span)),
+            CompileError::ModuleInner => None,
+        }
+    }
+
     pub fn from_parse_failure(value: ParseFailure) -> Vec<Self> {
         match value {
             ParseFailure::Lex(errors) => errors.into_iter().map(Self::Lex).collect(),

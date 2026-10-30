@@ -232,15 +232,12 @@ impl Backend {
                 let diagnostics: Vec<Diagnostic> = module
                     .errors
                     .iter()
-                    .filter(|e| !matches!(e, CompileError::ModuleInner))
-                    .map(|err| {
-                        let Spanned(message, span) = error_spanned_message(err);
-                        Diagnostic {
-                            range: span_to_range(&module.src, span),
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message,
-                            ..Default::default()
-                        }
+                    .filter_map(CompileError::spanned_message)
+                    .map(|Spanned(message, span)| Diagnostic {
+                        range: span_to_range(&module.src, span),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message,
+                        ..Default::default()
                     })
                     .collect();
 
@@ -320,15 +317,6 @@ async fn main() {
         diagnostic_sets: Arc::new(Mutex::new(HashMap::new())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
-}
-
-fn error_spanned_message(err: &CompileError) -> Spanned<String> {
-    match err {
-        CompileError::Code(Spanned(err, span)) => Spanned(err.to_string(), *span),
-        CompileError::Lex(Spanned(err, span)) => Spanned(err.to_string(), *span),
-        CompileError::Parse(Spanned(err, span)) => Spanned(err.to_string(), *span),
-        CompileError::ModuleInner => unreachable!("not reported as a diagnostic"),
-    }
 }
 
 fn offset_to_position(src: &str, offset: usize) -> Position {

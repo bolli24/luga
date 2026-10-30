@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Luga Lint Demo</title>
+	<style>
+		body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 900px; padding: 0 16px; }
+		#status { color: #666; }
+		h2 { font-size: 1rem; font-family: ui-monospace, monospace; margin: 1.5rem 0 0.5rem; }
+		.editor .cm-editor { border: 1px solid #ccc; height: 35vh; }
+		.editor .cm-scroller { font-family: ui-monospace, monospace; }
+	</style>
+</head>
+<body>
+<h1>Luga lint demo</h1>
+<p id="status">Loading checker…</p>
+<h2>main.luga</h2>
+<div class="editor" id="main"></div>
+<h2>modules/vec.luga</h2>
+<div class="editor" id="vec"></div>
+
+<script type="module">
+	import { basicSetup, EditorView } from "https://esm.sh/codemirror@6.0.1";
+	// Same URL codemirror imports internally, so both share one copy of the lint module
+	import { forceLinting, linter, lintGutter } from "https://esm.sh/@codemirror/lint@^6.0.0?target=es2022";
+	import { load } from "./linter.js";
+
+	const MAIN = "main.luga";
+	const status = document.getElementById("status");
+	const checker = await load();
+	const views = {};
+
+	const files = () => Object.fromEntries(
+		Object.entries(views).map(([path, view]) => [path, view.state.doc.toString()]));
+
+	// Every editor checks the whole program from main and shows the diagnostics of its own file
+	const lugaLinter = path => linter(() => {
+		const start = performance.now();
+		const diagnostics = checker.check(MAIN, files());
+		const ms = (performance.now() - start).toFixed(1);
+		status.textContent = diagnostics.length === 0
+			? `No errors (checked in ${ms} ms)`
+			: `${diagnostics.length} error(s) (checked in ${ms} ms)`;
+		return diagnostics.filter(d => d.path === path);
+	}, { delay: 300 });
+
+	// An edit in one file can change the diagnostics of the others
+	const relintOthers = path => EditorView.updateListener.of(update => {
+		if (!update.docChanged) return;
+		for (const [other, view] of Object.entries(views)) {
+			if (other !== path) forceLinting(view);
+		}
+	});
+
+	const sources = {
+		[MAIN]: `import modules.vec as v;
+
+fn main() {
+    var a = v.iVec{x: 2, y: 3};
+    var b = v.iVec{x: 4, y: -3};
+
+    v.printVec(v.add(a, b));
+    v.printVec(v.add(a, c));
+}
+`,
+		"modules/vec.luga": `struct iVec {
+    x: i32,
+    y: i32,
+}
+
+fn printVec(vec: iVec) {
+    @println("(%d, %d)", vec.x, vec.y);
+}
+
+fn add(a: iVec, b: iVec) : iVec {
+    return iVec {x: a.x + b.x, y: a.y + b.y};
+}
+
+fn len2(vec: iVec) : i32 {
+    return vec.x * vec.x + vec.y * vec.y;
+}
+`,
+	};
+
+	for (const [path, doc] of Object.entries(sources)) {
+		const id = path === MAIN ? "main" : "vec";
+		views[path] = new EditorView({
+			doc,
+			extensions: [basicSetup, lintGutter(), lugaLinter(path), relintOthers(path)],
+			parent: document.getElementById(id),
+		});
+	}
+</script>
+</body>
+</html>

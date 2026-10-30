@@ -12,3 +12,5 @@
 *.exe
 
 
+
+/crates/luga_wasm/pkg
