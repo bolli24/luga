@@ -1,0 +1,108 @@
+# Examples shown in the playground, see CONTRACT.md in the playground-runner repo.
+# The Dockerfile copies test/ next to this file, so paths are relative to test/.
+
+[[program]]
+id = "tour"
+title = "Tour"
+files = ["tour.luga", "modules/vec.luga", "modules/dir.luga"]
+entry = "tour.luga"
+expect.phase = "run"
+expect.stdout = "language tour\nanswer\nleft\ntour complete\n"
+
+[[program]]
+id = "hello_world"
+title = "Hello world"
+files = ["hello_world.luga"]
+entry = "hello_world.luga"
+expect.phase = "run"
+expect.stdout = "Hello, world!\nHello, Luga! (0)\nHello, Luga! (1)\nHello, Luga! (2)\n"
+
+[[program]]
+id = "function"
+title = "Functions"
+files = ["function.luga"]
+entry = "function.luga"
+expect.phase = "run"
+expect.stdout = "Hello world. 10\nHello from me too.\n"
+
+[[program]]
+id = "if"
+title = "If"
+files = ["if.luga"]
+entry = "if.luga"
+expect.phase = "run"
+expect.stdout = "Level 1: a = 10\nLevel 2: b = 12\nLevel 3: c = 23\ngood\n7\n"
+
+[[program]]
+id = "while"
+title = "While"
+files = ["while.luga"]
+entry = "while.luga"
+expect.phase = "run"
+expect.stdout = "55"
+
+[[program]]
+id = "fib"
+title = "Fibonacci"
+files = ["fib.luga"]
+entry = "fib.luga"
+expect.phase = "run"
+expect.stdout = "55"
+
+[[program]]
+id = "block"
+title = "Block expressions"
+files = ["block.luga"]
+entry = "block.luga"
+expect.phase = "run"
+expect.stdout = ""
+expect.exit_code = 42
+
+[[program]]
+id = "struct"
+title = "Structs"
+files = ["struct.luga"]
+entry = "struct.luga"
+expect.phase = "run"
+expect.stdout = "(0, -4)\n(0, -4)\n"
+
+[[program]]
+id = "enum"
+title = "Enums"
+files = ["enum.luga"]
+entry = "enum.luga"
+expect.phase = "run"
+expect.stdout = "dirName(Up):    up\ndirName(Right): right\n"
+
+[[program]]
+id = "ref"
+title = "References"
+files = ["ref.luga"]
+entry = "ref.luga"
+expect.phase = "run"
+expect.stdout = ""
+
+[[program]]
+id = "import"
+title = "Imports"
+files = ["import.luga", "modules/vec.luga", "modules/dir.luga"]
+entry = "import.luga"
+expect.phase = "run"
+expect.stdout = "(2, 3)\n(4, -3)\n(6, 0)\ndown\n"
+
+[[program]]
+id = "extern"
+title = "Calling C functions"
+files = ["extern.luga"]
+entry = "extern.luga"
+expect.phase = "run"
+expect.stdout = "3\n"
+
+[[program]]
+id = "assert"
+title = "Assertions and exit"
+files = ["assert.luga"]
+entry = "assert.luga"
+expect.phase = "run"
+expect.stdout = ""
+expect.exit_code = 100

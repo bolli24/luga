@@ -1,0 +1,35 @@
+# Conformance fixtures, see CONTRACT.md in the playground-runner repo.
+
+[[program]]
+id = "hello"
+files = ["hello.luga"]
+entry = "hello.luga"
+expect.phase = "run"
+expect.stdout = "Hello, world!\n"
+
+[[program]]
+id = "compile_error"
+files = ["compile_error.luga"]
+entry = "compile_error.luga"
+expect.phase = "compile"
+
+[[program]]
+id = "exit_code"
+files = ["exit_code.luga"]
+entry = "exit_code.luga"
+expect.phase = "run"
+expect.exit_code = 3
+
+[[program]]
+id = "infinite_loop"
+files = ["infinite_loop.luga"]
+entry = "infinite_loop.luga"
+expect.phase = "run"
+expect.timeout = true
+
+[[program]]
+id = "multi_file"
+files = ["multi_file.luga", "lib/greet.luga"]
+entry = "multi_file.luga"
+expect.phase = "run"
+expect.stdout = "Hello from multi file!\n"

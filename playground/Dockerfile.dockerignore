@@ -1,0 +1,9 @@
+target
+output
+.jj
+.git
+.idea
+.claude
+crates/luga_wasm/pkg
+**/*.o
+**/*.exe

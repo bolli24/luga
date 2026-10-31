@@ -1,0 +1,5 @@
+import lib.greet as g;
+
+fn main() {
+    g.greet("multi file");
+}
