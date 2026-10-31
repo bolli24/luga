@@ -1,6 +1,6 @@
 use crate::lexer::{LexingError, Token};
 use crate::parser::{Ast, Spanned, luga_parser};
-use ariadne::{Color, Label, Report, ReportKind, Source};
+use ariadne::{Color, Config, Label, Report, ReportKind, Source};
 use chumsky::span::SimpleSpan;
 use chumsky::{
     Parser,
@@ -79,9 +79,11 @@ where
 {
     let message = err.0.to_string();
     let range = err.1.into_range();
+    let config = Config::default().with_color(use_color());
 
     if let Some(file_name) = file_name {
         Report::build(ReportKind::Error, (file_name, range.clone()))
+            .with_config(config)
             .with_message(message)
             .with_label(Label::new((file_name, range)).with_color(Color::Red))
             .finish()
@@ -89,12 +91,18 @@ where
             .unwrap();
     } else {
         Report::build(ReportKind::Error, range.clone())
+            .with_config(config)
             .with_message(message)
             .with_label(Label::new(range).with_color(Color::Red))
             .finish()
             .eprint(src)
             .unwrap();
     }
+}
+
+/// Colors are on unless `NO_COLOR` is set to a non-empty value, see https://no-color.org.
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 pub fn report_errors<'a, T>(
