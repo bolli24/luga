@@ -1,0 +1,98 @@
+# Builds the playground image, checks it against the playground contract, and promotes it to
+# :playground when the check passes. The VPS pulls :playground. See playground/Dockerfile.
+
+name: Playground image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Promote in push order; a newer run waits for the older one instead of racing it.
+concurrency:
+  group: playground-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/bolli24/luga
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: tag
+        run: echo "image=$IMAGE:sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: playground/Dockerfile
+          build-args: REVISION=${{ github.sha }}
+          tags: ${{ steps.tag.outputs.image }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  contract:
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+    uses: bolli24/playground-runner/.github/workflows/contract.yml@main
+    with:
+      image: ${{ needs.build.outputs.image }}
+
+  promote:
+    needs: [build, contract]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag as :playground, keeping the previous one as :playground-prev
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:playground" > /dev/null 2>&1; then
+            docker buildx imagetools create --tag "$IMAGE:playground-prev" "$IMAGE:playground"
+          fi
+          docker buildx imagetools create --tag "$IMAGE:playground" "${{ needs.build.outputs.image }}"
+
+  notify:
+    needs: [build, contract, promote]
+    if: failure()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Send ntfy notification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "NTFY_TOPIC is not set, skipping notification"
+            exit 0
+          fi
+          curl -fsS \
+            -H "Title: luga playground image failed" \
+            -H "Tags: warning" \
+            -H "Click: $RUN_URL" \
+            -d "Commit ${GITHUB_SHA::7} was not promoted. The playground keeps running the previous image." \
+            "https://ntfy.sh/$NTFY_TOPIC"
