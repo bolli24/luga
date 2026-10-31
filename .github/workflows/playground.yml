@@ -1,5 +1,6 @@
 # Builds the playground image, checks it against the playground contract, and promotes it to
 # :playground when the check passes. The VPS pulls :playground. See playground/Dockerfile.
+# A failed run leaves :playground on the previous image; GitHub emails about the failure.
 
 name: Playground image
 
@@ -75,24 +76,3 @@ jobs:
             docker buildx imagetools create --tag "$IMAGE:playground-prev" "$IMAGE:playground"
           fi
           docker buildx imagetools create --tag "$IMAGE:playground" "${{ needs.build.outputs.image }}"
-
-  notify:
-    needs: [build, contract, promote]
-    if: failure()
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Send ntfy notification
-        env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [ -z "$NTFY_TOPIC" ]; then
-            echo "NTFY_TOPIC is not set, skipping notification"
-            exit 0
-          fi
-          curl -fsS \
-            -H "Title: luga playground image failed" \
-            -H "Tags: warning" \
-            -H "Click: $RUN_URL" \
-            -d "Commit ${GITHUB_SHA::7} was not promoted. The playground keeps running the previous image." \
-            "https://ntfy.sh/$NTFY_TOPIC"
