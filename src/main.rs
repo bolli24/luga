@@ -32,11 +32,17 @@ enum CliCommand {
     Build {
         #[arg(short, long, default_value_t = String::new())]
         linker_args: String,
+        /// Directory for the object file and executable [default: output/debug or output/release]
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
         path: PathBuf,
     },
     Run {
         #[arg(short, long, default_value_t = String::new())]
         linker_args: String,
+        /// Directory for the object file and executable [default: output/debug or output/release]
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
         path: PathBuf,
     },
     Test {
@@ -99,8 +105,16 @@ fn main() -> ExitCode {
     let cli = <Cli as clap::Parser>::parse();
 
     let result = match &cli.command {
-        CliCommand::Build { path, linker_args } => build_files(&cli, path, linker_args).map(|_| ()),
-        CliCommand::Run { path, linker_args } => run_file(&cli, path, linker_args),
+        CliCommand::Build {
+            path,
+            linker_args,
+            out_dir,
+        } => build_files(&cli, path, linker_args, out_dir.as_deref()).map(|_| ()),
+        CliCommand::Run {
+            path,
+            linker_args,
+            out_dir,
+        } => run_file(&cli, path, linker_args, out_dir.as_deref()),
         CliCommand::Test { path } => test_files(&cli, path),
         CliCommand::Check { path } => check(path, cli.verbose),
         CliCommand::Clean => clean(),
@@ -122,15 +136,25 @@ fn check(path: &Path, verbose: bool) -> Result<(), Failure> {
 
 const OUTPUT_DIR: &str = "output";
 
-fn output_dir(release: bool) -> io::Result<PathBuf> {
-    let dir = env::current_dir()?
-        .join(OUTPUT_DIR)
-        .join(if release { "release" } else { "debug" });
+fn output_dir(release: bool, out_dir: Option<&Path>) -> io::Result<PathBuf> {
+    let dir = match out_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            env::current_dir()?
+                .join(OUTPUT_DIR)
+                .join(if release { "release" } else { "debug" })
+        }
+    };
     create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, Failure> {
+fn build_files(
+    cli: &Cli,
+    path: &Path,
+    linker_args: &str,
+    out_dir: Option<&Path>,
+) -> Result<PathBuf, Failure> {
     let runtime_lib = extract_runtime_lib().map_err(|err| {
         eprintln!("ERROR: Could not extract runtime library.");
         eprintln!("{err}");
@@ -146,7 +170,7 @@ fn build_files(cli: &Cli, path: &Path, linker_args: &str) -> Result<PathBuf, Fai
         return Err(Failure::General);
     }
 
-    let output_dir = output_dir(cli.release).map_err(|err| {
+    let output_dir = output_dir(cli.release, out_dir).map_err(|err| {
         eprintln!("ERROR: Unable to create output directory: {err}");
         Failure::General
     })?;
@@ -250,7 +274,7 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), Failure> {
             continue;
         }
 
-        let exe_path = match build_files(cli, file, "") {
+        let exe_path = match build_files(cli, file, "", None) {
             Ok(p) => p,
             Err(_) => {
                 println!("{}", "BUILD FAIL".yellow());
@@ -313,7 +337,12 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), Failure> {
     }
 }
 
-fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), Failure> {
+fn run_file(
+    cli: &Cli,
+    path: &Path,
+    linker_args: &str,
+    out_dir: Option<&Path>,
+) -> Result<(), Failure> {
     if path.is_dir() {
         eprintln!("ERROR: Can't run more than one file.");
         return Err(Failure::General);
@@ -323,7 +352,7 @@ fn run_file(cli: &Cli, path: &Path, linker_args: &str) -> Result<(), Failure> {
         return Err(Failure::General);
     }
 
-    let exe_path = build_files(cli, path, linker_args)?;
+    let exe_path = build_files(cli, path, linker_args, out_dir)?;
     println!("Running executable '{}'", exe_path.display());
     let exe_name = exe_path.file_name().expect("Executable path must be valid");
     let exit_status = Command::new(&exe_path).status().map_err(|err| {
