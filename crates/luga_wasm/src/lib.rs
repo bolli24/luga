@@ -84,3 +84,45 @@ fn utf16_offset(src: &str, offset: usize) -> usize {
     }
     src[..offset].encode_utf16().count()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_offset_counts_code_units() {
+        // 'é' is 2 bytes and 1 UTF-16 unit, '😀' is 4 bytes and 2 units
+        let src = "aé😀b";
+        assert_eq!(utf16_offset(src, 0), 0);
+        assert_eq!(utf16_offset(src, 1), 1);
+        assert_eq!(utf16_offset(src, 3), 2);
+        assert_eq!(utf16_offset(src, 7), 4);
+        assert_eq!(utf16_offset(src, 8), 5);
+        // Offsets inside a character round down, offsets past the end are clamped
+        assert_eq!(utf16_offset(src, 2), 1);
+        assert_eq!(utf16_offset(src, 100), 5);
+    }
+
+    #[test]
+    fn check_reports_utf16_offsets_under_the_given_key() {
+        let files = HashMap::from([
+            (
+                "main.luga",
+                "import lib.greet as g;\n\nfn main() {\n    g.greet();\n}\n",
+            ),
+            (
+                "lib/greet.luga",
+                "fn greet() {\n    var s = \"héllo\";\n    var x = s + 2;\n}\n",
+            ),
+        ]);
+        let json = check("main.luga", &serde_json::to_string(&files).unwrap()).unwrap();
+        let diagnostics: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(diagnostics.len(), 1, "{json}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic["path"], "lib/greet.luga");
+        // `s + 2` starts at byte 47, but at UTF-16 offset 46 because of the 'é'
+        assert_eq!(diagnostic["from"], 46);
+        assert_eq!(diagnostic["to"], 51);
+    }
+}
