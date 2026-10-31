@@ -10,14 +10,22 @@ use crate::loader::{FsLoader, SourceLoader};
 use crate::lower_state::lower_ast;
 use crate::{CompileError, LowerErrors, ModuleErrors, report_compile_errors};
 
-pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
-    let src = fs::read_to_string(file_path)
-        .map_err(|err| eprintln!("Error reading file '{}': {}", file_path.display(), err))?;
+#[derive(Debug)]
+pub enum CheckFileError {
+    Io,
+    Compile,
+}
+
+pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), CheckFileError> {
+    let src = fs::read_to_string(file_path).map_err(|err| {
+        eprintln!("Error reading file '{}': {}", file_path.display(), err);
+        CheckFileError::Io
+    })?;
 
     let Some(modules) = check_source(Some(file_path.to_path_buf()), &src, &FsLoader, verbose)
     else {
         eprintln!("Error checking {}", file_path.display());
-        return Err(());
+        return Err(CheckFileError::Compile);
     };
 
     let errored = !modules.is_empty();
@@ -32,7 +40,11 @@ pub fn check_file(file_path: &Path, verbose: bool) -> Result<(), ()> {
         );
     }
 
-    if errored { Err(()) } else { Ok(()) }
+    if errored {
+        Err(CheckFileError::Compile)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn check_source(
