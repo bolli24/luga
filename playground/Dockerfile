@@ -5,7 +5,9 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# The build and linter stages run in parallel and share the registry cache; locking it keeps them
+# from unpacking the same crate at the same time
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin luga && cp target/release/luga /usr/local/bin/luga
 
@@ -16,12 +18,12 @@ WORKDIR /src
 # wasm-bindgen-cli must match the wasm-bindgen crate, so take its version from Cargo.lock. Copying only
 # the lock file first keeps this slow install cached until the lock file changes.
 COPY Cargo.lock .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo install --locked wasm-bindgen-cli \
         --version "$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
 COPY . .
 # Without --remove-name-section, function names make up over 90% of the module
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p luga_wasm --target wasm32-unknown-unknown \
     && wasm-bindgen --target web --out-dir /linter --remove-name-section --remove-producers-section \
