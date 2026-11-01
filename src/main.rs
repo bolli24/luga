@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use colored::Colorize;
 use luga_check::lower_state::lower_ast;
-use luga_codegen::generate;
+use luga_codegen::{Listings, generate};
 use std::fs::{self, File, create_dir_all, remove_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,12 @@ enum CliCommand {
         /// Directory for the object file and executable [default: output/debug or output/release]
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
+        /// Intermediate representations to write, comma-separated
+        #[arg(long, value_delimiter = ',')]
+        emit: Vec<View>,
+        /// Directory for --emit, one <view>.txt per view [default: the output directory]
+        #[arg(long)]
+        emit_dir: Option<PathBuf>,
         path: PathBuf,
     },
     Run {
@@ -53,6 +59,67 @@ enum CliCommand {
         path: PathBuf,
     },
     Clean,
+}
+
+/// An intermediate representation `build --emit` can write.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum View {
+    /// The MIR the checker lowers the program to
+    Mir,
+    /// Cranelift IR, before Cranelift optimizes it
+    Clif,
+    /// The generated machine code, as Cranelift prints it
+    Asm,
+}
+
+impl View {
+    fn name(self) -> &'static str {
+        match self {
+            View::Mir => "mir",
+            View::Clif => "clif",
+            View::Asm => "asm",
+        }
+    }
+}
+
+/// The views `build --emit` writes, and where.
+struct Emit<'a> {
+    views: &'a [View],
+    dir: &'a Path,
+}
+
+impl Emit<'_> {
+    fn wants(&self, view: View) -> bool {
+        self.views.contains(&view)
+    }
+
+    fn path(&self, view: View) -> PathBuf {
+        self.dir.join(format!("{}.txt", view.name()))
+    }
+
+    /// Views are written as soon as their stage succeeds, so a failed build must not leave those
+    /// of an earlier build behind.
+    fn clear(&self) -> Result<(), BuildError> {
+        if self.views.is_empty() {
+            return Ok(());
+        }
+        create_dir_all(self.dir).map_err(|err| BuildError::Io(self.dir.to_path_buf(), err))?;
+        for view in self.views {
+            let path = self.path(*view);
+            match fs::remove_file(&path) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                    return Err(BuildError::Io(path, err));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&self, view: View, text: &str) -> Result<(), BuildError> {
+        let path = self.path(view);
+        fs::write(&path, text).map_err(|err| BuildError::Io(path, err))
+    }
 }
 
 #[derive(Error, Debug)]
@@ -109,7 +176,17 @@ fn main() -> ExitCode {
             path,
             linker_args,
             out_dir,
-        } => build_files(&cli, path, linker_args, out_dir.as_deref()).map(|_| ()),
+            emit,
+            emit_dir,
+        } => build_files(
+            &cli,
+            path,
+            linker_args,
+            out_dir.as_deref(),
+            emit,
+            emit_dir.as_deref(),
+        )
+        .map(|_| ()),
         CliCommand::Run {
             path,
             linker_args,
@@ -154,6 +231,8 @@ fn build_files(
     path: &Path,
     linker_args: &str,
     out_dir: Option<&Path>,
+    views: &[View],
+    emit_dir: Option<&Path>,
 ) -> Result<PathBuf, Failure> {
     let runtime_lib = extract_runtime_lib().map_err(|err| {
         eprintln!("ERROR: Could not extract runtime library.");
@@ -175,6 +254,10 @@ fn build_files(
         Failure::General
     })?;
 
+    let emit = Emit {
+        views,
+        dir: emit_dir.unwrap_or(&output_dir),
+    };
     build_file(
         path,
         &output_dir,
@@ -182,6 +265,7 @@ fn build_files(
         cli.release,
         linker_args,
         &runtime_lib,
+        &emit,
     )
     .map_err(|err| {
         eprintln!("ERROR: Could not build executable.");
@@ -274,7 +358,7 @@ fn test_files(cli: &Cli, path: &Path) -> Result<(), Failure> {
             continue;
         }
 
-        let exe_path = match build_files(cli, file, "", None) {
+        let exe_path = match build_files(cli, file, "", None, &[], None) {
             Ok(p) => p,
             Err(_) => {
                 println!("{}", "BUILD FAIL".yellow());
@@ -352,7 +436,7 @@ fn run_file(
         return Err(Failure::General);
     }
 
-    let exe_path = build_files(cli, path, linker_args, out_dir)?;
+    let exe_path = build_files(cli, path, linker_args, out_dir, &[], None)?;
     println!("Running executable '{}'", exe_path.display());
     let exe_name = exe_path.file_name().expect("Executable path must be valid");
     let exit_status = Command::new(&exe_path).status().map_err(|err| {
@@ -394,9 +478,11 @@ fn build_file(
     release: bool,
     linker_args: &str,
     runtime_lib: &Path,
+    emit: &Emit,
 ) -> Result<PathBuf, BuildError> {
     let base_name = file_path.file_name().expect("Input must be file");
     let output_file = output_dir.join(base_name);
+    emit.clear()?;
 
     let src = fs::read_to_string(file_path)
         .map_err(|err| BuildError::Io(file_path.to_path_buf(), err))?;
@@ -443,8 +529,26 @@ fn build_file(
             println!("{func}");
         }
     }
+    if emit.wants(View::Mir) {
+        let functions: Vec<String> = mir_program
+            .functions
+            .values()
+            .map(|f| f.to_string())
+            .collect();
+        emit.write(View::Mir, &(functions.join("\n\n") + "\n"))?;
+    }
 
-    let product = match generate(mir_program, Some(file_path), release, verbose) {
+    let mut listings = Listings {
+        clif: emit.wants(View::Clif).then(String::new),
+        asm: emit.wants(View::Asm).then(String::new),
+    };
+    let product = match generate(
+        mir_program,
+        Some(file_path),
+        release,
+        verbose,
+        &mut listings,
+    ) {
         Ok(product) => product,
         Err(errors) => match errors {
             GeneratorErrors::CraneModuleErrors(module_errors) => {
@@ -460,6 +564,13 @@ fn build_file(
             }
         },
     };
+
+    if let Some(clif) = &listings.clif {
+        emit.write(View::Clif, clif)?;
+    }
+    if let Some(asm) = &listings.asm {
+        emit.write(View::Asm, asm)?;
+    }
 
     let bytes = product
         .emit()

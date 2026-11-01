@@ -4,6 +4,8 @@ use std::{
 };
 
 use cranelift::codegen::Context;
+use cranelift::codegen::ir::{Function, UserExternalName, UserFuncName};
+use cranelift::module::DataId;
 use cranelift::prelude::isa::OwnedTargetIsa;
 use cranelift::{
     codegen::ir::{ArgumentPurpose, StackSlot},
@@ -78,11 +80,31 @@ pub struct Place {
     ty: Type,
 }
 
+/// Text of the generated code, e.g. for `luga build --emit`. Set a field to `Some` to request it;
+/// `generate` appends each function to it.
+#[derive(Debug, Default)]
+pub struct Listings {
+    /// Cranelift IR of each function, as built from the MIR, before Cranelift optimizes it
+    pub clif: Option<String>,
+    /// Machine code of each function, as Cranelift prints it
+    pub asm: Option<String>,
+}
+
+impl Listings {
+    fn append(text: &mut String, function: &str, body: &str) {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("; fn {function}\n{}\n", body.trim_end()));
+    }
+}
+
 pub fn generate(
     program: MirProgram,
     file_path: Option<&Path>,
     release: bool,
     verbose: bool,
+    listings: &mut Listings,
 ) -> Result<ObjectProduct, GeneratorErrors> {
     #[cfg(target_os = "linux")]
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux";
@@ -162,6 +184,7 @@ pub fn generate(
         fn_name_prefix: String::new(),
         types: &program.types,
         verbose,
+        listings,
     };
 
     let crane_functions: HashMap<LowerFuncId, FuncId> = program
@@ -293,6 +316,7 @@ pub struct GeneratorState<'a> {
     fn_name_prefix: String,
     types: &'a TypeContext,
     verbose: bool,
+    listings: &'a mut Listings,
 }
 
 impl<'a> GeneratorState<'a> {
@@ -1169,6 +1193,8 @@ impl GeneratorState<'_> {
         };
 
         let mut fn_context = Context::new();
+        // Only used in listings, which would otherwise show every function as the default u0:0
+        fn_context.func.name = UserFuncName::user(0, self.crane_functions[&lower_func_id].as_u32());
         let mut fn_builder_context = FunctionBuilderContext::new();
         let mut fn_builder = FunctionBuilder::new(&mut fn_context.func, &mut fn_builder_context);
 
@@ -1224,13 +1250,86 @@ impl GeneratorState<'_> {
         fn_generator.build_blocks(&function);
 
         fn_generator.builder.finalize();
+
+        if self.listings.clif.is_some() {
+            let names = self.reference_names(&fn_context.func);
+            let text = rename_tokens(&fn_context.func.display().to_string(), &names);
+            if let Some(clif) = &mut self.listings.clif {
+                Listings::append(clif, &function.name, &text);
+            }
+        }
+        fn_context.set_disasm(self.listings.asm.is_some());
         self.module
             .define_function(self.crane_functions[&lower_func_id], &mut fn_context)
             .map_err(|err| GeneratorErrors::CraneModuleErrors(vec![err]))?;
+        if let Some(vcode) = fn_context
+            .compiled_code()
+            .and_then(|code| code.vcode.as_deref())
+            && self.listings.asm.is_some()
+        {
+            let text = rename_tokens(vcode, &self.reference_names(&fn_context.func));
+            if let Some(asm) = &mut self.listings.asm {
+                Listings::append(asm, &function.name, &text);
+            }
+        }
         self.module.clear_context(&mut fn_context);
 
         Ok(())
     }
+
+    /// Declared names for the functions and data `func` refers to, keyed by the tokens Cranelift
+    /// prints for them: `u0:2` (namespace 0 holds functions, 1 holds data) and the function's own
+    /// references to those, `userextname1`. Names get CLIF's `%` sigil, e.g. `%fibonacci`.
+    fn reference_names(&self, func: &Function) -> HashMap<String, String> {
+        let declarations = self.module.declarations();
+        let declared_name = |user: &UserExternalName| match user.namespace {
+            0 => declarations
+                .get_function_decl(FuncId::from_u32(user.index))
+                .name
+                .clone(),
+            1 => declarations
+                .get_data_decl(DataId::from_u32(user.index))
+                .name
+                .clone(),
+            _ => None,
+        };
+
+        let mut names = HashMap::new();
+        let mut add = |user: &UserExternalName, reference: Option<String>| {
+            if let Some(name) = declared_name(user) {
+                let name = format!("%{name}");
+                if let Some(reference) = reference {
+                    names.insert(reference, name.clone());
+                }
+                names.insert(format!("u{}:{}", user.namespace, user.index), name);
+            }
+        };
+        if let UserFuncName::User(user) = &func.name {
+            add(user, None);
+        }
+        for (reference, user) in func.params.user_named_funcs() {
+            add(user, Some(reference.to_string()));
+        }
+        names
+    }
+}
+
+/// Replace each token in `text` that `names` has an entry for. Tokens are runs of letters, digits,
+/// `_` and `:`, so `u0:2` is one token and doesn't match inside `u0:21`.
+fn rename_tokens(text: &str, names: &HashMap<String, String>) -> String {
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':';
+    let mut renamed = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(is_token_char) {
+        renamed.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(|c| !is_token_char(c)).unwrap_or(rest.len());
+        let token = &rest[..end];
+        renamed.push_str(names.get(token).map_or(token, String::as_str));
+        rest = &rest[end..];
+    }
+    renamed.push_str(rest);
+    renamed
 }
 
 impl FnGenerator<'_, '_> {
@@ -1455,4 +1554,21 @@ fn main() {
                 .any(|Spanned(error, _)| matches!(error, CodeError::ExpectedRefArgument))
         );
     }*/
+
+    use super::*;
+
+    #[test]
+    fn renames_whole_tokens_only() {
+        let names = HashMap::from([
+            ("u0:2".to_string(), "%fib".to_string()),
+            ("userextname1".to_string(), "%string_0".to_string()),
+        ]);
+        assert_eq!(
+            rename_tokens(
+                "fn0 = colocated u0:2 sig0, u0:21\n  call User(userextname1); userextname12",
+                &names
+            ),
+            "fn0 = colocated %fib sig0, u0:21\n  call User(%string_0); userextname12"
+        );
+    }
 }
