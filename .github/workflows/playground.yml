@@ -20,6 +20,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # Every step has its own limit, so a hang fails within minutes instead of after GitHub's
+    # default of 6 hours. This covers what they don't, like saving the build cache at the end.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -27,18 +30,24 @@ jobs:
       image: ${{ steps.tag.outputs.image }}
     steps:
       - uses: actions/checkout@v5
+        timeout-minutes: 2
 
       - id: tag
+        timeout-minutes: 1
         run: echo "image=$IMAGE:sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
+        timeout-minutes: 5
       - uses: docker/login-action@v3
+        timeout-minutes: 2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # A cold build compiles the compiler and the linter from scratch
       - uses: docker/build-push-action@v6
+        timeout-minutes: 40
         with:
           context: .
           file: playground/Dockerfile
@@ -60,17 +69,21 @@ jobs:
   promote:
     needs: [build, contract]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
+        timeout-minutes: 5
       - uses: docker/login-action@v3
+        timeout-minutes: 2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Retag as :playground, keeping the previous one as :playground-prev
+        timeout-minutes: 5
         run: |
           if docker buildx imagetools inspect "$IMAGE:playground" > /dev/null 2>&1; then
             docker buildx imagetools create --tag "$IMAGE:playground-prev" "$IMAGE:playground"
