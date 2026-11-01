@@ -50,6 +50,7 @@ LABEL playground.contract="1" \
       playground.extensions=".luga" \
       playground.capabilities="multi-file" \
       playground.views="mir,clif,asm" \
+      playground.options="release" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.source="https://github.com/bolli24/luga"
 

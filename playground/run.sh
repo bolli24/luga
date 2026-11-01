@@ -2,14 +2,21 @@
 # Playground entrypoint, see CONTRACT.md in the playground-runner repo.
 set -u
 
-# Runners from before views don't set these
+# Runners from before views and options don't set these
 views=${PLAYGROUND_VIEWS:-}
 run=${PLAYGROUND_RUN:-1}
+options=${PLAYGROUND_OPTIONS:-}
+
+# The only option: an optimized build, for both the views and the program
+release=
+case ",$options," in
+    *,release,*) release=--release ;;
+esac
 
 # Build from the source root so diagnostics show paths relative to it
 cd /work/src
 
-luga build --out-dir /work/build ${views:+--emit "$views" --emit-dir /tmp/views} "$PLAYGROUND_ENTRY"
+luga $release build --out-dir /work/build ${views:+--emit "$views" --emit-dir /tmp/views} "$PLAYGROUND_ENTRY"
 status=$?
 
 # Views come after the compiler's output, also on a failed build, as far as it got. They can contain
