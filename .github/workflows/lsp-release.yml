@@ -1,0 +1,106 @@
+# Builds the luga_lsp language server for Windows and Linux and attaches the binaries to a
+# GitHub release. Triggered by pushing a tag `lsp-v<version>`, where <version> must match
+# lsp/Cargo.toml. Editor extensions (e.g. luga-vscode) download the binaries from that release.
+#
+# A manual run (workflow_dispatch) only builds and uploads the binaries as workflow artifacts.
+
+name: LSP release
+
+on:
+  push:
+    tags: ["lsp-v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            exe: luga_lsp.exe
+          # Older glibc so the binary runs on more distros.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            exe: luga_lsp
+    runs-on: ${{ matrix.os }}
+    # Every step has its own limit; this covers what they don't.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        timeout-minutes: 2
+
+      - name: Check tag matches lsp/Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          crate_version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' lsp/Cargo.toml | head -n1)
+          tag_version=${GITHUB_REF_NAME#lsp-v}
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match lsp/Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        timeout-minutes: 5
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 5
+        with:
+          key: lsp-${{ matrix.target }}
+
+      - name: Build
+        timeout-minutes: 20
+        run: cargo build --release --locked -p luga_lsp --target ${{ matrix.target }}
+
+      # Asset names carry the target triple so all platforms fit in one release.
+      - name: Rename binary
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          mkdir dist
+          src=target/${{ matrix.target }}/release/${{ matrix.exe }}
+          case "${{ matrix.exe }}" in
+            *.exe) dst=dist/luga_lsp-${{ matrix.target }}.exe ;;
+            *)     dst=dist/luga_lsp-${{ matrix.target }} ;;
+          esac
+          cp "$src" "$dst"
+
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: luga_lsp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        with:
+          pattern: luga_lsp-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Language server ${GITHUB_REF_NAME#lsp-v}" \
+            --notes "luga_lsp ${GITHUB_REF_NAME#lsp-v} for Windows (x86_64) and Linux (x86_64, glibc)." \
+            --latest=false
